@@ -30,6 +30,7 @@ mod index;
 mod install;
 mod launch;
 mod linkfix;
+mod pack;
 mod project;
 mod refresh;
 mod relink;
@@ -400,6 +401,26 @@ enum Cmd {
     List,
     /// Search the indexes.
     Search { query: String },
+    /// Work with the package the `[package]` table of an `lvpm.toml`
+    /// describes.
+    #[command(subcommand)]
+    Package(PackageCmd),
+}
+
+#[derive(Subcommand)]
+enum PackageCmd {
+    /// Build the package, without LabVIEW or VIPM.
+    Build {
+        /// The manifest; default: the nearest `lvpm.toml` at or above here.
+        #[arg(long, value_name = "FILE")]
+        manifest: Option<PathBuf>,
+        /// Write the package here instead of `[package] output`.
+        #[arg(long, value_name = "DIR")]
+        output: Option<PathBuf>,
+        /// Use this version instead of `[package] version`, e.g. from CI.
+        #[arg(long = "set-version", value_name = "VERSION")]
+        set_version: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -542,6 +563,9 @@ fn run(cli: &Cli) -> Result<()> {
         Cmd::Import { file, all, group, dry_run } => cmd_import(&cli, file, *all, group.as_deref(), *dry_run),
         Cmd::List => cmd_list(&cli),
         Cmd::Search { query } => cmd_search(&cli, query),
+        Cmd::Package(PackageCmd::Build { manifest, output, set_version }) => {
+            cmd_package_build(manifest.as_deref(), output.as_deref(), set_version.as_deref())
+        }
     }
 }
 
@@ -552,6 +576,31 @@ fn took(d: std::time::Duration) -> String {
         true => format!("{s:.1}s"),
         false => format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60),
     }
+}
+
+fn cmd_package_build(manifest: Option<&Path>, output: Option<&Path>, set_version: Option<&str>) -> Result<()> {
+    let path = match manifest {
+        Some(p) => p.to_path_buf(),
+        None => project::find_manifest(&std::env::current_dir()?)
+            .context("no lvpm.toml here or above; pass --manifest")?,
+    };
+    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut pkg = pack::parse(&text, base).with_context(|| format!("[package] in {}", path.display()))?;
+    if let Some(v) = set_version {
+        pack::check_version(v)?;
+        pkg.version = v.to_string();
+    }
+    if let Some(o) = output {
+        pkg.output = o.to_path_buf();
+    }
+    let out = pkg.build()?;
+    println!("built {} {} ({} files)", pkg.name, pkg.version, pkg.files.len());
+    for (file, _) in &pkg.files {
+        println!("  {file}");
+    }
+    println!("-> {}", out.display());
+    Ok(())
 }
 
 /// Resolve `--labview` / `--prefix` into a set of roots.
