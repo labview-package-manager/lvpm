@@ -699,6 +699,8 @@ mod tests {
             name: "acme_lib_thing".into(),
             version: "1.0.0.1".into(),
             display_name: None,
+            vendor: None,
+            license: None,
             file_groups: groups,
             script_vis: Vec::new(),
             requires: None,

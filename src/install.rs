@@ -31,6 +31,9 @@ pub struct Manifest {
     pub name: String,
     pub version: String,
     pub display_name: Option<String>,
+    /// Metadata captured from the installed archive. Older records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_metadata: Option<PackageMetadata>,
     pub installed_at: u64,
     /// Where it went: a scratch prefix or a LabVIEW install dir.
     pub target: String,
@@ -86,6 +89,14 @@ pub struct Manifest {
     /// rather than the LabVIEW tree, as `Target Dir (N files)`.
     #[serde(default)]
     pub skipped_groups: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PackageMetadata {
+    pub vendor: Option<String>,
+    pub license: Option<String>,
+    pub archive_md5: String,
+    pub archive_sha256: String,
 }
 
 /// Which tree of the merged palette addon a palette file belongs to.
@@ -181,7 +192,13 @@ pub fn read_manifest(roots: &Roots, name: &str) -> Result<Manifest> {
 }
 
 pub fn list_installed(roots: &Roots) -> Result<Vec<Manifest>> {
-    let (manifests, mut unreadable) = list_installed_lenient(roots)?;
+    list_installed_with(roots, |_| Ok(()))
+}
+
+pub(crate) fn list_installed_with(
+    roots: &Roots, check_path: impl FnMut(&Path) -> Result<()>,
+) -> Result<Vec<Manifest>> {
+    let (manifests, mut unreadable) = list_installed_lenient_with(roots, check_path)?;
     match unreadable.is_empty() {
         true => Ok(manifests),
         false => Err(unreadable.remove(0).1),
@@ -198,6 +215,12 @@ pub type Unreadable = (PathBuf, anyhow::Error);
 /// (`uninstall`, `list`, `run-hooks --all`) uses [`list_installed`], which
 /// refuses instead.
 pub fn list_installed_lenient(roots: &Roots) -> Result<(Vec<Manifest>, Vec<Unreadable>)> {
+    list_installed_lenient_with(roots, |_| Ok(()))
+}
+
+pub(crate) fn list_installed_lenient_with(
+    roots: &Roots, mut check_path: impl FnMut(&Path) -> Result<()>,
+) -> Result<(Vec<Manifest>, Vec<Unreadable>)> {
     let dir = roots.store_dir();
     if !dir.exists() {
         return Ok((Vec::new(), Vec::new()));
@@ -211,6 +234,7 @@ pub fn list_installed_lenient(roots: &Roots) -> Result<(Vec<Manifest>, Vec<Unrea
     paths.sort();
     for path in paths {
         if path.extension().is_some_and(|ext| ext == "json") {
+            check_path(&path)?;
             let read = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display())).and_then(|text| {
                 serde_json::from_str::<Manifest>(&text)
                     .with_context(|| format!("reading installation record {} (dependency list required)", path.display()))
@@ -229,6 +253,21 @@ type Archive = zip::ZipArchive<std::io::Cursor<Vec<u8>>>;
 
 pub fn open_archive(vip_bytes: Vec<u8>) -> Result<Archive> {
     Ok(zip::ZipArchive::new(std::io::Cursor::new(vip_bytes))?)
+}
+
+pub fn read_spec(zip: &mut Archive) -> Result<String> {
+    // Almost always literally "spec" at the archive root.
+    let idx = (0..zip.len()).find(|i| {
+        zip.by_index(*i).is_ok_and(|f| f.name().is_ok_and(|n| n.eq_ignore_ascii_case("spec")))
+    });
+    let Some(idx) = idx else {
+        bail!("no `spec` member in .vip archive");
+    };
+    let mut f = zip.by_index(idx)?;
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut buf)?;
+    // spec files are latin-1-ish; lossy is fine for the fields we read.
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Work out every file this package would write, without touching disk.
@@ -330,7 +369,7 @@ pub fn addon_info(name: &str, target: &LvTarget) -> String {
 pub fn apply(
     roots: &Roots,
     spec: &Spec,
-    zip: &mut Archive,
+    mut zip: Archive,
     plan: &Plan,
     pre_install_vi: Option<&Path>,
     dependencies: Vec<String>,
@@ -342,7 +381,7 @@ pub fn apply(
     // pass has made it runnable.
     let mut hook = |name: &str, member: &str| -> Result<Option<PathBuf>> {
         match spec.script_vis.iter().any(|(h, v)| h == name && !v.is_empty()) {
-            true => extract_hook(roots, &spec.name, zip, member),
+            true => extract_hook(roots, &spec.name, &mut zip, member),
             false => Ok(None),
         }
     };
@@ -383,10 +422,17 @@ pub fn apply(
         written.push(info.to_string_lossy().replace('\\', "/"));
     }
 
+    let archive = zip.into_inner().into_inner();
     let manifest = Manifest {
         name: spec.name.clone(),
         version: spec.version.clone(),
         display_name: spec.display_name.clone(),
+        package_metadata: Some(PackageMetadata {
+            vendor: spec.vendor.clone(),
+            license: spec.license.clone(),
+            archive_md5: crate::index::md5_hex(&archive),
+            archive_sha256: crate::cache::sha256_hex(&archive),
+        }),
         installed_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -590,7 +636,7 @@ mod tests {
         std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
         std::fs::write(&payload, b"test").unwrap();
         let manifest = Manifest {
-            name: "example".into(), version: "1".into(), display_name: None, installed_at: 0,
+            name: "example".into(), version: "1".into(), display_name: None, package_metadata: None, installed_at: 0,
             target: "test".into(), files: vec![payload.to_string_lossy().into_owned()], dependencies: vec![],
             palette_files: vec![],
             skipped_hooks: vec![], relinked: false, relink_folders: vec![],
@@ -680,7 +726,7 @@ File 0="functions.mnu"
         let source = crate::palette::contribution_root(&roots, "example").join("Categories/functions.mnu");
         assert_eq!(plan.writes[0].dest, source);
         assert_eq!(plan.palette_files, [PaletteFile { relative: "Categories/functions.mnu".into(), tree: PaletteTree::Menus }]);
-        let manifest = apply(&roots, &spec, &mut zip, &plan, None, Vec::new()).unwrap();
+        let manifest = apply(&roots, &spec, zip, &plan, None, Vec::new()).unwrap();
 
         assert!(source.is_file());
         assert!(!roots.application.join("lvaddoninfo.json").exists());

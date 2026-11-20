@@ -136,6 +136,28 @@ impl Rsrc {
         out
     }
 
+    /// Locate an embedded VI by the name stored on its LVSR section.
+    pub(crate) fn embedded_vi(&self, name: &[u8]) -> Option<Rsrc> {
+        self.sections.iter().filter(|section| &section.ident == b"VINS").find_map(|section| {
+            let embedded = Self::parse(&section.data).ok()?;
+            let record = embedded.section(b"LVSR")?;
+            (embedded.section_name(record)? == name).then_some(embedded)
+        })
+    }
+
+    fn section_name(&self, section: &Section) -> Option<&[u8]> {
+        // The section's name offset precedes its data offset by eight bytes.
+        // Names are Pascal strings after the block list.
+        let offset = be32(&self.info, section.off_field.checked_sub(8)?).ok()?;
+        if offset == u32::MAX {
+            return None;
+        }
+        let names = (be32(&self.info, 16).ok()? as usize).checked_sub(32)?;
+        let start = names.checked_add(offset as usize)?;
+        let (&len, bytes) = self.info.get(start..)?.split_first()?;
+        bytes.get(..usize::from(len))
+    }
+
     /// (major, minor) from the `LVSR` block, e.g. (20, 0) for LabVIEW 2020.
     pub fn version(&self) -> Result<(u32, u32)> {
         let s = self.sections.iter().find(|s| &s.ident == b"LVSR").context("no LVSR block")?;
@@ -450,7 +472,7 @@ pub struct Pth {
 }
 
 impl Pth {
-    fn parse(b: &[u8], pos: usize) -> Result<(Pth, usize)> {
+    pub(crate) fn parse(b: &[u8], pos: usize) -> Result<(Pth, usize)> {
         ensure!(b.get(pos..pos + 4) == Some(b"PTH0"), "no PTH0 at {pos}");
         let totlen = be32(b, pos + 4)? as usize;
         let tp = be16(b, pos + 8)?;
@@ -549,6 +571,16 @@ pub struct LinkObj {
     tail: Vec<u8>,
     /// Section position the tail was read at, for re-padding API caches.
     tail_pos: usize,
+}
+
+impl LinkObj {
+    /// LabVIEW links to the VINS copy by a relative basename qualified as Instance.
+    pub(crate) fn embedded_instance_name(&self) -> Option<&[u8]> {
+        let [qualifier, name] = self.qual.as_slice() else { return None };
+        let [path] = self.path.comps.as_slice() else { return None };
+        (matches!(&self.ident, b"VIVI" | b"IUVI") && self.flag == 1 && self.path.is_relative()
+            && qualifier == b"Instance" && path == name).then_some(name.as_slice())
+    }
 }
 
 pub struct LinkSection {
@@ -979,6 +1011,7 @@ const TOKENS: &[(&str, &str)] = &[
     ("<resource>", "resource"),
     ("<menus>", "menus"),
     ("<help>", "help"),
+    ("<helpdir>", "help"),
     ("<examples>", "examples"),
     ("<project>", "project"),
     ("<templates>", "templates"),
@@ -1224,7 +1257,7 @@ fn urls(xml: &str) -> Vec<String> {
 }
 
 /// `<vilib>/a/b` -> `vi.lib/a/b`
-fn token_to_logical(p: &str) -> Option<String> {
+pub(crate) fn token_to_logical(p: &str) -> Option<String> {
     let (tok, rest) = match p.find('/') {
         Some(i) => (&p[..i], &p[i + 1..]),
         None => (p, ""),
@@ -1306,7 +1339,7 @@ fn resolve_relative(vi_dir: &str, comps: &[Vec<u8>]) -> Option<String> {
 /// RSRC file whose second header copy sits at its own info offset — that
 /// copy is what tells a real member start from a stray `RSRC` string. The
 /// name comes from the member's `TITL` block.
-fn llb_members(data: &[u8]) -> Vec<(String, &[u8])> {
+pub(crate) fn llb_members(data: &[u8]) -> Vec<(String, &[u8])> {
     let mut out = Vec::new();
     let mut i = match data.len() > 6 { true => 1, false => return out };
     while let Some(off) = data[i..].windows(6).position(|w| w == b"RSRC\r\n") {
@@ -1349,7 +1382,7 @@ fn llb_members(data: &[u8]) -> Vec<(String, &[u8])> {
 /// Every file under `root`, as (physical, logical) where logical starts with
 /// the LabVIEW folder (`vi.lib/...`). An `.llb` is listed as one file and not
 /// entered here; `Tree::read_llbs` indexes its members for resolution only.
-fn walk(root: &Path) -> Result<Vec<(PathBuf, String)>> {
+pub(crate) fn walk(root: &Path) -> Result<Vec<(PathBuf, String)>> {
     ensure!(!std::fs::symlink_metadata(root)?.file_type().is_symlink(), "linked root is not supported: {}", root.display());
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -1800,7 +1833,7 @@ pub fn is_vi_like(p: &Path) -> bool {
     )
 }
 
-fn is_library_xml(p: &Path) -> bool {
+pub(crate) fn is_library_xml(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
         Some("lvlib" | "lvclass")
@@ -2348,6 +2381,149 @@ mod tests {
     }
 
     #[test]
+    fn build_sbom_follows_transitive_links_from_the_selected_sources() {
+        let root = std::env::temp_dir().join(format!("lvpm-vi-graph-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let project = root.join("test.lvproj");
+        std::fs::write(&project, r#"
+<Project><Item Name="Desktop" Type="My Computer">
+ <Item Name="Startup.vi" Type="VI" URL="../Startup.vi"/>
+ <Item Name="Other.vi" Type="VI" URL="../Other.vi"/>
+ <Item Name="Packed.lvlib" Type="Library" URL="../Packed.lvlib"/>
+ <Item Name="Build Specifications" Type="Build">
+  <Item Name="Demo" Type="EXE">
+   <Property Name="Source[0].itemID">/Desktop/Startup.vi</Property>
+   <Property Name="Source[0].sourceInclusion">TopLevel</Property>
+  </Item>
+  <Item Name="Sources" Type="Source Distribution">
+   <Property Name="Source[0].itemID">/Desktop/Other.vi</Property>
+   <Property Name="Source[0].sourceInclusion">Include</Property>
+  </Item>
+  <Item Name="Packed" Type="Packed Library">
+   <Property Name="Source[1].itemID">/Desktop/Packed.lvlib</Property>
+   <Property Name="Source[1].Library.LVLIBPtopLevel">true</Property>
+   <Property Name="TgtF_productName">Packed Demo</Property>
+   <Property Name="Bld_version.major">2</Property>
+  </Item>
+ </Item>
+</Item></Project>
+"#).unwrap();
+
+        let mut vi = Rsrc::parse(&sample().expect("bundled VI fixture")).unwrap();
+        let version = vi.version().unwrap();
+        vi.edit_blocks(&[*b"LIvi", *b"LIbd", *b"LIfp", *b"LIds", *b"VINS"], None).unwrap();
+        let write_vi = |name: &str, callees: &[&str]| {
+            let mut vi = vi.clone();
+            let links = LinkSection {
+                list_ident: *b"LVIN",
+                header_extra: Vec::new(),
+                objs: callees.iter().map(|callee| LinkObj {
+                    ident: *b"VIVI",
+                    qual: vec![callee.as_bytes().to_vec()],
+                    path: Pth { tp: 1, comps: vec![Vec::new(), callee.as_bytes().to_vec()], zero: false },
+                    flag: 0,
+                    tail: Vec::new(),
+                    tail_pos: 0,
+                }).collect(),
+            };
+            vi.edit_blocks(&[], Some((*b"LIvi", links.write(version, false).unwrap()))).unwrap();
+            std::fs::write(root.join(name), vi.write()).unwrap();
+        };
+        write_vi("Startup.vi", &["Sub.vi"]);
+        write_vi("Sub.vi", &["Leaf.vi"]);
+        write_vi("Leaf.vi", &["Startup.vi"]);
+        write_vi("Other.vi", &[]);
+        std::fs::write(root.join("Packed.lvlib"), r#"<Library><Item Name="Nested.lvlib" Type="Library" URL="../Nested.lvlib"/></Library>"#).unwrap();
+        std::fs::write(root.join("Nested.lvlib"), r#"<Library><Item Name="Startup.vi" Type="VI" URL="../Startup.vi"/></Library>"#).unwrap();
+
+        // Replace the saved caller with an instance call. The embedded VI
+        // alone links to Sub.vi, and the instance basename has no disk file.
+        let instance_name = b"instance.vi";
+        let startup_path = root.join("Startup.vi");
+        let mut embedded = Rsrc::parse(&std::fs::read(&startup_path).unwrap()).unwrap();
+        let name_field = embedded.section(b"LVSR").unwrap().off_field - 8;
+        let names_start = be32(&embedded.info, 16).unwrap() as usize - 32;
+        let name_offset = (embedded.info.len() - names_start) as u32;
+        embedded.info[name_field..name_field + 4].copy_from_slice(&name_offset.to_be_bytes());
+        embedded.info.push(instance_name.len() as u8);
+        embedded.info.extend_from_slice(instance_name);
+
+        let mut startup = vi.clone();
+        let link = LinkObj {
+            ident: *b"VIVI",
+            qual: vec![b"Instance".to_vec(), instance_name.to_vec()],
+            path: Pth { tp: 1, comps: vec![instance_name.to_vec()], zero: false },
+            flag: 1,
+            tail: Vec::new(),
+            tail_pos: 0,
+        };
+        let links = LinkSection { list_ident: *b"LVIN", header_extra: Vec::new(), objs: vec![link] };
+        startup.edit_blocks(&[], Some((*b"LIvi", links.write(version, false).unwrap()))).unwrap();
+        let without_instance = startup.write();
+        startup.edit_blocks(&[], Some((*b"VINS", embedded.write()))).unwrap();
+        let with_instance = startup.write();
+        std::fs::write(&startup_path, &with_instance).unwrap();
+
+        let database = root.join("vipm");
+        for (package, file) in [("pkg_a", "Sub.vi"), ("pkg_b", "Leaf.vi"), ("unused", "Other.vi")] {
+            let record = database.join(package);
+            std::fs::create_dir_all(&record).unwrap();
+            std::fs::write(record.join("files-installed"), root.join(file).display().to_string()).unwrap();
+            let archive = std::fs::File::create(record.join(format!("{package}-1.0.0.1.vip"))).unwrap();
+            let mut zip = zip::ZipWriter::new(archive);
+            zip.start_file("spec", zip::write::SimpleFileOptions::default()).unwrap();
+            writeln!(zip, "[Package]\nName={package}\nVersion=1.0.0.1").unwrap();
+            zip.finish().unwrap();
+        }
+        let export = |build, allow_incomplete| {
+            crate::sbom::build_document(
+                &project,
+                "Desktop",
+                build,
+                crate::sbom::ProjectBuildOptions {
+                    include: None,
+                    environment: crate::vi_graph::Environment {
+                        global: true,
+                        ..Default::default()
+                    },
+                    allow_incomplete,
+                    vipm_database: Some(&database),
+                    output: None,
+                },
+                None,
+            )
+        };
+        let exe = export("Demo", false).unwrap();
+        let names: Vec<_> = exe["components"].as_array().unwrap().iter()
+            .map(|component| component["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["pkg_a", "pkg_b"]);
+        assert_eq!(exe["dependencies"][0]["dependsOn"], serde_json::json!(["pkg:generic/vipm/pkg_a@1.0.0.1"]));
+        assert_eq!(exe["dependencies"][1]["dependsOn"], serde_json::json!(["pkg:generic/vipm/pkg_b@1.0.0.1"]));
+
+        let src = export("Sources", false).unwrap();
+        assert_eq!(src["components"].as_array().unwrap().len(), 1);
+        assert_eq!(src["components"][0]["name"], "unused");
+
+        let packed = export("Packed", false).unwrap();
+        assert_eq!(packed["metadata"]["component"]["type"], "library");
+        assert_eq!(packed["metadata"]["component"]["name"], "Packed Demo");
+        assert_eq!(packed["metadata"]["component"]["version"], "2.0.0.0");
+        assert_eq!(packed["dependencies"], exe["dependencies"]);
+        assert_eq!(packed["components"], exe["components"]);
+
+        std::fs::write(&startup_path, &without_instance).unwrap();
+        let error = export("Demo", false).unwrap_err().to_string();
+        assert!(error.contains("instance.vi"), "{error}");
+        std::fs::write(&startup_path, &with_instance).unwrap();
+
+        std::fs::remove_file(root.join("Leaf.vi")).unwrap();
+        assert!(export("Demo", false).is_err());
+        let partial = export("Demo", true).unwrap();
+        assert_eq!(partial["compositions"][0]["aggregate"], "incomplete");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn container_round_trips_byte_exactly() {
         let Some(b) = sample() else { return };
         let r = Rsrc::parse(&b).unwrap();
@@ -2538,6 +2714,19 @@ mod tests {
         let t = logical_to_token("user.lib/_OpenG.lib/a.lvlib").unwrap();
         assert_eq!(t[0], b"<userlib>");
         assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn helpdir_is_a_read_alias_for_the_help_folder() {
+        assert_eq!(
+            token_to_logical("<helpdir>/Guide/Index.vi").as_deref(),
+            Some("help/Guide/Index.vi")
+        );
+        assert_eq!(
+            logical_to_token("help/Guide/Index.vi").unwrap(),
+            [b"<help>".to_vec(), b"Guide".to_vec(), b"Index.vi".to_vec()]
+        );
+        assert!(link_token("help/Guide/Index.vi").is_none());
     }
 
     #[test]

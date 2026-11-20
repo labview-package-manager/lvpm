@@ -75,6 +75,10 @@ fn reject_legacy(dir: &Path) -> Result<()> {
 }
 
 impl Venv {
+    pub(crate) fn binding_path(&self) -> PathBuf {
+        binding_path(&self.dir)
+    }
+
     /// The manifest pinned at creation, when this binding records one.
     pub fn manifest_path(&self) -> Option<PathBuf> {
         self.manifest.as_ref().map(|name| self.repo.join(name))

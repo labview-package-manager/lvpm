@@ -97,4 +97,5 @@ level:
 At 10 MB a log moves to `<name>.log.1`, replacing the previous one. A venv
 moved to another path starts a new log; the old one stays. Venvs created
 before lvpm 0.3.1 kept their log in `.lv-venv/logs/`, which lvpm no longer
-writes to.
+writes to. SBOM commands use console diagnostics and skip file logging
+and update checks, protecting inputs and outputs from incidental writes.
