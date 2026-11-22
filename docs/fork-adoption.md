@@ -23,10 +23,10 @@ are trying this form on
   [#54](https://github.com/labview-package-manager/lvpm/issues/54) and
   [#55](https://github.com/labview-package-manager/lvpm/issues/55). Don't use
   `/ship`, `/autoship` or `--candidates`.
-- Slices are tracked in this repository. `CLAUDE.md` still names the fork's own
-  board; until
-  [#58](https://github.com/labview-package-manager/lvpm/issues/58) changes it,
-  leave that board alone.
+- Slices are tracked in this repository, not on the fork's board that
+  `docs/vision/build-slices.md` names.
+- PRs go into `integration/fork`. From a clone of a fork, GitHub and `gh` can
+  pick another repository or branch, so check the target before you open one.
 
 ## Set up, once
 
@@ -40,9 +40,6 @@ claude plugin install dev-team@bfinster --scope local
 Start a new Claude session afterwards. `/setup` is not needed. The plugin's
 hooks need Python 3.
 
-Still to do on this branch: `.github/workflows/pr.yml` runs only for PRs into
-`main`. Add `integration/fork` to its branches before the first slice PR.
-
 ## One slice, step by step
 
 The prompts use #44. Put your issue number and a short name in their place.
@@ -52,9 +49,9 @@ The prompts use #44. Put your issue number and a short name in their place.
 Start a new session and note `/usage`. Then:
 
 > Work on issue #44 on a branch `slice/44-bare-year` from `integration/fork`.
-> Read the issue and only the code it needs. Don't use /specs, /plan or /build,
-> and leave the project board in CLAUDE.md alone. Write the scenarios as a
-> feature file first, run them, show me they fail, then stop.
+> Read the issue and only the code it needs. Don't use /specs, /plan or /build.
+> Write the scenarios as a feature file first, add it to `FEATURE_FILES` in
+> tests/acceptance.rs, run them, show me they fail, then stop.
 
 Check that the scenarios say what you want, and that they fail for the right
 reason.
@@ -105,8 +102,10 @@ whether the other slices run this way.
 
 - Merge with a merge commit, never a squash. The history records which upstream
   commit each port came from.
-- Settle #58 first. `tag.yml` and `release-please.yml` run on every push to
-  `main`, so the merge can start a release.
+- Settle [#58](https://github.com/labview-package-manager/lvpm/issues/58) first.
+  `tag.yml` and `release-please.yml` run on every push to `main`. An accidental
+  merge on 2026-11-22 (PR 42, reverted) did try to release; it stopped only
+  because this repository has no `RELEASE_PLEASE_TOKEN`.
 - The fork's commits use its own issue numbers. Titles such as "(#43)" will link
   to unrelated issues here, which is only untidy. Two commits say `Closes #62`
   (`a3c376c`) and `Closes #77` (`f3cbed8`): if we have those issues and they are

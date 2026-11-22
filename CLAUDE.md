@@ -1,34 +1,29 @@
 # lvpm
 
-## Slices, issues and the board
+## Slices and issues
 
-Every slice is an issue under #57, shown on the
-[lvpm mission](https://github.com/users/ThatsTheEnd/projects/2) board. The issue
-is the work item; the board only adds its Status. How to run a slice is in
-[docs/vision/build-slices.md](docs/vision/build-slices.md#how-to-run-a-slice).
+The fork adoption is tracked in labview-package-manager/lvpm: every slice is a
+sub-issue of [#43](https://github.com/labview-package-manager/lvpm/issues/43).
+Issue and PR numbers in older commits, and in `docs/` and `plans/`, are
+ThatsTheEnd/lvpm's own.
 
-When you start a slice:
+How to run a slice is in [docs/fork-adoption.md](docs/fork-adoption.md). In
+short:
 
-1. Set its card to **In Progress** (`N` is the issue number):
+- Branch from `integration/fork`, and open the PR into it, never into `main`.
+- Write the issue's Gherkin scenarios first, and see them fail.
+- The PR says `Part of #N`. Close the issue by hand after the merge.
 
-   ```bash
-   N=71
-   project_id=PVT_kwHOA_lWOM4Bo99Q
-   status_field_id=PVTSSF_lAHOA_lWOM4Bo99QzhnboIQ   # the Status field
-   in_progress_option_id=47fc9ee4                   # its "In Progress" option
-   item_id=$(gh project item-list 2 --owner ThatsTheEnd --limit 300 --format json \
-     -q ".items[] | select(.content.number==$N and .content.repository==\"ThatsTheEnd/lvpm\") | .id")
-   gh project item-edit --project-id "$project_id" --id "$item_id" \
-     --field-id "$status_field_id" --single-select-option-id "$in_progress_option_id"
-   ```
+Name the repository when you use `gh` in a clone of a fork, where it may pick
+another one: `gh pr create -R labview-package-manager/lvpm --base integration/fork`.
 
-   The ids come from `gh project field-list 2 --owner ThatsTheEnd --format json`;
-   re-read them there if the edit is refused. Raise `--limit` once the board
-   holds more than 300 items.
+## Build and test
 
-2. Then follow [How to run a slice](docs/vision/build-slices.md#how-to-run-a-slice):
-   the PR says `Closes #N` and, for a `deviation`, how it differs. Merging
-   closes the issue and the board moves the card to Done; never close a slice
-   issue or set Done by hand.
+```bash
+cargo test --workspace
+```
 
-Work that is not a slice needs no issue; its PR just doesn't say `Closes`.
+Scenarios are in `tests/features/` and run in `tests/acceptance.rs`. Add a new
+feature file to `FEATURE_FILES` there, or it does not run.
+
+Don't add features to CHANGELOG.md: it is generated at release.
