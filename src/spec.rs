@@ -23,6 +23,8 @@ pub struct Spec {
     pub name: String,
     pub version: String,
     pub display_name: Option<String>,
+    pub vendor: Option<String>,
+    pub license: Option<String>,
     pub file_groups: Vec<FileGroup>,
     /// Non-empty `[Script VIs]` hooks, e.g. ("PostInstall", "install.vi").
     /// About a quarter of published packages have at least one.
@@ -133,7 +135,11 @@ pub fn parse(text: &str) -> Result<Spec> {
     let lv_gate =
         sections.get("Platform").and_then(|s| non_empty(s, "Exclusive_LabVIEW_Version"));
 
-    Ok(Spec { name, version, display_name, file_groups, script_vis, requires, lv_gate })
+    let description = sections.get("Description");
+    let vendor = description.and_then(|s| non_empty(s, "Vendor"));
+    let license = description.and_then(|s| non_empty(s, "License"));
+
+    Ok(Spec { name, version, display_name, vendor, license, file_groups, script_vis, requires, lv_gate })
 }
 
 #[cfg(test)]

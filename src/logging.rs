@@ -38,6 +38,7 @@ const ROTATE_AT: u64 = 10 * 1024 * 1024;
 const NAME_MAX: usize = 80;
 
 struct State {
+    enabled: bool,
     file: Option<File>,
     path: Option<PathBuf>,
     /// Lines formatted before a file was attached.
@@ -48,6 +49,7 @@ struct State {
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
+    enabled: false,
     file: None,
     path: None,
     pending: Vec::new(),
@@ -87,6 +89,7 @@ pub fn level(arg: Option<&str>) -> Result<LevelFilter, String> {
 
 /// Install the logger and write the run's header line.
 pub fn init(level: LevelFilter) {
+    lock().enabled = true;
     if log::set_logger(&Logger).is_ok() {
         log::set_max_level(level);
     }
@@ -151,7 +154,8 @@ pub fn attach_default() {
 
 /// [`attach`] on a given state, so a test can use a private one.
 fn attach_to(s: &mut State, path: &Path) {
-    if s.path.as_deref() == Some(path) {
+    // Read-only commands such as SBOM export do not initialize file logging.
+    if !s.enabled || s.path.as_deref() == Some(path) {
         return;
     }
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -381,7 +385,7 @@ mod tests {
     }
 
     fn empty() -> State {
-        State { file: None, path: None, pending: Vec::new(), partial: [String::new(), String::new()], failed: false }
+        State { enabled: true, file: None, path: None, pending: Vec::new(), partial: [String::new(), String::new()], failed: false }
     }
 
     #[test]

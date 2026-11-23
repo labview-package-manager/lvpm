@@ -74,38 +74,72 @@ pub struct Rsrc {
     pub sections: Vec<Section>,
 }
 
+struct SectionBytes<'a> {
+    ident: [u8; 4],
+    off_field: usize,
+    data_offset: usize,
+    data: &'a [u8],
+}
+
+fn rsrc_sections(b: &[u8]) -> Result<(&[u8], Vec<SectionBytes<'_>>)> {
+    ensure!(b.len() >= 32 && &b[..6] == b"RSRC\r\n", "not an RSRC file");
+    let info_off = be32(b, 16)? as usize;
+    let info_sz = be32(b, 20)? as usize;
+    let data_off = be32(b, 24)? as usize;
+    ensure!(data_off == 32, "unexpected data offset {data_off}");
+    let info_end = info_off.checked_add(info_sz).context("info table out of range")?;
+    let info = b.get(info_off..info_end).context("info table out of range")?;
+    ensure!(info.len() >= 52, "info table out of range");
+    ensure!(info[..32] == b[..32], "second RSRC header differs from the first");
+    let info = &info[32..];
+
+    // BlockInfoListHeader has offsets relative to the second RSRC header.
+    let base = (be32(info, 12)? as usize).checked_sub(32).context("blockinfo offset inside the header copy")?;
+    let block_count = (be32(info, base)? as usize).checked_add(1).context("invalid block count")?;
+    ensure!(block_count <= (info.len() - base - 4) / 12, "truncated block headers");
+    let mut sections = Vec::new();
+    for i in 0..block_count {
+        let hdr = base + 4 + 12 * i;
+        let ident = info[hdr..hdr + 4].try_into()?;
+        let count = (be32(info, hdr + 4)? as usize).checked_add(1).context("invalid section count")?;
+        let offset = base.checked_add(be32(info, hdr + 8)? as usize).context("section table out of range")?;
+        let table = info.get(offset..).context("section table out of range")?;
+        ensure!(count <= table.len() / 20, "truncated section table");
+        for j in 0..count {
+            let off_field = offset + 20 * j + 12;
+            let data_offset = data_off.checked_add(be32(info, off_field)? as usize).context("section data out of range")?;
+            let data = b.get(data_offset..).context("section data out of range")?;
+            let size = be32(data, 0)? as usize;
+            let data = data[4..].get(..size).context("section data out of range")?;
+            sections.push(SectionBytes { ident, off_field, data_offset, data });
+        }
+    }
+    sections.sort_by_key(|section| section.data_offset);
+    Ok((info, sections))
+}
+
+fn rsrc_section_name(info: &[u8], off_field: usize) -> Option<&[u8]> {
+    // The section's name offset precedes its data offset by eight bytes.
+    // Names are Pascal strings after the block list.
+    let offset = be32(info, off_field.checked_sub(8)?).ok()?;
+    if offset == u32::MAX {
+        return None;
+    }
+    let table = (be32(info, 16).ok()? as usize).checked_sub(32)?;
+    let start = table.checked_add(offset as usize)?;
+    let (&len, bytes) = info.get(start..)?.split_first()?;
+    bytes.get(..usize::from(len))
+}
+
 impl Rsrc {
     pub fn parse(b: &[u8]) -> Result<Rsrc> {
-        ensure!(b.len() >= 32 && &b[..6] == b"RSRC\r\n", "not an RSRC file");
-        let info_off = be32(b, 16)? as usize;
-        let info_sz = be32(b, 20)? as usize;
-        let data_off = be32(b, 24)? as usize;
-        ensure!(data_off == 32, "unexpected data offset {data_off}");
-        ensure!(info_off + info_sz <= b.len() && info_sz >= 52, "info table out of range");
-        ensure!(b[info_off..info_off + 32] == b[..32], "second RSRC header differs from the first");
-        let info = b[info_off + 32..info_off + info_sz].to_vec();
-        // BlockInfoListHeader: int1, int2, int3, blockinfo_offset, blockinfo_size.
-        let base = be32(&info, 12)? as usize;
-        ensure!(base >= 32, "blockinfo offset inside the header copy");
-        let base = base - 32;
-        let nblocks = be32(&info, base)? as usize + 1;
-        let mut sections = Vec::new();
-        for i in 0..nblocks {
-            let hdr = base + 4 + 12 * i;
-            let ident: [u8; 4] = info.get(hdr..hdr + 4).context("truncated block header")?.try_into()?;
-            let scount = be32(&info, hdr + 4)? as usize + 1;
-            let soff = be32(&info, hdr + 8)? as usize;
-            for j in 0..scount {
-                let st = base + soff + 20 * j;
-                let doff = be32(&info, st + 12)? as usize;
-                let pos = data_off + doff;
-                let size = be32(b, pos)? as usize;
-                ensure!(pos + 4 + size <= b.len(), "section {} data out of range", String::from_utf8_lossy(&ident));
-                sections.push((doff, Section { ident, off_field: st + 12, data: b[pos + 4..pos + 4 + size].to_vec() }));
-            }
-        }
-        sections.sort_by_key(|(doff, _)| *doff);
-        Ok(Rsrc { head: b[..32].try_into()?, info, sections: sections.into_iter().map(|(_, s)| s).collect() })
+        let (info, sections) = rsrc_sections(b)?;
+        let sections = sections.into_iter().map(|section| Section {
+            ident: section.ident,
+            off_field: section.off_field,
+            data: section.data.to_vec(),
+        }).collect();
+        Ok(Rsrc { head: b[..32].try_into()?, info: info.to_vec(), sections })
     }
 
     pub fn write(&self) -> Vec<u8> {
@@ -134,6 +168,25 @@ impl Rsrc {
         out.extend_from_slice(&head);
         out.extend_from_slice(&info);
         out
+    }
+
+    /// Locate a named VINS resource at each level of an embedded instance path.
+    pub(crate) fn embedded_vi(&self, path: &[Vec<u8>]) -> Option<Rsrc> {
+        let (name, nested) = path.split_first()?;
+        let embedded = self.sections.iter().filter(|section| &section.ident == b"VINS").find_map(|section| {
+            let embedded = Self::parse(&section.data).ok()?;
+            let record = embedded.section(b"LVSR")?;
+            (embedded.section_name(record)? == name.as_slice()).then_some(embedded)
+        })?;
+        if nested.is_empty() {
+            Some(embedded)
+        } else {
+            embedded.embedded_vi(nested)
+        }
+    }
+
+    fn section_name(&self, section: &Section) -> Option<&[u8]> {
+        rsrc_section_name(&self.info, section.off_field)
     }
 
     /// (major, minor) from the `LVSR` block, e.g. (20, 0) for LabVIEW 2020.
@@ -434,25 +487,37 @@ pub fn separate_compiled_code(rsrc: &mut Rsrc) -> Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// PTH0 path records.
+// PTH0 and PTH2 path records.
 // ---------------------------------------------------------------------------
 
-/// `"PTH0" | u32 length | u16 type | u16 count | pascal components`. Type 0 is
-/// absolute — a drive letter or a `<vilib>`-style token as the first
-/// component — and type 1 is relative: a leading empty component means "from
-/// this VI's folder", each further empty one goes up a level.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PthFormat {
+    Pth0 { zero_length: bool },
+    Pth2,
+}
+
+/// A saved LabVIEW path. Type 0 is absolute or a token, and type 1 is
+/// relative: the first empty component anchors it at the VI's directory and
+/// each further empty component goes up a level. Types 2 and 3 are an invalid
+/// path and a UNC path, respectively.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pth {
     pub tp: u16,
     pub comps: Vec<Vec<u8>>,
-    /// Written with a zero length field: the empty placeholder form.
-    zero: bool,
+    format: PthFormat,
 }
 
 impl Pth {
-    fn parse(b: &[u8], pos: usize) -> Result<(Pth, usize)> {
-        ensure!(b.get(pos..pos + 4) == Some(b"PTH0"), "no PTH0 at {pos}");
+    pub(crate) fn parse(b: &[u8], pos: usize) -> Result<(Pth, usize)> {
         let totlen = be32(b, pos + 4)? as usize;
+        match b.get(pos..pos + 4) {
+            Some(b"PTH0") => Self::parse_pth0(b, pos, totlen),
+            Some(b"PTH2") => Self::parse_pth2(b, pos + 8, totlen),
+            _ => bail!("unrecognized path record at {pos}"),
+        }
+    }
+
+    fn parse_pth0(b: &[u8], pos: usize, totlen: usize) -> Result<(Pth, usize)> {
         let tp = be16(b, pos + 8)?;
         let count = be16(b, pos + 10)? as usize;
         ensure!(count <= 128, "PTH0 with {count} components");
@@ -464,26 +529,82 @@ impl Pth {
             comps.push(b[p + 1..p + 1 + n].to_vec());
             p += 1 + n;
         }
-        let ctlen = 4 + comps.iter().map(|c| 1 + c.len()).sum::<usize>();
+        let ctlen = p - (pos + 8);
         ensure!(totlen == ctlen || totlen == 0, "PTH0 length {totlen} does not match content {ctlen}");
-        Ok((Pth { tp, comps, zero: totlen == 0 }, p))
+        Ok((Pth { tp, comps, format: PthFormat::Pth0 { zero_length: totlen == 0 } }, p))
+    }
+
+    // PTH2 stores a four-byte path type followed by u16-length components,
+    // bounded by the payload length. Unlike PTH0 it has no component count.
+    fn parse_pth2(b: &[u8], start: usize, totlen: usize) -> Result<(Pth, usize)> {
+        let end = start.checked_add(totlen).context("PTH2 length overflow")?;
+        let data = b.get(start..end).context("truncated PTH2")?;
+        let tp = match data.get(..4) {
+            Some(b"abs ") => 0,
+            Some(b"rel ") => 1,
+            Some(b"!pth") => 2,
+            Some(b"unc ") => 3,
+            _ => bail!("invalid PTH2 path type"),
+        };
+        let mut comps = Vec::new();
+        let mut p = 4;
+        while p < data.len() {
+            ensure!(comps.len() < 128, "PTH2 with more than 128 components");
+            let n = be16(data, p)? as usize;
+            p += 2;
+            comps.push(data.get(p..p + n).context("truncated PTH2 component")?.to_vec());
+            p += n;
+        }
+        Ok((Pth { tp, comps, format: PthFormat::Pth2 }, end))
     }
 
     fn write(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(b"PTH0");
-        let ctlen = 4 + self.comps.iter().map(|c| 1 + c.len()).sum::<usize>();
-        let totlen = if self.zero && self.tp == 0 && self.comps.is_empty() { 0 } else { ctlen };
-        out.extend_from_slice(&(totlen as u32).to_be_bytes());
-        out.extend_from_slice(&self.tp.to_be_bytes());
-        out.extend_from_slice(&(self.comps.len() as u16).to_be_bytes());
-        for c in &self.comps {
-            out.push(c.len() as u8);
-            out.extend_from_slice(c);
+        match self.format {
+            PthFormat::Pth0 { zero_length } => {
+                out.extend_from_slice(b"PTH0");
+                let ctlen = 4 + self.comps.iter().map(|c| 1 + c.len()).sum::<usize>();
+                let totlen = if zero_length && self.tp == 0 && self.comps.is_empty() { 0 } else { ctlen };
+                out.extend_from_slice(&(totlen as u32).to_be_bytes());
+                out.extend_from_slice(&self.tp.to_be_bytes());
+                out.extend_from_slice(&(self.comps.len() as u16).to_be_bytes());
+                for c in &self.comps {
+                    out.push(c.len() as u8);
+                    out.extend_from_slice(c);
+                }
+            }
+            PthFormat::Pth2 => {
+                out.extend_from_slice(b"PTH2");
+                let totlen = 4 + self.comps.iter().map(|c| 2 + c.len()).sum::<usize>();
+                out.extend_from_slice(&(totlen as u32).to_be_bytes());
+                let kind = match self.tp {
+                    0 => b"abs ",
+                    1 => b"rel ",
+                    2 => b"!pth",
+                    3 => b"unc ",
+                    _ => unreachable!("PTH2 path type is validated when parsed"),
+                };
+                out.extend_from_slice(kind);
+                for c in &self.comps {
+                    out.extend_from_slice(&(c.len() as u16).to_be_bytes());
+                    out.extend_from_slice(c);
+                }
+            }
+        }
+    }
+
+    fn pth0(tp: u16, comps: Vec<Vec<u8>>) -> Self {
+        Self { tp, comps, format: PthFormat::Pth0 { zero_length: false } }
+    }
+
+    fn with_path(&self, tp: u16, comps: Vec<Vec<u8>>) -> Self {
+        match self.format {
+            PthFormat::Pth0 { .. } => Self::pth0(tp, comps),
+            PthFormat::Pth2 => Self { tp, comps, format: PthFormat::Pth2 },
         }
     }
 
     pub fn token(comps: Vec<Vec<u8>>) -> Pth {
-        Pth { tp: 0, comps, zero: false }
+        Self::pth0(0, comps)
     }
 
     pub fn is_token(&self) -> bool {
@@ -551,6 +672,30 @@ pub struct LinkObj {
     tail_pos: usize,
 }
 
+impl LinkObj {
+    /// A VINS reference qualifies each relative path component with Instance.
+    pub(crate) fn embedded_instance_path(&self) -> Option<&[Vec<u8>]> {
+        let path = self.path.comps.as_slice();
+        (matches!(&self.ident, b"VIVI" | b"IUVI")
+            && self.flag == 1
+            && self.path.is_relative()
+            && !path.is_empty()
+            && self.qual.len() == 2 * path.len()
+            && self.qual.chunks_exact(2).zip(path).all(|(pair, name)| {
+                pair[0].as_slice() == b"Instance" && &pair[1] == name
+            }))
+        .then_some(path)
+    }
+
+    pub(crate) fn is_embedded_owner(&self) -> bool {
+        self.ident == *b"IVOV"
+            && self.flag == 3
+            && self.qual.is_empty()
+            && self.path.is_relative()
+            && matches!(self.path.comps.as_slice(), [anchor] if anchor.is_empty())
+    }
+}
+
 pub struct LinkSection {
     list_ident: [u8; 4],
     /// Pre-2014 files: the qualified-name header, kept raw.
@@ -562,7 +707,7 @@ fn pad_to(pos: usize, n: usize) -> usize {
     (n - pos % n) % n
 }
 
-/// Parse `ident | pad4 | qualname | pad2 | PTH0 | flag` at `pos` (the ident).
+/// Parse `ident | pad4 | qualname | pad2 | path | flag` at `pos` (the ident).
 fn parse_basic(b: &[u8], mut pos: usize, ver: (u32, u32)) -> Result<Basic> {
     let ident: [u8; 4] = b.get(pos..pos + 4).context("truncated ident")?.try_into()?;
     pos += 4;
@@ -713,7 +858,7 @@ struct ApiTail {
 /// A class and its direct parents, as the LabVIEW 2020 class list holds them.
 type ClassParents = (Vec<Vec<u8>>, Pth, Vec<(Vec<Vec<u8>>, Pth)>);
 
-/// `u32 m, qual×m, PTH0` at `q`: a class's qualified name and absolute path.
+/// `u32 m, qual×m, path` at `q`: a class's qualified name and absolute path.
 fn parse_class_ref(t: &[u8], q: &mut usize) -> Result<(Vec<Vec<u8>>, Pth)> {
     let m = be32(t, *q)? as usize;
     ensure!(m <= 64, "qualified name too long");
@@ -938,7 +1083,10 @@ fn reflow_dn_tail(o: &LinkObj, ver: (u32, u32), new_pos: usize, out: &mut Vec<u8
     }
     let k = pad_to(o.tail_pos + p, 2);
     ensure!(t.len() >= p + k && t[p..p + k].iter().all(|&x| x == 0), "assembly link pad is not zero");
-    ensure!(t.get(p + k..p + k + 4) == Some(b"PTH0"), "assembly link has no trailing path");
+    ensure!(
+        matches!(t.get(p + k..p + k + 4), Some(b"PTH0" | b"PTH2")),
+        "assembly link has no trailing path"
+    );
     out.extend_from_slice(&t[..p]);
     out.resize(out.len() + pad_to(new_pos + p, 2), 0);
     out.extend_from_slice(&t[p + k..]);
@@ -979,6 +1127,7 @@ const TOKENS: &[(&str, &str)] = &[
     ("<resource>", "resource"),
     ("<menus>", "menus"),
     ("<help>", "help"),
+    ("<helpdir>", "help"),
     ("<examples>", "examples"),
     ("<project>", "project"),
     ("<templates>", "templates"),
@@ -1224,7 +1373,7 @@ fn urls(xml: &str) -> Vec<String> {
 }
 
 /// `<vilib>/a/b` -> `vi.lib/a/b`
-fn token_to_logical(p: &str) -> Option<String> {
+pub(crate) fn token_to_logical(p: &str) -> Option<String> {
     let (tok, rest) = match p.find('/') {
         Some(i) => (&p[..i], &p[i + 1..]),
         None => (p, ""),
@@ -1301,12 +1450,32 @@ fn resolve_relative(vi_dir: &str, comps: &[Vec<u8>]) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// The files inside an LLB: (name with extension, bytes). An LLB is an RSRC
-/// container (type `LVAR`) with its members laid out verbatim, each a whole
-/// RSRC file whose second header copy sits at its own info offset — that
-/// copy is what tells a real member start from a stray `RSRC` string. The
-/// name comes from the member's `TITL` block.
-fn llb_members(data: &[u8]) -> Vec<(String, &[u8])> {
+/// Return a filename and borrowed resource bytes for each VI or control in an LLB.
+pub(crate) fn llb_members(data: &[u8]) -> Vec<(String, &[u8])> {
+    if data.get(8..12) == Some(b"LVAR")
+        && let Ok((info, sections)) = rsrc_sections(data)
+    {
+        let named: Vec<_> = sections.into_iter().filter_map(|section| {
+            if &section.ident != b"UCRF" || !section.data.starts_with(b"RSRC\r\n") {
+                return None;
+            }
+            // LVAR's uncompressed resources have the real filename in the
+            // outer name table, including when the VI has no TITL block.
+            let name = rsrc_section_name(info, section.off_field)?;
+            if name.is_empty() || name == b"." || name == b".."
+                || name.iter().any(|&byte| matches!(byte, b'/' | b'\\' | b':' | b'\0'))
+            {
+                return None;
+            }
+            Some((String::from_utf8_lossy(name).into_owned(), section.data))
+        }).collect();
+        if !named.is_empty() {
+            return named;
+        }
+    }
+
+    // Legacy fallback: find verbatim nested resources by their duplicate
+    // RSRC header and recover the filename from the member's TITL block.
     let mut out = Vec::new();
     let mut i = match data.len() > 6 { true => 1, false => return out };
     while let Some(off) = data[i..].windows(6).position(|w| w == b"RSRC\r\n") {
@@ -1349,7 +1518,7 @@ fn llb_members(data: &[u8]) -> Vec<(String, &[u8])> {
 /// Every file under `root`, as (physical, logical) where logical starts with
 /// the LabVIEW folder (`vi.lib/...`). An `.llb` is listed as one file and not
 /// entered here; `Tree::read_llbs` indexes its members for resolution only.
-fn walk(root: &Path) -> Result<Vec<(PathBuf, String)>> {
+pub(crate) fn walk(root: &Path) -> Result<Vec<(PathBuf, String)>> {
     ensure!(!std::fs::symlink_metadata(root)?.file_type().is_symlink(), "linked root is not supported: {}", root.display());
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -1679,7 +1848,7 @@ pub fn fix_vi(bytes: &[u8], vi_logical: &str, tree: &Tree, m: Methods) -> Result
                     && !o.path.is_token()
                     && let Some(tok) = link_token(&owner)
                 {
-                    o.path = Pth::token(tok);
+                    o.path = o.path.with_path(0, tok);
                     changes.owner += 1;
                     sec_changed = true;
                 }
@@ -1695,9 +1864,9 @@ pub fn fix_vi(bytes: &[u8], vi_logical: &str, tree: &Tree, m: Methods) -> Result
                 let from_build_machine = o.path.is_drive()
                     || resolve_relative(&vi_dir, &o.path.comps).is_none_or(|l| !l.eq_ignore_ascii_case(&target));
                 let new = match link_token(&target) {
-                    Some(tok) => Some(Pth::token(tok)),
+                    Some(tok) => Some(o.path.with_path(0, tok)),
                     None if from_build_machine && tree.same_root(vi_logical, &target) => {
-                        Some(Pth { tp: 1, comps: relative_comps(&vi_dir, &target), zero: false })
+                        Some(o.path.with_path(1, relative_comps(&vi_dir, &target)))
                     }
                     None => None,
                 };
@@ -1800,7 +1969,7 @@ pub fn is_vi_like(p: &Path) -> bool {
     )
 }
 
-fn is_library_xml(p: &Path) -> bool {
+pub(crate) fn is_library_xml(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
         Some("lvlib" | "lvclass")
@@ -2127,6 +2296,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn llb_uses_the_outer_name_for_a_member_without_a_title_block() {
+        fn resource(file_type: [u8; 4], block: [u8; 4], name: &[u8], payload: Vec<u8>) -> Vec<u8> {
+            let mut head = [0; 32];
+            head[..6].copy_from_slice(b"RSRC\r\n");
+            head[8..12].copy_from_slice(&file_type);
+            let mut info = vec![0; 56];
+            info[12..16].copy_from_slice(&52u32.to_be_bytes());
+            info[16..20].copy_from_slice(&88u32.to_be_bytes());
+            info[24..28].copy_from_slice(&block);
+            info[32..36].copy_from_slice(&16u32.to_be_bytes());
+            info.push(name.len() as u8);
+            info.extend_from_slice(name);
+            let sections = vec![Section { ident: block, off_field: 48, data: payload }];
+            Rsrc { head, info, sections }.write()
+        }
+
+        let member = resource(*b"LVIN", *b"LVSR", b"", vec![0; 4]);
+        let llb = resource(*b"LVAR", *b"UCRF", b"Directory Name.vi", member.clone());
+        assert_eq!(llb_members(&llb), vec![("Directory Name.vi".to_owned(), member.as_slice())]);
+
+        // These section names are paths or special components on at least one platform.
+        for name in [b"../Bad.vi".as_slice(), b"..\\Bad.vi", b"C:Bad.vi", b".", b"..", b"Bad\0Name.vi"] {
+            let llb = resource(*b"LVAR", *b"UCRF", name, member.clone());
+            let entries = llb_members(&llb);
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0].0.starts_with("member@"));
+            assert_eq!(entries[0].1, member.as_slice());
+        }
+    }
+
+    #[test]
     fn the_heap_is_inflated_only_when_a_call_library_link_reads_it() {
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         z.write_all(b"heap bytes").unwrap();
@@ -2138,7 +2338,7 @@ mod tests {
         let mut o = LinkObj {
             ident: *b"VIVI",
             qual: vec![b"lib.*".to_vec()],
-            path: Pth { tp: 0, comps: vec![b"a".to_vec()], zero: false },
+            path: Pth::pth0(0, vec![b"a".to_vec()]),
             flag: 0,
             tail: Vec::new(),
             tail_pos: 0,
@@ -2348,6 +2548,176 @@ mod tests {
     }
 
     #[test]
+    fn build_sbom_follows_transitive_links_from_the_selected_sources() {
+        let root = std::env::temp_dir().join(format!("lvpm-vi-graph-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let project = root.join("test.lvproj");
+        std::fs::write(&project, r#"
+<Project><Item Name="Desktop" Type="My Computer">
+ <Item Name="Startup.vi" Type="VI" URL="../Startup.vi"/>
+ <Item Name="Other.vi" Type="VI" URL="../Other.vi"/>
+ <Item Name="Packed.lvlib" Type="Library" URL="../Packed.lvlib"/>
+ <Item Name="Build Specifications" Type="Build">
+  <Item Name="Demo" Type="EXE">
+   <Property Name="Source[0].itemID">/Desktop/Startup.vi</Property>
+   <Property Name="Source[0].sourceInclusion">TopLevel</Property>
+  </Item>
+  <Item Name="Sources" Type="Source Distribution">
+   <Property Name="Source[0].itemID">/Desktop/Other.vi</Property>
+   <Property Name="Source[0].sourceInclusion">Include</Property>
+  </Item>
+  <Item Name="Packed" Type="Packed Library">
+   <Property Name="Source[1].itemID">/Desktop/Packed.lvlib</Property>
+   <Property Name="Source[1].Library.LVLIBPtopLevel">true</Property>
+   <Property Name="TgtF_productName">Packed Demo</Property>
+   <Property Name="Bld_version.major">2</Property>
+  </Item>
+ </Item>
+</Item></Project>
+"#).unwrap();
+
+        let mut vi = Rsrc::parse(&sample().expect("bundled VI fixture")).unwrap();
+        let version = vi.version().unwrap();
+        vi.edit_blocks(&[*b"LIvi", *b"LIbd", *b"LIfp", *b"LIds", *b"VINS"], None).unwrap();
+        let write_vi = |name: &str, callees: &[&str]| {
+            let mut vi = vi.clone();
+            let links = LinkSection {
+                list_ident: *b"LVIN",
+                header_extra: Vec::new(),
+                objs: callees.iter().map(|callee| LinkObj {
+                    ident: *b"VIVI",
+                    qual: vec![callee.as_bytes().to_vec()],
+                    path: Pth::pth0(1, vec![Vec::new(), callee.as_bytes().to_vec()]),
+                    flag: 0,
+                    tail: Vec::new(),
+                    tail_pos: 0,
+                }).collect(),
+            };
+            vi.edit_blocks(&[], Some((*b"LIvi", links.write(version, false).unwrap()))).unwrap();
+            std::fs::write(root.join(name), vi.write()).unwrap();
+        };
+        write_vi("Startup.vi", &["Sub.vi"]);
+        write_vi("Sub.vi", &["Leaf.vi"]);
+        write_vi("Leaf.vi", &["Startup.vi"]);
+        write_vi("Other.vi", &[]);
+        std::fs::write(root.join("Packed.lvlib"), r#"<Library><Item Name="Nested.lvlib" Type="Library" URL="../Nested.lvlib"/></Library>"#).unwrap();
+        std::fs::write(root.join("Nested.lvlib"), r#"<Library><Item Name="Startup.vi" Type="VI" URL="../Startup.vi"/></Library>"#).unwrap();
+
+        // A flattened reference reaches the nested VINS resource. Its link
+        // to Startup.vi's sibling crosses both virtual folders.
+        let instance_name = b"instance.vi";
+        let nested_name = b"nested.vi";
+        let startup_path = root.join("Startup.vi");
+        let set_instance_name = |resource: &mut Rsrc, name: &[u8]| {
+            let name_field = resource.section(b"LVSR").unwrap().off_field - 8;
+            let names_start = be32(&resource.info, 16).unwrap() as usize - 32;
+            let name_offset = (resource.info.len() - names_start) as u32;
+            resource.info[name_field..name_field + 4].copy_from_slice(&name_offset.to_be_bytes());
+            resource.info.push(name.len() as u8);
+            resource.info.extend_from_slice(name);
+        };
+
+        let mut nested = Rsrc::parse(&std::fs::read(&startup_path).unwrap()).unwrap();
+        set_instance_name(&mut nested, nested_name);
+        let nested_section = nested.section_mut(b"LIvi").unwrap();
+        let mut nested_links = LinkSection::parse(&nested_section.data, version).unwrap();
+        nested_links.objs[0].path.comps.splice(0..0, [Vec::new(), Vec::new()]);
+        nested_section.data = nested_links.write(version, false).unwrap();
+
+        let mut embedded = vi.clone();
+        set_instance_name(&mut embedded, instance_name);
+        let owner_link = LinkObj {
+            ident: *b"IVOV",
+            qual: Vec::new(),
+            path: Pth::pth0(1, vec![Vec::new()]),
+            flag: 3,
+            tail: Vec::new(),
+            // Position after the flag for this sole object.
+            tail_pos: 37,
+        };
+        let links = LinkSection { list_ident: *b"LVIN", header_extra: Vec::new(), objs: vec![owner_link] };
+        embedded.edit_blocks(&[], Some((*b"LIvi", links.write(version, false).unwrap()))).unwrap();
+        embedded.edit_blocks(&[], Some((*b"VINS", nested.write()))).unwrap();
+
+        let mut startup = vi.clone();
+        let direct = LinkObj {
+            ident: *b"VIVI",
+            qual: vec![b"Instance".to_vec(), instance_name.to_vec()],
+            path: Pth::pth0(1, vec![instance_name.to_vec()]),
+            flag: 1,
+            tail: Vec::new(),
+            tail_pos: 0,
+        };
+        let mut flat = direct.clone();
+        flat.qual.extend([b"Instance".to_vec(), nested_name.to_vec()]);
+        flat.path.comps.push(nested_name.to_vec());
+        let links = LinkSection { list_ident: *b"LVIN", header_extra: Vec::new(), objs: vec![direct, flat] };
+        startup.edit_blocks(&[], Some((*b"LIvi", links.write(version, false).unwrap()))).unwrap();
+        let without_instance = startup.write();
+        startup.edit_blocks(&[], Some((*b"VINS", embedded.write()))).unwrap();
+        let with_instance = startup.write();
+        std::fs::write(&startup_path, &with_instance).unwrap();
+
+        let database = root.join("vipm");
+        for (package, file) in [("pkg_a", "Sub.vi"), ("pkg_b", "Leaf.vi"), ("unused", "Other.vi")] {
+            let record = database.join(package);
+            std::fs::create_dir_all(&record).unwrap();
+            std::fs::write(record.join("files-installed"), root.join(file).display().to_string()).unwrap();
+            let archive = std::fs::File::create(record.join(format!("{package}-1.0.0.1.vip"))).unwrap();
+            let mut zip = zip::ZipWriter::new(archive);
+            zip.start_file("spec", zip::write::SimpleFileOptions::default()).unwrap();
+            writeln!(zip, "[Package]\nName={package}\nVersion=1.0.0.1").unwrap();
+            zip.finish().unwrap();
+        }
+        let export = |build, allow_incomplete| {
+            crate::sbom::build_document(
+                &project,
+                "Desktop",
+                build,
+                crate::sbom::ProjectBuildOptions {
+                    include: None,
+                    environment: crate::vi_graph::Environment {
+                        global: true,
+                        ..Default::default()
+                    },
+                    allow_incomplete,
+                    vipm_database: Some(&database),
+                    output: None,
+                },
+                None,
+            )
+        };
+        let exe = export("Demo", false).unwrap();
+        let names: Vec<_> = exe["components"].as_array().unwrap().iter()
+            .map(|component| component["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["pkg_a", "pkg_b"]);
+        assert_eq!(exe["dependencies"][0]["dependsOn"], serde_json::json!(["pkg:generic/vipm/pkg_a@1.0.0.1"]));
+        assert_eq!(exe["dependencies"][1]["dependsOn"], serde_json::json!(["pkg:generic/vipm/pkg_b@1.0.0.1"]));
+
+        let src = export("Sources", false).unwrap();
+        assert_eq!(src["components"].as_array().unwrap().len(), 1);
+        assert_eq!(src["components"][0]["name"], "unused");
+
+        let packed = export("Packed", false).unwrap();
+        assert_eq!(packed["metadata"]["component"]["type"], "library");
+        assert_eq!(packed["metadata"]["component"]["name"], "Packed Demo");
+        assert_eq!(packed["metadata"]["component"]["version"], "2.0.0.0");
+        assert_eq!(packed["dependencies"], exe["dependencies"]);
+        assert_eq!(packed["components"], exe["components"]);
+
+        std::fs::write(&startup_path, &without_instance).unwrap();
+        let error = export("Demo", false).unwrap_err().to_string();
+        assert!(error.contains("instance.vi"), "{error}");
+        std::fs::write(&startup_path, &with_instance).unwrap();
+
+        std::fs::remove_file(root.join("Leaf.vi")).unwrap();
+        assert!(export("Demo", false).is_err());
+        let partial = export("Demo", true).unwrap();
+        assert_eq!(partial["compositions"][0]["aggregate"], "incomplete");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn container_round_trips_byte_exactly() {
         let Some(b) = sample() else { return };
         let r = Rsrc::parse(&b).unwrap();
@@ -2447,6 +2817,48 @@ mod tests {
     }
 
     #[test]
+    fn pth2_round_trips_utf8_and_leaves_the_fields_after_the_path() {
+        let record = b"\xffPTH2\0\0\0\x14rel \0\0\0\x0cR\xc3\xbccklauf.vi\xff";
+        let (path, end) = Pth::parse(record, 1).unwrap();
+        assert_eq!(end, record.len() - 1);
+        assert!(path.is_relative());
+        assert_eq!(path.comps, vec![Vec::new(), "Rücklauf.vi".as_bytes().to_vec()]);
+        let mut written = Vec::new();
+        path.write(&mut written);
+        assert_eq!(written, record[1..end]);
+
+        let replacement = path.with_path(0, vec![b"<vilib>".to_vec(), vec![b'a'; 300]]);
+        written.clear();
+        replacement.write(&mut written);
+        assert!(written.starts_with(b"PTH2"));
+        assert_eq!(Pth::parse(&written, 0).unwrap(), (replacement, written.len()));
+    }
+
+    #[test]
+    fn pth2_rejects_bad_lengths_and_path_types() {
+        for invalid in [
+            b"PTH2\0\0\0\x03rel ".as_slice(),
+            b"PTH2\0\0\0\x04????",
+            b"PTH2\0\0\0\x06rel ",
+            b"PTH2\0\0\0\x07rel \0\x02\xff",
+        ] {
+            assert!(Pth::parse(invalid, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn link_section_recognizes_pth2_after_a_pth0_object() {
+        let mut section = b"\0\x01LVIN\0\0\0\x02".to_vec();
+        section.extend_from_slice(b"\0\x02VIVI\0\0\0\0PTH0\0\0\0\x04\0\0\0\0\0\0\0\0\xff");
+        section.extend_from_slice(b"\0\x02VIVI\0\0\0\0\0PTH2\0\0\0\x04!pth\0\0\0\0");
+        section.extend_from_slice(b"\0\x03");
+        let links = LinkSection::parse(&section, (25, 0)).unwrap();
+        assert_eq!(links.objs.len(), 2);
+        assert_eq!(links.objs[1].path.tp, 2);
+        assert_eq!(links.write((25, 0), false).unwrap(), section);
+    }
+
+    #[test]
     fn relative_paths_resolve_like_labview() {
         let up = vec![b"".to_vec(), b"".to_vec(), b"JKI JSON Serialization.lvlib".to_vec()];
         assert_eq!(
@@ -2527,7 +2939,7 @@ mod tests {
         assert!(!tree.qualified_as(vi, &q(&["Old.lvlib", "Global.vi"]), false));
         assert!(tree.qualified_as(class, &q(&["C.lvclass", "\x07\x00"]), true));
         assert!(!tree.qualified_as(class, &q(&["D.lvclass", "\x07\x00"]), true));
-        let absolute = Pth { tp: 0, comps: q(&["C", "build", "Old", "Global.vi"]), zero: false };
+        let absolute = Pth::pth0(0, q(&["C", "build", "Old", "Global.vi"]));
         assert!(tree.only_one_qualified(&absolute, &q(&["Old.lvlib", "Global.vi"]), false).is_none());
         assert_eq!(tree.only_one_qualified(&absolute, &q(&["New.lvlib", "Global.vi"]), false), Some(vi.to_string()));
     }
@@ -2538,6 +2950,19 @@ mod tests {
         let t = logical_to_token("user.lib/_OpenG.lib/a.lvlib").unwrap();
         assert_eq!(t[0], b"<userlib>");
         assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn helpdir_is_a_read_alias_for_the_help_folder() {
+        assert_eq!(
+            token_to_logical("<helpdir>/Guide/Index.vi").as_deref(),
+            Some("help/Guide/Index.vi")
+        );
+        assert_eq!(
+            logical_to_token("help/Guide/Index.vi").unwrap(),
+            [b"<help>".to_vec(), b"Guide".to_vec(), b"Index.vi".to_vec()]
+        );
+        assert!(link_token("help/Guide/Index.vi").is_none());
     }
 
     #[test]

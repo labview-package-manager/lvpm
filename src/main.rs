@@ -22,6 +22,17 @@ compile_error!("lvpm supports Windows and Linux; macOS is on the roadmap (docs/r
 // First, so its print-and-log macros are in scope in every module below.
 #[macro_use]
 mod logging;
+mod lvproj;
+mod nipkg;
+#[cfg(windows)]
+mod nipkg_cab;
+#[cfg(windows)]
+mod nipkg_msi;
+mod package_graph;
+mod ppl;
+mod distribution;
+mod ppl_pe;
+mod vi_graph;
 mod cache;
 mod config;
 mod dependency;
@@ -35,6 +46,18 @@ mod project;
 mod refresh;
 mod relink;
 mod resolve;
+mod sbom;
+mod sbom_artifact_document;
+mod sbom_artifacts;
+mod sbom_ci;
+mod sbom_diff;
+mod sbom_graph_validation;
+mod sbom_installers;
+mod sbom_merge;
+mod sbom_metadata;
+mod sbom_paths;
+mod sbom_pe;
+mod sbom_schema;
 mod shadow;
 mod shortcut;
 mod spec;
@@ -108,19 +131,59 @@ struct RelinkArgs {
     keep_open: bool,
 }
 
-/// Which named dependency groups a manifest install takes. `main` names
+/// Which named dependency groups an install or SBOM export takes. `main` names
 /// `[dependencies]`, the only group installed by default.
 #[derive(clap::Args, Clone)]
 struct GroupArgs {
-    /// Also install these dependency groups (comma-separated).
-    #[arg(long, value_name = "GROUP", value_delimiter = ',', conflicts_with_all = ["only", "package"])]
+    /// Also include these dependency groups (comma-separated).
+    #[arg(long, value_name = "GROUP", value_delimiter = ',', conflicts_with = "only")]
     with: Vec<String>,
     /// Leave these groups out, `main` included (comma-separated).
-    #[arg(long, value_name = "GROUP", value_delimiter = ',', conflicts_with_all = ["only", "package"])]
+    #[arg(long, value_name = "GROUP", value_delimiter = ',', conflicts_with = "only")]
     without: Vec<String>,
-    /// Install only these groups (comma-separated); add `main` to keep [dependencies].
-    #[arg(long, value_name = "GROUP", value_delimiter = ',', conflicts_with = "package")]
+    /// Include only these groups (comma-separated); add `main` to keep [dependencies].
+    #[arg(long, value_name = "GROUP", value_delimiter = ',')]
     only: Vec<String>,
+}
+
+#[derive(clap::Args)]
+struct SbomProjectArgs {
+    /// Read control metadata and packed libraries from a built NI package (.nipkg).
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["lvproj", "with", "without", "only"])]
+    nipkg: Option<PathBuf>,
+    /// Read direct packed-library references from a built .lvlibp.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["nipkg", "lvproj", "with", "without", "only"])]
+    lvlibp: Option<PathBuf>,
+    /// Scan a saved LabVIEW project or a selected build specification.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["with", "without", "only"])]
+    lvproj: Option<PathBuf>,
+    /// Select the exact target of --lvproj-build-spec.
+    #[arg(long, value_name = "NAME", requires_all = ["lvproj", "lvproj_build_spec"])]
+    lvproj_target: Option<String>,
+    /// Select the exact build specification name in the target.
+    #[arg(long, value_name = "NAME", requires_all = ["lvproj", "lvproj_target"])]
+    lvproj_build_spec: Option<String>,
+    /// Export a partial VI dependency graph when files or links cannot be read.
+    #[arg(long, requires = "lvproj")]
+    allow_incomplete: bool,
+    /// Override the installed VIPM ownership database used in VI dependency scans.
+    #[arg(long, value_name = "DIR", requires = "lvproj")]
+    vipm_database: Option<PathBuf>,
+    /// Select a delivered output file or directory. Repeat to select multiple outputs.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["nipkg", "lvlibp", "with", "without", "only"])]
+    artifact: Vec<PathBuf>,
+    /// Set the common root used for artifact paths in the SBOM.
+    #[arg(long, value_name = "DIR", requires = "artifact")]
+    artifact_root: Option<PathBuf>,
+    /// Select the product's file by its path relative to the artifact root.
+    #[arg(long, value_name = "PATH", requires = "artifact")]
+    primary_artifact: Option<String>,
+    /// Override the product name for an artifact export.
+    #[arg(long, value_name = "NAME", requires = "artifact")]
+    product_name: Option<String>,
+    /// Set the release version for an artifact export.
+    #[arg(long, value_name = "VERSION", requires = "artifact")]
+    product_version: Option<String>,
 }
 
 /// Whether `install <pkg>` writes the package into the venv's manifest.
@@ -154,6 +217,7 @@ enum Cmd {
     /// `--no-save` leaves the manifest alone.
     Install {
         /// Package to install. Omit when using --manifest.
+        #[arg(conflicts_with_all = ["with", "without", "only"])]
         package: Option<String>,
         /// Install every package listed in an `lvpm.toml`'s `[dependencies]`.
         ///
@@ -432,8 +496,73 @@ enum Cmd {
     },
     /// Show what lvpm has installed into the selected target.
     List,
+    /// Export or merge CycloneDX 1.5 JSON SBOMs.
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
+    Sbom(Box<SbomArgs>),
     /// Search the indexes.
     Search { query: String },
+}
+
+#[derive(clap::Args)]
+struct SbomArgs {
+    /// Write the SBOM to this file.
+    #[arg(long, value_name = "FILE", required = true)]
+    output: Option<PathBuf>,
+    /// Add the components in a CycloneDX 1.5 JSON file as direct dependencies.
+    #[arg(long, value_name = "FILE")]
+    include: Option<PathBuf>,
+    /// Require adequate SBOM coverage in the selected scope.
+    #[arg(long, value_name = "SCOPE", num_args = 0..=1, require_equals = true, default_missing_value = "all")]
+    fail_on_incomplete: Option<sbom_ci::CoverageScope>,
+    /// Write one JSON diagnostic per line to stderr.
+    #[arg(long)]
+    diagnostics_json: bool,
+    #[command(flatten)]
+    groups: GroupArgs,
+    #[command(flatten)]
+    source: SbomProjectArgs,
+    #[command(subcommand)]
+    action: Option<SbomCmd>,
+}
+
+#[derive(Subcommand)]
+enum SbomCmd {
+    /// Compare the declared requirements of a build spec and a built NI package.
+    Diff {
+        /// CycloneDX JSON exported from the NIPKG build specification.
+        #[arg(long, value_name = "FILE")]
+        buildspec: PathBuf,
+        /// CycloneDX JSON exported from the built .nipkg.
+        #[arg(long, value_name = "FILE")]
+        built: PathBuf,
+        /// Return exit code 5 if package requirements were added, removed or changed.
+        #[arg(long)]
+        fail_on_change: bool,
+        /// Write one JSON diagnostic per line to stderr.
+        #[arg(long)]
+        diagnostics_json: bool,
+    },
+    /// Merge both graphs, attaching a child product or enriching an existing PPL.
+    Merge {
+        /// CycloneDX JSON whose product remains the root.
+        #[arg(long, value_name = "FILE")]
+        primary: PathBuf,
+        /// CycloneDX JSON files whose products are merged into the primary graph.
+        #[arg(long, value_name = "FILE", required_unless_present = "relationships", conflicts_with = "relationships", num_args = 1..)]
+        child: Vec<PathBuf>,
+        /// Read the child SBOM aliases and explicit relationships from a JSON file.
+        #[arg(long, value_name = "FILE")]
+        relationships: Option<PathBuf>,
+        /// Write the merged CycloneDX JSON to this file.
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+        /// Require adequate SBOM coverage in the selected scope.
+        #[arg(long, value_name = "SCOPE", num_args = 0..=1, require_equals = true, default_missing_value = "all")]
+        fail_on_incomplete: Option<sbom_ci::CoverageScope>,
+        /// Write one JSON diagnostic per line to stderr.
+        #[arg(long)]
+        diagnostics_json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -484,24 +613,72 @@ enum ConfigCmd {
     Get { key: String },
 }
 
-fn main() -> Result<()> {
+impl Cmd {
+    fn sbom_json(&self) -> Option<bool> {
+        let Self::Sbom(args) = self else {
+            return None;
+        };
+        Some(match &args.action {
+            Some(SbomCmd::Diff { diagnostics_json, .. } | SbomCmd::Merge { diagnostics_json, .. }) => {
+                *diagnostics_json
+            }
+            None => args.diagnostics_json,
+        })
+    }
+}
+
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    let sbom_json = cli.cmd.sbom_json();
     let level = match logging::level(cli.log_level.as_deref()) {
         Ok(level) => level,
-        Err(e) => bail!(e),
+        Err(error) => {
+            let code = match sbom_json {
+                Some(json) => {
+                    let location = if cli.log_level.is_some() { "--log-level" } else { "LVPM_LOG" };
+                    sbom_ci::emit_error(
+                        &sbom_ci::failure(sbom_ci::Failure::Usage, location, error), json,
+                    )
+                }
+                None => {
+                    eprintln!("Error: {error}");
+                    1
+                }
+            };
+            return std::process::ExitCode::from(code);
+        }
     };
-    logging::init(level);
-    let update_notice = update_notice::start();
+    // A configured log or update-cache path can alias a BOM or an artifact.
+    let update_notice = if sbom_json.is_none() {
+        logging::init(level);
+        update_notice::start()
+    } else {
+        None
+    };
     let result = run(&cli);
     if let (Some(notice), Ok(())) = (update_notice, &result) {
         notice.finish();
     }
-    logging::finish(&result);
+    if sbom_json.is_none() {
+        logging::finish(&result);
+    }
     if let (Cmd::Launch { pause_on_error: true, .. }, Err(e)) = (&cli.cmd, &result) {
         eprintln!("error: {e:#}\n\npress Enter to close");
         let _ = std::io::stdin().read_line(&mut String::new());
     }
-    result
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            let code = match sbom_json {
+                Some(json) => sbom_ci::emit_error(&error, json),
+                None => {
+                    eprintln!("Error: {error:?}");
+                    1
+                }
+            };
+            std::process::ExitCode::from(code)
+        }
+    }
 }
 
 fn run(cli: &Cli) -> Result<()> {
@@ -613,8 +790,168 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Cmd::Import { file, all, group, dry_run } => cmd_import(&cli, file, *all, group.as_deref(), *dry_run),
         Cmd::List => cmd_list(&cli),
+        Cmd::Sbom(args) => run_sbom(cli, args),
         Cmd::Search { query } => cmd_search(&cli, query),
     }
+}
+
+fn run_sbom(cli: &Cli, args: &SbomArgs) -> Result<()> {
+    match &args.action {
+        Some(SbomCmd::Diff {
+            buildspec,
+            built,
+            fail_on_change,
+            ..
+        }) => {
+            let diff = sbom_diff::compare(buildspec, built)?;
+            let mut stdout = std::io::stdout().lock();
+            serde_json::to_writer_pretty(&mut stdout, &diff)?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+            if *fail_on_change && sbom_diff::has_changes(&diff) {
+                return Err(sbom_ci::failure(
+                    sbom_ci::Failure::Changed,
+                    sbom_paths::diagnostic_path(built),
+                    "NI package requirements changed",
+                ));
+            }
+            Ok(())
+        }
+        Some(SbomCmd::Merge {
+            primary,
+            child,
+            relationships,
+            output,
+            fail_on_incomplete,
+            diagnostics_json,
+        }) => {
+            let guard = sbom_paths::OutputGuard::new(output)?;
+            guard.protect(primary)?;
+            let mut document = if let Some(plan) = relationships {
+                sbom_merge::merge_with_relationships(primary, plan, &guard)?
+            } else {
+                for path in child {
+                    guard.protect(path)?;
+                }
+                sbom_merge::merge(primary, child)?
+            };
+            sbom_ci::write(
+                &guard,
+                output,
+                &mut document,
+                *fail_on_incomplete,
+                *diagnostics_json,
+                None,
+            )?;
+            log!(
+                "wrote merged CycloneDX SBOM to {}",
+                sbom_paths::diagnostic_path(output)
+            );
+            Ok(())
+        }
+        None => export_sbom(cli, args),
+    }
+}
+
+fn export_sbom(cli: &Cli, args: &SbomArgs) -> Result<()> {
+    let output = args.output.as_deref().context("sbom export requires --output")?;
+    let include = args.include.as_deref();
+    let source = &args.source;
+    let guard = sbom_paths::OutputGuard::new(output)?;
+    for path in [
+        include,
+        source.lvlibp.as_deref(),
+        source.nipkg.as_deref(),
+        source.lvproj.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        guard.protect(path)?;
+    }
+    if source.lvproj.is_some() && source.lvproj_build_spec.is_none() && !source.artifact.is_empty() {
+        return Err(sbom_ci::failure(
+            sbom_ci::Failure::Usage,
+            "arguments",
+            "--artifact with --lvproj requires a build specification",
+        ));
+    }
+
+    let post_build = if let Some(first) = source.artifact.first() {
+        let inventory = sbom_artifacts::scan(&source.artifact, source.artifact_root.as_deref(), &guard)
+            .map_err(|error| sbom_ci::input_error(error, first))?;
+        let inferred_name = if source.artifact.len() == 1 {
+            first.file_name().and_then(|name| name.to_str())
+        } else {
+            None
+        };
+        Some(sbom_artifact_document::PostBuild {
+            inventory,
+            primary_key: source.primary_artifact.as_deref(),
+            product_name: source.product_name.as_deref(),
+            product_version: source.product_version.as_deref(),
+            inferred_name,
+        })
+    } else {
+        None
+    };
+    let environment = vi_graph::Environment {
+        project: cli.project.as_deref(),
+        global: cli.global || cli.prefix.is_some(),
+        labview_version: cli.labview_version.as_deref(),
+    };
+    let mut project_inventory = None;
+    let mut document = match (
+        &source.lvlibp,
+        &source.nipkg,
+        &source.lvproj,
+        &source.lvproj_target,
+        &source.lvproj_build_spec,
+    ) {
+        (Some(path), _, _, _, _) => sbom::packed_library_document(path, include)
+            .map_err(|error| sbom_ci::input_error(error, path))?,
+        (_, Some(path), _, _, _) => sbom::nipkg_archive_document(path, include)
+            .map_err(|error| sbom_ci::input_error(error, path))?,
+        (_, _, Some(path), Some(target), Some(spec)) => {
+            let options = sbom::ProjectBuildOptions {
+                include,
+                environment,
+                allow_incomplete: source.allow_incomplete,
+                vipm_database: source.vipm_database.as_deref(),
+                output: Some(&guard),
+            };
+            sbom::build_document(path, target, spec, options, post_build.as_ref())
+                .map_err(|error| sbom_ci::input_error(error, path))?
+        }
+        (_, _, Some(path), None, None) => {
+            let (document, inventory) = sbom::project_document(
+                path,
+                environment,
+                include,
+                source.allow_incomplete,
+                source.vipm_database.as_deref(),
+                &guard,
+            )
+            .map_err(|error| sbom_ci::input_error(error, path))?;
+            project_inventory = inventory;
+            document
+        }
+        _ if let Some(post_build) = &post_build => sbom::artifact_document(post_build, include)
+            .map_err(|error| sbom_ci::input_error(error, &source.artifact[0]))?,
+        _ => installed_sbom(cli, include, &args.groups, &guard)?,
+    };
+    sbom_ci::write(
+        &guard,
+        output,
+        &mut document,
+        args.fail_on_incomplete,
+        args.diagnostics_json,
+        project_inventory
+            .as_ref()
+            .or_else(|| post_build.as_ref().map(|post_build| &post_build.inventory)),
+    )?;
+    log!("wrote CycloneDX SBOM to {}", sbom_paths::diagnostic_path(output));
+    Ok(())
 }
 
 /// A duration for the user: `48.2s`, or `3m 12s` past a minute.
@@ -786,7 +1123,9 @@ fn destination(cli: &Cli) -> Result<Destination> {
         return Ok(Destination::Global(roots));
     }
     if let Some(v) = venv::find(cli.project.as_deref(), &cwd)? {
-        elog!("{}", v.banner());
+        if cli.cmd.sbom_json() != Some(true) {
+            elog!("{}", v.banner());
+        }
         return Ok(Destination::Venv(v));
     }
     let roots = roots_for(cli)?;
@@ -821,11 +1160,13 @@ fn headless_roots(cli: &Cli, repo: &Path) -> Result<Roots> {
             t.label()
         );
     }
-    elog!(
-        "headless (LV_RTE_HEADLESS): {} has a manifest and no venv — using {} itself",
-        repo.display(),
-        t.label()
-    );
+    if cli.cmd.sbom_json() != Some(true) {
+        elog!(
+            "headless (LV_RTE_HEADLESS): {} has a manifest and no venv — using {} itself",
+            repo.display(),
+            t.label()
+        );
+    }
     Ok(Roots::labview(&t))
 }
 
@@ -1385,6 +1726,29 @@ fn cmd_list(cli: &Cli) -> Result<()> {
         log!("\n{owed} post-install hook(s) owed (pending, failed, skipped or of unknown state) — `lvpm run-hooks --all` runs them");
     }
     Ok(())
+}
+
+fn installed_sbom(
+    cli: &Cli, include: Option<&Path>, groups: &GroupArgs, output: &sbom_paths::OutputGuard,
+) -> Result<serde_json::Value> {
+    let dest = destination(cli)?;
+    let venv = match &dest {
+        Destination::Venv(v) => Some(v),
+        _ => None,
+    };
+    let (manifest, project) = manifest_for(cli, None, venv)?
+        .context("sbom needs an lvpm.toml project manifest")?;
+    output.protect(&manifest)?;
+    if let Some(venv) = venv {
+        output.protect(&venv.binding_path())?;
+    }
+    let name = project.name.as_deref().or_else(|| {
+        manifest.parent()?.file_name()?.to_str()
+    }).context("sbom could not determine a project name; set [project].name")?;
+    let selection = project.select(&groups.with, &groups.without, &groups.only)
+        .map_err(|error| sbom_ci::input_error(error, &manifest))?;
+    let installed = install::list_installed_with(&dest.store(), |path| output.protect(path))?;
+    sbom::document(name, project.version.as_deref(), &selection, &installed, include)
 }
 
 /// The hook policy for a command that is not an install: the destination's
@@ -2040,7 +2404,7 @@ fn cmd_install(
         };
 
         let mut zip = install::open_archive(bytes)?;
-        let spec = spec::parse(&read_spec(&mut zip)?)?;
+        let spec = spec::parse(&install::read_spec(&mut zip)?)?;
         let p = install::plan(&roots, &spec, &mut zip)?;
 
         total_writes += p.writes.len();
@@ -2087,7 +2451,14 @@ fn cmd_install(
                 }
                 std::io::stdout().flush().ok();
             }
-            let m = install::apply(&roots, &spec, &mut zip, &p, pre.as_deref(), dependency::package_dependency_names(e, spec.requires.as_deref()))?;
+            let m = install::apply(
+                &roots,
+                &spec,
+                zip,
+                &p,
+                pre.as_deref(),
+                dependency::package_dependency_names(e, spec.requires.as_deref()),
+            )?;
             log!("{} files", m.files.len());
             relink_work.push((e.name.clone(), m.relink_folders.iter().map(PathBuf::from).collect()));
             // The record now holds PostInstall as pending; the hook step
@@ -3564,21 +3935,6 @@ fn cmd_vi_run(
     conn.release(vi_ref)?;
     conn.close();
     result
-}
-
-fn read_spec(zip: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>) -> Result<String> {
-    // Almost always literally "spec" at the archive root.
-    let idx = (0..zip.len()).find(|i| {
-        zip.by_index(*i).is_ok_and(|f| f.name().is_ok_and(|n| n.eq_ignore_ascii_case("spec")))
-    });
-    let Some(idx) = idx else {
-        bail!("no `spec` member in .vip archive");
-    };
-    let mut f = zip.by_index(idx)?;
-    let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut f, &mut buf)?;
-    // spec files are latin-1-ish; lossy is fine for the fields we read.
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 #[cfg(test)]

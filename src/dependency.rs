@@ -192,6 +192,7 @@ mod tests {
             name: name.into(),
             version: "1".into(),
             display_name: None,
+            package_metadata: None,
             installed_at: 0,
             target: "test".into(),
             files: vec![],
