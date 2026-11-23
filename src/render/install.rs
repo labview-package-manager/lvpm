@@ -423,12 +423,13 @@ fn allow_line(allow: &AllowLine) -> Option<String> {
             ))
         }
         AllowLine::PassHooks => Some("  always run it:  add --hooks to this command".to_string()),
-        AllowLine::SkipDoesNothing { name, table } if pasteable(name) && pasteable(table) => {
-            Some(format!(
-                "  hooks = \"skip\" on the {name} line in [{table}] of lvpm.toml does nothing: \
-                 hooks are off unless it says \"run\"; delete the key"
-            ))
-        }
+        // Prose naming the user's own line, not a command: no paste check.
+        AllowLine::SkipDoesNothing { name, table } => Some(format!(
+            "  hooks = \"skip\" on the {} line in [{}] of lvpm.toml does nothing: \
+             hooks are off unless it says \"run\"; delete the key",
+            one_line(name),
+            one_line(table)
+        )),
         _ => None,
     }
 }
@@ -987,7 +988,7 @@ resave (1/1) alpha ... 1 saved (9s)
                 ),
             ),
             (
-                "the line says skip, a name that reads as a flag",
+                "the line says skip, a name that reads as a flag: no run line, the note names it",
                 vec![skipped_hooks(
                     "-x",
                     &[PostInstall],
@@ -999,7 +1000,11 @@ resave (1/1) alpha ... 1 saved (9s)
                         table: "dependencies".into(),
                     }),
                 )],
-                format!("warning: -x: skipped install hook PostInstall {OFF_BY_DEFAULT}\n"),
+                format!(
+                    "warning: -x: skipped install hook PostInstall {OFF_BY_DEFAULT}\n  \
+                     hooks = \"skip\" on the -x line in [dependencies] of lvpm.toml does nothing: \
+                     hooks are off unless it says \"run\"; delete the key\n"
+                ),
             ),
             (
                 "not allowed, project, transitive",

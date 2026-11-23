@@ -28,14 +28,14 @@ Feature: install hooks run only for allowed packages
       | depends on     |
       | dev-depends on |
 
-  # A smoke test: a scratch tree runs no hooks, so it cannot show the
-  # warning. The @labview scenario below is the evidence for a package with hooks.
-  Scenario: hooks = "skip" is accepted by a sync into a scratch tree, which says nothing about hooks
+  # A scratch tree runs no hooks. The sync with hooks is covered by
+  # sync_global_with_skip_runs_no_hook_and_warns_only_for_the_package_with_hooks
+  # in crates/lvpm-core/src/ops/hook_policy.rs, against a fake installation.
+  Scenario: hooks = "skip" is accepted by a sync
     Given "first" lists "alpha" 1.0
     And a project that depends on "alpha" with hooks set to "skip"
     When I run "lvpm sync --prefix dest"
     Then the command succeeds
-    And stderr does not say "hooks"
 
   Scenario: hooks = "run" is accepted on every dependency table
     Given "first" lists "alpha" 1.0, "beta" 1.0
@@ -112,16 +112,6 @@ Feature: install hooks run only for allowed packages
     And the PostInstall hook did not run
     And stderr says "lvpm_test_fixture: skipped install hook PostInstall"
     And stderr says "lvpm run-hooks lvpm_test_fixture"
-
-  @labview @unsafe
-  Scenario: hooks = "skip" keeps the fixture's hook off and says the key does nothing
-    Given the hook fixture package is not installed
-    And a project that depends on "lvpm_test_fixture" with hooks set to "skip"
-    When I run "lvpm sync --global"
-    Then the command succeeds
-    And the PostInstall hook did not run
-    And stderr says "does nothing"
-    And stderr does not say "lvpm run-hooks lvpm_test_fixture"
 
   @labview @unsafe
   Scenario: following the run-it-now line runs the hook

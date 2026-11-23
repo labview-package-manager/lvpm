@@ -158,9 +158,10 @@ Each criterion cites the issue (#76) or an ADR. Criteria marked
 9. **Transitive allow.** A transitive dependency listed as
    `name = { version = "*", hooks = "run" }` runs its hook. *(#76 AC9;
    ADR 4 consequences)*
-10. **Bad value.** `hooks = "<anything but run>"` fails when the manifest is
-    read, naming the line. *(inference)* Amended 2026-11-22 (issue 46):
-    `"skip"`, which 0.3.x documents, is read as no key, and an install that
+10. **Bad value.** `hooks = "<anything but run or skip>"` fails when the manifest is
+    read, naming the line. *(inference)* Amended 2026-11-22
+    ([issue 46](https://github.com/labview-package-manager/lvpm/issues/46)):
+    `"skip"`, which the 0.3.x docs describe, is read as no key, and an install that
     skips that package's hooks says the key does nothing.
 11. **Headless unchanged.** Headless, an allowlisted package's hooks are
     skipped unless `--hooks`, and the warning says `(LabVIEW runs headless)`.
@@ -200,7 +201,7 @@ allow it. *(#76)*
 | `run it now:` for a PreInstall-only package | `inferable` | inference | Left out. `run-hooks` runs PostInstall only, and a PreInstall cannot run after the files are installed. The allowlist line still shows. |
 | Allowlist line for a transitive dependency | `inferable` | inference | `name = { version = "*", hooks = "run" }`, the form ADR 4 names for a transitive pin or allow. |
 | Global allowlist command when the list has names | `inferable` | inference | `config set` replaces the list, so the hint lists the existing names plus the new one; pasting it never drops an allowed package. |
-| Values of `hooks` other than `run` | `inferable` | inference | Refused at read: the line format refuses unknown keys today, and a typo must not silently mean "skip". Amended 2026-11-22 (issue 46): `"skip"` itself is accepted and read as no key. |
+| Values of `hooks` other than `run` or `skip` | `inferable` | inference | Refused at read: the line format refuses unknown keys today, and a typo must not silently mean "skip". Amended 2026-11-22 (issue 46): `"skip"` itself is accepted and read as no key. |
 | Is `hooks` a lock input | `inferable` | inference | No. It does not change what resolves or where from; `lock --check` compares resolution inputs only. |
 | What counts as "the install hook ran" for uninstall | `inferable` | inference | No hook is listed in `skipped_hooks` (amended after review; first: neither PreInstall nor PostInstall). A failed PostInstall is already recorded there, so its uninstall hooks do not run either; `run-hooks` success clears every install and uninstall entry, PreInstall included (amended at plan review: clearing only PostInstall left two-hook packages blocked). |
 | Records written before S12 | `inferable` | inference | A global record lists no install hook as skipped, because those installs ran them; its uninstall hooks run as before. |
