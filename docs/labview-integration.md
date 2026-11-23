@@ -55,6 +55,10 @@ It appears once, on the last warning, and lists the names already in
 `(LabVIEW runs headless; hooks = "run" and hooks.run do not apply)` and
 offers `add --hooks to this command`. `--dry-run` says `would skip`.
 
+A package whose line says `hooks = "skip"` gets no run-it line. Its warning
+says instead that `hooks = "skip"` does nothing and to delete the key. A
+package without hooks gets no warning.
+
 The allowlist applies from the next install or upgrade. A package that is
 already installed keeps the hook it skipped: run `lvpm run-hooks <pkg>`.
 Installing it again says so with `install hook PostInstall was skipped when it

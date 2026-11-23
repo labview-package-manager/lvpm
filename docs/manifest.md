@@ -342,8 +342,8 @@ Here is what the index key does:
 ### Allowing install hooks
 
 Install hooks are off by default. To let a package's hooks run, give its line
-the `hooks` key. It takes the one value `"run"`, in `[dependencies]`,
-`[dev-dependencies]` and the groups, next to `version`, `github` and `index`:
+the `hooks` key set to `"run"`, in `[dependencies]`, `[dev-dependencies]`
+and the groups, next to `version`, `github` and `index`:
 
 ```toml
 [dependencies]
@@ -353,8 +353,13 @@ pilot_a = { version = "*", hooks = "run" }
 - Only the root `lvpm.toml` counts. A `hooks = "run"` in a dependency's own
   `lvpm.toml` allows nothing. To allow a package that only another package
   needs, list it yourself with `version = "*"`.
+- `hooks = "skip"`, which the lvpm 0.3.x docs describe, is read as no key:
+  hooks are off. An install into a LabVIEW installation that skips that
+  package's hooks warns that the key does nothing, and says to delete it. A
+  package without hooks gets no warning. `--hooks` still runs that package's
+  hooks.
 - Any other value fails when the manifest is read:
-  `[dependencies] pilot_a: hooks must be "run" (delete the key to keep hooks off), got "yes"`.
+  `[dependencies] pilot_a: hooks must be "run" or "skip" (leave the key out to keep hooks off), got "yes"`.
   `"Run"` is refused too.
 - `hooks` is not part of the lock: changing it leaves `lvpm.lock` current.
   `lvpm add pilot_a@<newer>` keeps it.

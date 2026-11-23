@@ -26,8 +26,12 @@ pub struct HookAllow {
 #[derive(Debug, Clone)]
 enum AllowSource {
     /// The root project's dependency lines. `listed` has every line, by
-    /// [`name_key`], allowed or not.
-    Project { listed: BTreeMap<String, Listed> },
+    /// [`name_key`], allowed or not; `skip` the lines that say
+    /// `hooks = "skip"`, by [`name_key`].
+    Project {
+        listed: BTreeMap<String, Listed>,
+        skip: BTreeMap<String, Listed>,
+    },
     /// The user's `hooks.run`, as written.
     Config { names: Vec<String> },
 }
@@ -96,9 +100,18 @@ impl HookAllow {
                         });
                     }
                 }
+                let skip = (p.hooks_skip.iter())
+                    .map(|(name, table)| {
+                        let line = Listed {
+                            name: name.clone(),
+                            table: table.clone(),
+                        };
+                        (name_key(name), line)
+                    })
+                    .collect();
                 HookAllow {
                     names: p.hooks_allowed.iter().map(|n| name_key(n)).collect(),
-                    source: AllowSource::Project { listed },
+                    source: AllowSource::Project { listed, skip },
                 }
             }
             None => HookAllow {
@@ -128,7 +141,7 @@ impl HookAllow {
     /// project, the config line for that one name.
     fn line_for(&self, name: &str) -> AllowLine {
         match &self.source {
-            AllowSource::Project { listed } => match listed.get(&name_key(name)) {
+            AllowSource::Project { listed, .. } => match listed.get(&name_key(name)) {
                 Some(line) => AllowLine::AddKey {
                     name: line.name.clone(),
                     table: line.table.clone(),
@@ -139,6 +152,23 @@ impl HookAllow {
             },
             AllowSource::Config { .. } => self.config_line(&[name.to_string()]),
         }
+    }
+
+    /// The note for a project line that says `hooks = "skip"` for `name`: the
+    /// key does nothing, so the user learns to delete it. None when another
+    /// line allows `name`: then the key is not what keeps the hooks off.
+    fn skip_line(&self, name: &str) -> Option<AllowLine> {
+        let AllowSource::Project { skip, .. } = &self.source else {
+            return None;
+        };
+        if self.names.contains(&name_key(name)) {
+            return None;
+        }
+        skip.get(&name_key(name))
+            .map(|line| AllowLine::SkipDoesNothing {
+                name: line.name.clone(),
+                table: line.table.clone(),
+            })
     }
 
     /// The `hooks.run` that allows every name in `skipped` and keeps the names
@@ -172,7 +202,12 @@ impl HookAllow {
             .into_iter()
             .enumerate()
             .map(|(at, s)| {
+                let skip_line = match s.reason {
+                    SkipReason::Headless | SkipReason::NotAllowed => self.skip_line(&s.package),
+                    _ => None,
+                };
                 let allow = match (s.reason, &self.source) {
+                    _ if skip_line.is_some() => skip_line,
                     (SkipReason::Headless, _) => Some(AllowLine::PassHooks),
                     (SkipReason::NotAllowed, AllowSource::Project { .. }) => {
                         Some(self.line_for(&s.package))
@@ -372,6 +407,61 @@ mod tests {
             allow.line_for("pilot_c"),
             add_key("pilot_c", "dependency-groups.ci")
         );
+    }
+
+    #[test]
+    fn a_line_that_says_skip_is_told_it_does_nothing_and_is_not_allowed() {
+        let root = crate::project::parse(
+            "[project]\nlabview = \">=2024\"\n\n[dependencies]\nplain = \"*\"\n\n\
+             [dependency-groups.ci]\nPilot_A = { version = \"*\", hooks = \"skip\" }\n",
+        )
+        .unwrap();
+        let allow = HookAllow::for_command(&config(&[]), Some(&root));
+        let plain = HookContext {
+            venv: false,
+            headless: false,
+            forced: false,
+        };
+        assert_eq!(
+            allow.verdict(plain, "pilot_a"),
+            Verdict::Skip(SkipReason::NotAllowed)
+        );
+        let skip = AllowLine::SkipDoesNothing {
+            name: "Pilot_A".into(),
+            table: "dependency-groups.ci".into(),
+        };
+        // Headless too: the key is the thing to fix, not the missing --hooks.
+        let events = allow.warnings(
+            false,
+            vec![
+                skipped("pilot_a", SkipReason::NotAllowed),
+                skipped("pilot_a", SkipReason::Headless),
+                skipped("pilot_a", SkipReason::AlreadyInstalled),
+                skipped("plain", SkipReason::NotAllowed),
+            ],
+        );
+        assert_eq!(
+            allows(&events),
+            [
+                Some(skip.clone()),
+                Some(skip),
+                None,
+                Some(add_key("plain", "dependencies")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_skip_key_is_not_blamed_when_another_line_says_run() {
+        let root = crate::project::parse(
+            "[project]\nlabview = \">=2024\"\n\n\
+             [dependencies]\nalpha = { version = \"*\", hooks = \"run\" }\n\n\
+             [dev-dependencies]\nalpha = { version = \"*\", hooks = \"skip\" }\n",
+        )
+        .unwrap();
+        let allow = HookAllow::for_command(&config(&[]), Some(&root));
+        let events = allow.warnings(false, vec![skipped("alpha", SkipReason::Headless)]);
+        assert_eq!(allows(&events), [Some(AllowLine::PassHooks)]);
     }
 
     #[test]
@@ -702,6 +792,42 @@ mod installation {
                 .any(|e| matches!(e, Event::HooksNotRun { .. })),
             "a LabVIEW installation warns with HooksSkipped: {events:?}"
         );
+    }
+
+    #[test]
+    fn sync_global_with_skip_runs_no_hook_and_warns_only_for_the_package_with_hooks() {
+        let bed = Bed::new("sync-skip");
+        bed.package("hooked", "1.0", "", POST);
+        bed.package("plain", "1.0", "", &[]);
+        bed.manifest(
+            "hooked = { version = \"*\", hooks = \"skip\" }\n\
+             plain = { version = \"*\", hooks = \"skip\" }\n",
+        );
+        let events = sync_into(&bed, &[], false);
+        assert_eq!(started(&events), []);
+        assert!(lists_skipped(&bed.record("hooked"), "PostInstall"));
+        assert_eq!(skipped_packages(&events), ["hooked"]);
+        let allow = events.iter().find_map(|e| match e {
+            Event::HooksSkipped { allow, .. } => allow.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            allow,
+            Some(AllowLine::SkipDoesNothing {
+                name: "hooked".into(),
+                table: "dependencies".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn sync_global_with_hooks_runs_the_hook_of_a_skip_line() {
+        let bed = Bed::new("sync-skip-forced");
+        bed.package("hooked", "1.0", "", POST);
+        bed.manifest("hooked = { version = \"*\", hooks = \"skip\" }\n");
+        let events = sync_into(&bed, &[], true);
+        assert_eq!(started(&events), [post("hooked")]);
+        assert_eq!(skipped_packages(&events), Vec::<String>::new());
     }
 
     #[test]
