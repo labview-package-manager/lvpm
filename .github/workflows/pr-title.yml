@@ -5,7 +5,7 @@ name: PR title
 # minor while the major is 0. A title it cannot parse releases nothing.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, integration/fork]
     types: [opened, edited, synchronize, reopened]
 
 permissions:
