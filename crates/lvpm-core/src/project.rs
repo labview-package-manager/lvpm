@@ -755,10 +755,10 @@ fn parse_dependencies(
                 stated.state_index(table, &name, source)?;
             }
             match keys.hooks {
-                Some(true) => {
+                Some(HooksKey::Run) => {
                     stated.hooks.insert(name.clone());
                 }
-                Some(false) => {
+                Some(HooksKey::Skip) => {
                     (stated.hooks_skip).insert(name.clone(), table.to_string());
                 }
                 None => {}
@@ -811,8 +811,7 @@ fn check_source_pins(
 struct LineKeys {
     github: Option<String>,
     index: Option<String>,
-    /// `hooks = "run"` is `Some(true)`, `hooks = "skip"` `Some(false)`.
-    hooks: Option<bool>,
+    hooks: Option<HooksKey>,
     /// `relink = true`.
     relink: bool,
 }
@@ -835,9 +834,16 @@ fn dependency(table: &str, name: &str, value: toml::Value) -> Result<(Constraint
 /// The keys a table-form dependency line may have.
 const LINE_KEYS: [&str; 5] = ["version", "github", "index", "hooks", "relink"];
 
-/// The values `hooks` may have.
+/// The values `hooks` may have: `"run"` allows the package's hooks, and
+/// `"skip"`, which the 0.3.x docs describe, is read as no key.
 const HOOKS_RUN: &str = "run";
 const HOOKS_SKIP: &str = "skip";
+
+/// What a line's `hooks` key says.
+enum HooksKey {
+    Run,
+    Skip,
+}
 
 /// The `version`, `github`, `index`, `hooks` and `relink` of a table-form dependency
 /// line. Any key not known yet is refused, never ignored.
@@ -896,7 +902,7 @@ fn dependency_table(
         })
         .transpose()?;
     let hooks = (fields.remove("hooks"))
-        .map(|value| hooks_run(&at, value))
+        .map(|value| hooks_key(&at, value))
         .transpose()?;
     let relink = match fields.remove("relink") {
         None => false,
@@ -917,12 +923,11 @@ fn dependency_table(
     ))
 }
 
-/// Whether `value` says `"run"` (true) or `"skip"` (false), or a refusal
-/// naming what it was.
-fn hooks_run(at: &str, value: toml::Value) -> Result<bool> {
+/// What `value` says, or a refusal naming what it was.
+fn hooks_key(at: &str, value: toml::Value) -> Result<HooksKey> {
     let got = match value {
-        toml::Value::String(s) if s == HOOKS_RUN => return Ok(true),
-        toml::Value::String(s) if s == HOOKS_SKIP => return Ok(false),
+        toml::Value::String(s) if s == HOOKS_RUN => return Ok(HooksKey::Run),
+        toml::Value::String(s) if s == HOOKS_SKIP => return Ok(HooksKey::Skip),
         toml::Value::String(s) => format!("{s:?}"),
         other => other.type_str().to_string(),
     };
@@ -1427,7 +1432,7 @@ ni-daqmx-labview-support = "26.0.0.49434-0+f282"
     }
 
     #[test]
-    fn a_hooks_value_other_than_the_string_run_is_refused_with_its_value_or_type() {
+    fn a_hooks_value_other_than_run_or_skip_is_refused_with_its_value_or_type() {
         let said = |got: &str| {
             format!(
                 "[dependencies] pkg: hooks must be \"run\" or \"skip\" (leave the key out to keep hooks off), got {got}"
@@ -1934,11 +1939,11 @@ Build-Spec = \"s\"
         .unwrap();
         assert!(p.hooks_allowed.is_empty(), "skip allows nothing");
         assert_eq!(
-            p.hooks_skip.into_iter().collect::<Vec<_>>(),
-            [
+            p.hooks_skip,
+            BTreeMap::from([
+                ("alpha".to_string(), "dependencies".to_string()),
                 ("Beta".to_string(), "dev-dependencies".to_string()),
-                ("alpha".to_string(), "dependencies".to_string())
-            ]
+            ])
         );
     }
 

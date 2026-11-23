@@ -387,7 +387,7 @@ fn hooks_skipped(
              (hooks are off by default; see docs/labview-integration.md#hooks)"
         ),
     });
-    // The user asked for these hooks to stay off: no line on how to run them.
+    // The user once wrote that these hooks stay off: lvpm does not offer to run them.
     let skip_line = matches!(allow, Some(AllowLine::SkipDoesNothing { .. }));
     if run_now && !skip_line {
         if pasteable(package) {
@@ -930,6 +930,12 @@ resave (1/1) alpha ... 1 saved (9s)
             name: "pilot_a".into(),
             table: "dependencies".into(),
         });
+        let skip = Some(AllowLine::SkipDoesNothing {
+            name: "pilot_a".into(),
+            table: "dependencies".into(),
+        });
+        const SKIP_LINE: &str = "hooks = \"skip\" on the pilot_a line in [dependencies] of lvpm.toml \
+             does nothing: hooks are off unless it says \"run\"; delete the key";
         let rows: Vec<(&str, Vec<Event>, String)> = vec![
             (
                 "not allowed, project, listed",
@@ -958,6 +964,42 @@ resave (1/1) alpha ... 1 saved (9s)
                      \x20 hooks = \"skip\" on the pilot_a line in [dev-dependencies] of lvpm.toml does nothing: \
                      hooks are off unless it says \"run\"; delete the key\n"
                 ),
+            ),
+            (
+                "the line says skip, PreInstall only: no line on how to run it",
+                vec![skipped_hooks("pilot_a", &[PreInstall], NotAllowed, false, false, skip.clone())],
+                format!(
+                    "warning: pilot_a: skipped install hook PreInstall {OFF_BY_DEFAULT}\n  {SKIP_LINE}\n"
+                ),
+            ),
+            (
+                "the line says skip, headless",
+                vec![skipped_hooks("pilot_a", &[PostInstall], Headless, true, false, skip.clone())],
+                format!(
+                    "warning: pilot_a: skipped install hook PostInstall (LabVIEW runs headless; hooks = \"run\" and hooks.run do not apply)\n  {SKIP_LINE}\n"
+                ),
+            ),
+            (
+                "the line says skip, dry run",
+                vec![skipped_hooks("pilot_a", &[PostInstall], NotAllowed, true, true, skip)],
+                format!(
+                    "warning: pilot_a: would skip install hook PostInstall {OFF_BY_DEFAULT}\n  {SKIP_LINE}\n"
+                ),
+            ),
+            (
+                "the line says skip, a name that reads as a flag",
+                vec![skipped_hooks(
+                    "-x",
+                    &[PostInstall],
+                    NotAllowed,
+                    true,
+                    false,
+                    Some(AllowLine::SkipDoesNothing {
+                        name: "-x".into(),
+                        table: "dependencies".into(),
+                    }),
+                )],
+                format!("warning: -x: skipped install hook PostInstall {OFF_BY_DEFAULT}\n"),
             ),
             (
                 "not allowed, project, transitive",

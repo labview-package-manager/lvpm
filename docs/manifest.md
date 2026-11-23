@@ -353,10 +353,11 @@ pilot_a = { version = "*", hooks = "run" }
 - Only the root `lvpm.toml` counts. A `hooks = "run"` in a dependency's own
   `lvpm.toml` allows nothing. To allow a package that only another package
   needs, list it yourself with `version = "*"`.
-- `hooks = "skip"`, which lvpm 0.3 wrote, is read as no key: hooks are off.
-  An install into a LabVIEW installation that skips that package's hooks says
-  the key does nothing and to delete it. A package without hooks gets no
-  warning.
+- `hooks = "skip"`, which the lvpm 0.3.x docs describe, is read as no key:
+  hooks are off. An install into a LabVIEW installation that skips that
+  package's hooks warns that the key does nothing, and says to delete it. A
+  package without hooks gets no warning. `--hooks` still runs that package's
+  hooks.
 - Any other value fails when the manifest is read:
   `[dependencies] pilot_a: hooks must be "run" or "skip" (leave the key out to keep hooks off), got "yes"`.
   `"Run"` is refused too.

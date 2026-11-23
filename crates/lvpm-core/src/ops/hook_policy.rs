@@ -141,13 +141,6 @@ impl HookAllow {
     /// project, the config line for that one name.
     fn line_for(&self, name: &str) -> AllowLine {
         match &self.source {
-            AllowSource::Project { skip, .. } if skip.contains_key(&name_key(name)) => {
-                let line = &skip[&name_key(name)];
-                AllowLine::SkipDoesNothing {
-                    name: line.name.clone(),
-                    table: line.table.clone(),
-                }
-            }
             AllowSource::Project { listed, .. } => match listed.get(&name_key(name)) {
                 Some(line) => AllowLine::AddKey {
                     name: line.name.clone(),
@@ -159,6 +152,19 @@ impl HookAllow {
             },
             AllowSource::Config { .. } => self.config_line(&[name.to_string()]),
         }
+    }
+
+    /// The note for a project line that says `hooks = "skip"` for `name`: the
+    /// key does nothing, so the user learns to delete it.
+    fn skip_line(&self, name: &str) -> Option<AllowLine> {
+        let AllowSource::Project { skip, .. } = &self.source else {
+            return None;
+        };
+        skip.get(&name_key(name))
+            .map(|line| AllowLine::SkipDoesNothing {
+                name: line.name.clone(),
+                table: line.table.clone(),
+            })
     }
 
     /// The `hooks.run` that allows every name in `skipped` and keeps the names
@@ -192,7 +198,12 @@ impl HookAllow {
             .into_iter()
             .enumerate()
             .map(|(at, s)| {
+                let skip_line = match s.reason {
+                    SkipReason::Headless | SkipReason::NotAllowed => self.skip_line(&s.package),
+                    _ => None,
+                };
                 let allow = match (s.reason, &self.source) {
+                    _ if skip_line.is_some() => skip_line,
                     (SkipReason::Headless, _) => Some(AllowLine::PassHooks),
                     (SkipReason::NotAllowed, AllowSource::Project { .. }) => {
                         Some(self.line_for(&s.package))
@@ -411,14 +422,27 @@ mod tests {
             allow.verdict(plain, "pilot_a"),
             Verdict::Skip(SkipReason::NotAllowed)
         );
-        assert_eq!(
-            allow.line_for("pilot_a"),
-            AllowLine::SkipDoesNothing {
-                name: "Pilot_A".into(),
-                table: "dependency-groups.ci".into(),
-            }
+        let skip = AllowLine::SkipDoesNothing {
+            name: "Pilot_A".into(),
+            table: "dependency-groups.ci".into(),
+        };
+        // Headless too: the key is the thing to fix, not the missing --hooks.
+        let events = allow.warnings(
+            false,
+            vec![
+                skipped("pilot_a", SkipReason::NotAllowed),
+                skipped("pilot_a", SkipReason::Headless),
+                skipped("plain", SkipReason::NotAllowed),
+            ],
         );
-        assert_eq!(allow.line_for("plain"), add_key("plain", "dependencies"));
+        assert_eq!(
+            allows(&events),
+            [
+                Some(skip.clone()),
+                Some(skip),
+                Some(add_key("plain", "dependencies")),
+            ]
+        );
     }
 
     #[test]

@@ -327,6 +327,16 @@ mod tests {
             )["data"]["allow"],
             serde_json::json!({"kind": "add_line", "name": "pilot_a"})
         );
+        assert_eq!(
+            skipped(
+                SkipReason::NotAllowed,
+                Some(AllowLine::SkipDoesNothing {
+                    name: "pilot_a".into(),
+                    table: "dependencies".into(),
+                })
+            )["data"]["allow"],
+            serde_json::json!({"kind": "skip_does_nothing", "name": "pilot_a", "table": "dependencies"})
+        );
         let headless = skipped(SkipReason::Headless, Some(AllowLine::PassHooks));
         assert_eq!(headless["data"]["reason"], "headless");
         assert_eq!(

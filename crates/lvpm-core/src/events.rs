@@ -836,8 +836,9 @@ pub enum SkipReason {
     AlreadyInstalled,
 }
 
-/// How the user makes the next install run a package's hooks, as data the
-/// front end words.
+/// What the user changes so the next install runs a package's hooks, or, for
+/// a line that says `hooks = "skip"`, the key to delete. Data the front end
+/// words.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AllowLine {
