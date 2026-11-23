@@ -222,6 +222,10 @@ pub struct Project {
     /// `hooks = "run"`, in any table.
     pub hooks_allowed: BTreeSet<String>,
     /// The name, as written, of every dependency whose line says
+    /// `hooks = "skip"`, to the table that line is in. It changes nothing:
+    /// hooks are off unless a line says `"run"`; an install warns about it.
+    pub hooks_skip: BTreeMap<String, String>,
+    /// The name, as written, of every dependency whose line says
     /// `relink = true`, in any table: an install loads and saves it in
     /// LabVIEW after linkfix.
     pub relink: BTreeSet<String>,
@@ -253,6 +257,7 @@ impl Default for Project {
             github: BTreeMap::new(),
             source_pins: BTreeMap::new(),
             hooks_allowed: BTreeSet::new(),
+            hooks_skip: BTreeMap::new(),
             relink: BTreeSet::new(),
             nipm: Vec::new(),
             distribution: None,
@@ -527,6 +532,7 @@ pub(crate) fn parse(text: &str) -> Result<Project> {
         .map(|(name, (source, _))| (name, source))
         .collect();
     p.hooks_allowed = stated.hooks;
+    p.hooks_skip = stated.hooks_skip;
     p.relink = stated.relink;
     p.nipm = f.nipm.dependencies.into_iter().map(|(k, _)| k).collect();
     p.policy = f.policy.map(parse_policy).transpose()?.unwrap_or_default();
@@ -677,6 +683,8 @@ struct Stated {
     index: BTreeMap<String, (String, String)>,
     /// Names whose line says `hooks = "run"`, as written.
     hooks: BTreeSet<String>,
+    /// Names whose line says `hooks = "skip"`, as written, to their table.
+    hooks_skip: BTreeMap<String, String>,
     /// Names whose line says `relink = true`, as written.
     relink: BTreeSet<String>,
 }
@@ -746,8 +754,14 @@ fn parse_dependencies(
             if let Some(source) = keys.index {
                 stated.state_index(table, &name, source)?;
             }
-            if keys.hooks {
-                stated.hooks.insert(name.clone());
+            match keys.hooks {
+                Some(true) => {
+                    stated.hooks.insert(name.clone());
+                }
+                Some(false) => {
+                    (stated.hooks_skip).insert(name.clone(), table.to_string());
+                }
+                None => {}
             }
             if keys.relink {
                 stated.relink.insert(name.clone());
@@ -797,8 +811,8 @@ fn check_source_pins(
 struct LineKeys {
     github: Option<String>,
     index: Option<String>,
-    /// `hooks = "run"`.
-    hooks: bool,
+    /// `hooks = "run"` is `Some(true)`, `hooks = "skip"` `Some(false)`.
+    hooks: Option<bool>,
     /// `relink = true`.
     relink: bool,
 }
@@ -821,8 +835,9 @@ fn dependency(table: &str, name: &str, value: toml::Value) -> Result<(Constraint
 /// The keys a table-form dependency line may have.
 const LINE_KEYS: [&str; 5] = ["version", "github", "index", "hooks", "relink"];
 
-/// The one value `hooks` may have.
+/// The values `hooks` may have.
 const HOOKS_RUN: &str = "run";
+const HOOKS_SKIP: &str = "skip";
 
 /// The `version`, `github`, `index`, `hooks` and `relink` of a table-form dependency
 /// line. Any key not known yet is refused, never ignored.
@@ -882,8 +897,7 @@ fn dependency_table(
         .transpose()?;
     let hooks = (fields.remove("hooks"))
         .map(|value| hooks_run(&at, value))
-        .transpose()?
-        .is_some();
+        .transpose()?;
     let relink = match fields.remove("relink") {
         None => false,
         Some(toml::Value::Boolean(on)) => on,
@@ -903,14 +917,18 @@ fn dependency_table(
     ))
 }
 
-/// `value` as the one `hooks` value there is, or a refusal naming what it was.
-fn hooks_run(at: &str, value: toml::Value) -> Result<()> {
+/// Whether `value` says `"run"` (true) or `"skip"` (false), or a refusal
+/// naming what it was.
+fn hooks_run(at: &str, value: toml::Value) -> Result<bool> {
     let got = match value {
-        toml::Value::String(s) if s == HOOKS_RUN => return Ok(()),
+        toml::Value::String(s) if s == HOOKS_RUN => return Ok(true),
+        toml::Value::String(s) if s == HOOKS_SKIP => return Ok(false),
         toml::Value::String(s) => format!("{s:?}"),
         other => other.type_str().to_string(),
     };
-    bail!("{at}: hooks must be \"{HOOKS_RUN}\" (delete the key to keep hooks off), got {got}")
+    bail!(
+        "{at}: hooks must be \"{HOOKS_RUN}\" or \"{HOOKS_SKIP}\" (leave the key out to keep hooks off), got {got}"
+    )
 }
 
 /// `value` as `owner/repo`: a string of two non-empty parts around one `/`,
@@ -1412,7 +1430,7 @@ ni-daqmx-labview-support = "26.0.0.49434-0+f282"
     fn a_hooks_value_other_than_the_string_run_is_refused_with_its_value_or_type() {
         let said = |got: &str| {
             format!(
-                "[dependencies] pkg: hooks must be \"run\" (delete the key to keep hooks off), got {got}"
+                "[dependencies] pkg: hooks must be \"run\" or \"skip\" (leave the key out to keep hooks off), got {got}"
             )
         };
         for (value, got) in [
@@ -1433,9 +1451,9 @@ ni-daqmx-labview-support = "26.0.0.49434-0+f282"
         assert_eq!(
             refusal(
                 "dev-dependencies",
-                "pkg = { version = \"*\", hooks = \"skip\" }"
+                "pkg = { version = \"*\", hooks = \"sometimes\" }"
             ),
-            "[dev-dependencies] pkg: hooks must be \"run\" (delete the key to keep hooks off), got \"skip\""
+            "[dev-dependencies] pkg: hooks must be \"run\" or \"skip\" (leave the key out to keep hooks off), got \"sometimes\""
         );
     }
 
@@ -1904,6 +1922,23 @@ Build-Spec = \"s\"
             p.hooks_allowed.into_iter().collect::<Vec<_>>(),
             ["Beta", "alpha", "gamma"],
             "by the name as written; the short form allows nothing"
+        );
+    }
+
+    #[test]
+    fn hooks_skip_is_read_with_its_table_and_allows_nothing() {
+        let p = parse(
+            "[dependencies]\nalpha = { version = \"1.0\", hooks = \"skip\" }\n\n\
+             [dev-dependencies]\nBeta = { hooks = \"skip\", version = \"*\" }\n",
+        )
+        .unwrap();
+        assert!(p.hooks_allowed.is_empty(), "skip allows nothing");
+        assert_eq!(
+            p.hooks_skip.into_iter().collect::<Vec<_>>(),
+            [
+                ("Beta".to_string(), "dev-dependencies".to_string()),
+                ("alpha".to_string(), "dependencies".to_string())
+            ]
         );
     }
 

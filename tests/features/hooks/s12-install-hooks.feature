@@ -1,19 +1,39 @@
 Feature: install hooks run only for allowed packages
 
-  Scenario Outline: a hooks value other than "run" is refused when the manifest is read
+  Scenario Outline: a hooks value other than "run" or "skip" is refused when the manifest is read
     Given a project that <relation> "alpha" with hooks set to <value>
     When I run "lvpm lock"
     Then the exit code is non-zero
-    And the error says "<table> alpha: hooks must be \"run\" (delete the key to keep hooks off)"
+    And the error says "<table> alpha: hooks must be \"run\" or \"skip\" (leave the key out to keep hooks off)"
     And no lvpm.lock is written
 
     Examples:
-      | relation       | value  | table              |
-      | depends on     | "yes"  | [dependencies]     |
-      | depends on     | "Run"  | [dependencies]     |
-      | depends on     | ""     | [dependencies]     |
-      | depends on     | true   | [dependencies]     |
-      | dev-depends on | "skip" | [dev-dependencies] |
+      | relation       | value       | table              |
+      | depends on     | "yes"       | [dependencies]     |
+      | depends on     | "Run"       | [dependencies]     |
+      | depends on     | ""          | [dependencies]     |
+      | depends on     | true        | [dependencies]     |
+      | dev-depends on | "sometimes" | [dev-dependencies] |
+
+  # 0.3.x wrote hooks = "skip" to keep a package's hooks off. Hooks are off
+  # unless a line says "run", so it is read as no key at all.
+  Scenario Outline: hooks = "skip" is accepted on every dependency table
+    Given "first" lists "alpha" 1.0
+    And a project that <relation> "alpha" with hooks set to "skip"
+    When I run "lvpm lock"
+    Then the command succeeds
+
+    Examples:
+      | relation       |
+      | depends on     |
+      | dev-depends on |
+
+  Scenario: hooks = "skip" on a package without hooks says nothing about hooks
+    Given "first" lists "alpha" 1.0
+    And a project that depends on "alpha" with hooks set to "skip"
+    When I run "lvpm sync --prefix dest"
+    Then the command succeeds
+    And stderr does not say "hooks"
 
   Scenario: hooks = "run" is accepted on every dependency table
     Given "first" lists "alpha" 1.0, "beta" 1.0

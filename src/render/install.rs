@@ -387,11 +387,13 @@ fn hooks_skipped(
              (hooks are off by default; see docs/labview-integration.md#hooks)"
         ),
     });
-    if run_now {
+    // The user asked for these hooks to stay off: no line on how to run them.
+    let skip_line = matches!(allow, Some(AllowLine::SkipDoesNothing { .. }));
+    if run_now && !skip_line {
         if pasteable(package) {
             lines.push(format!("  run it now:     lvpm run-hooks {package}"));
         }
-    } else if reason == SkipReason::NotAllowed && !dry_run {
+    } else if reason == SkipReason::NotAllowed && !dry_run && !skip_line {
         lines.push(
             "  run it:         uninstall, allow it, then install again \
              (PreInstall runs only at install)"
@@ -421,6 +423,12 @@ fn allow_line(allow: &AllowLine) -> Option<String> {
             ))
         }
         AllowLine::PassHooks => Some("  always run it:  add --hooks to this command".to_string()),
+        AllowLine::SkipDoesNothing { name, table } if pasteable(name) && pasteable(table) => {
+            Some(format!(
+                "  hooks = \"skip\" on the {name} line in [{table}] of lvpm.toml does nothing: \
+                 hooks are off unless it says \"run\"; delete the key"
+            ))
+        }
         _ => None,
     }
 }
@@ -930,6 +938,25 @@ resave (1/1) alpha ... 1 saved (9s)
                     "warning: pilot_a: skipped install hook PostInstall {OFF_BY_DEFAULT}\n\
                      \x20 run it now:     lvpm run-hooks pilot_a\n\
                      \x20 always run it:  add hooks = \"run\" to the pilot_a line in [dependencies] of lvpm.toml\n"
+                ),
+            ),
+            (
+                "not allowed, project, the line says skip",
+                vec![skipped_hooks(
+                    "pilot_a",
+                    &[PostInstall],
+                    NotAllowed,
+                    true,
+                    false,
+                    Some(AllowLine::SkipDoesNothing {
+                        name: "pilot_a".into(),
+                        table: "dev-dependencies".into(),
+                    }),
+                )],
+                format!(
+                    "warning: pilot_a: skipped install hook PostInstall {OFF_BY_DEFAULT}\n\
+                     \x20 hooks = \"skip\" on the pilot_a line in [dev-dependencies] of lvpm.toml does nothing: \
+                     hooks are off unless it says \"run\"; delete the key\n"
                 ),
             ),
             (

@@ -853,6 +853,9 @@ pub enum AllowLine {
     ConfigSet { names: Vec<String>, skipped: usize },
     /// Pass `--hooks`: where LabVIEW runs headless, no list allows a hook.
     PassHooks,
+    /// The package's line in `table` says `hooks = "skip"`, which changes
+    /// nothing: hooks are off unless it says `"run"`. Delete the key.
+    SkipDoesNothing { name: String, table: String },
 }
 
 /// The hooks a package can ship.

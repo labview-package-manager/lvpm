@@ -26,8 +26,12 @@ pub struct HookAllow {
 #[derive(Debug, Clone)]
 enum AllowSource {
     /// The root project's dependency lines. `listed` has every line, by
-    /// [`name_key`], allowed or not.
-    Project { listed: BTreeMap<String, Listed> },
+    /// [`name_key`], allowed or not; `skip` the lines that say
+    /// `hooks = "skip"`, by [`name_key`].
+    Project {
+        listed: BTreeMap<String, Listed>,
+        skip: BTreeMap<String, Listed>,
+    },
     /// The user's `hooks.run`, as written.
     Config { names: Vec<String> },
 }
@@ -96,9 +100,18 @@ impl HookAllow {
                         });
                     }
                 }
+                let skip = (p.hooks_skip.iter())
+                    .map(|(name, table)| {
+                        let line = Listed {
+                            name: name.clone(),
+                            table: table.clone(),
+                        };
+                        (name_key(name), line)
+                    })
+                    .collect();
                 HookAllow {
                     names: p.hooks_allowed.iter().map(|n| name_key(n)).collect(),
-                    source: AllowSource::Project { listed },
+                    source: AllowSource::Project { listed, skip },
                 }
             }
             None => HookAllow {
@@ -128,7 +141,14 @@ impl HookAllow {
     /// project, the config line for that one name.
     fn line_for(&self, name: &str) -> AllowLine {
         match &self.source {
-            AllowSource::Project { listed } => match listed.get(&name_key(name)) {
+            AllowSource::Project { skip, .. } if skip.contains_key(&name_key(name)) => {
+                let line = &skip[&name_key(name)];
+                AllowLine::SkipDoesNothing {
+                    name: line.name.clone(),
+                    table: line.table.clone(),
+                }
+            }
+            AllowSource::Project { listed, .. } => match listed.get(&name_key(name)) {
                 Some(line) => AllowLine::AddKey {
                     name: line.name.clone(),
                     table: line.table.clone(),
@@ -372,6 +392,33 @@ mod tests {
             allow.line_for("pilot_c"),
             add_key("pilot_c", "dependency-groups.ci")
         );
+    }
+
+    #[test]
+    fn a_line_that_says_skip_is_told_it_does_nothing_and_is_not_allowed() {
+        let root = crate::project::parse(
+            "[project]\nlabview = \">=2024\"\n\n[dependencies]\nplain = \"*\"\n\n\
+             [dependency-groups.ci]\nPilot_A = { version = \"*\", hooks = \"skip\" }\n",
+        )
+        .unwrap();
+        let allow = HookAllow::for_command(&config(&[]), Some(&root));
+        let plain = HookContext {
+            venv: false,
+            headless: false,
+            forced: false,
+        };
+        assert_eq!(
+            allow.verdict(plain, "pilot_a"),
+            Verdict::Skip(SkipReason::NotAllowed)
+        );
+        assert_eq!(
+            allow.line_for("pilot_a"),
+            AllowLine::SkipDoesNothing {
+                name: "Pilot_A".into(),
+                table: "dependency-groups.ci".into(),
+            }
+        );
+        assert_eq!(allow.line_for("plain"), add_key("plain", "dependencies"));
     }
 
     #[test]
