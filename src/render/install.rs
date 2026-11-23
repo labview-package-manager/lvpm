@@ -69,6 +69,13 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 );
             }
         }
+        Event::LabviewBareYear { path, year } => r.line(
+            Stream::Err,
+            &format!(
+                "warning: labview = \"{year}\" in {} is read as a minimum: write labview = \">={year}\"",
+                path.display()
+            ),
+        ),
         Event::VipmManifestConverted {
             path,
             unused,

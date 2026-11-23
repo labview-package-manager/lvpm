@@ -306,7 +306,16 @@ impl<'a> OpEnv<'a> {
     pub fn read_manifest(&self, path: &Path) -> Result<Project> {
         match crate::vipm_interop::is_toml(path) {
             true => crate::vipm_interop::read_toml(path, self.sink),
-            false => project::read(path),
+            false => {
+                let project = project::read(path)?;
+                if project.labview_bare_year {
+                    self.sink.emit(Event::LabviewBareYear {
+                        path: path.to_path_buf(),
+                        year: project.labview.clone().unwrap_or_default(),
+                    });
+                }
+                Ok(project)
+            }
         }
     }
 

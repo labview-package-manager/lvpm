@@ -91,6 +91,7 @@ impl Renderer {
             | Event::VenvLabviewLeftOpen { .. }
             | Event::NothingToRelink { .. } => relink::render(self, event),
             Event::ManifestInUse { .. }
+            | Event::LabviewBareYear { .. }
             | Event::PalettesMerged { .. }
             | Event::VipmManifestConverted { .. }
             | Event::InstallTarget { .. }

@@ -84,7 +84,7 @@ the manifest's `labview`.
 | --------- | ------ | ---------------------------------------------------------------------------------------------- |
 | `name`    | string | Shown in the install banner. Optional.                                                         |
 | `version` | string | Recorded, not acted on. Optional.                                                              |
-| `labview` | string | The **minimum** LabVIEW year the project supports, written `">=YYYY"`, for example `">=2025"`. Optional but recommended. |
+| `labview` | string | The **minimum** LabVIEW year the project supports, written `">=YYYY"`, for example `">=2025"`. **Required**: `lvpm lock`, `sync`, `add` and `remove` fail without it and print the line to add. A bare year, `"2025"`, the lvpm 0.3 form, is read as `">=2025"` with a warning. |
 
 `labview` is a floor, not a pin:
 
