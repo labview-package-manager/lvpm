@@ -90,8 +90,8 @@ These are hard to undo, so settle them as ADRs (`/adr-tools`) before S1 starts:
    work, so they are on the agenda:
    - **`lvpm build`.** Upstream PR #15 proposes a `[build]` table in
      `lvpm.toml` and a `Build.vi` runner. ADR 1 rules out `[build]`.
-   - **The manifest.** ADR 1 makes upstream's `labview = "2025"` an error,
-     and upstream has users. Upstream PR #16 also adds
+   - **The manifest.** ADR 1 made upstream's `labview = "2025"` an error,
+     and upstream has users (since #44 it is read as `">=2025"`, with a warning). Upstream PR #16 also adds
      `[dependency-groups]` with `--with`, `include-groups` and `main`. ADR 1
      keeps `[dev-dependencies]` as the group `dev`. S11 builds groups as
      `[dependency-groups.<name>]` rather than upstream's `[dependencies.<name>]`;

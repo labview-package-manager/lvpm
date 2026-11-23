@@ -6,6 +6,7 @@
 use super::env::OpEnv;
 use crate::events::Event;
 use crate::paths;
+use crate::project;
 use crate::venv::{self, Venv};
 use crate::{install, launch};
 use anyhow::{Result, bail};
@@ -22,13 +23,13 @@ pub fn create(env: &OpEnv, manifest: Option<&Path>) -> Result<Venv> {
         None => env.cwd.clone(),
     };
     let explicit = match manifest {
-        Some(p) => {
-            let p = paths::resolve(&env.cwd, p);
-            let proj = env.read_manifest(&p)?;
-            Some((p, proj))
-        }
-        None => None,
+        Some(p) => Some(paths::resolve(&env.cwd, p)),
+        // Found here, not in venv::create, so a bare labview year warns.
+        None => project::find_manifest(&paths::clean(&start)),
     };
+    let explicit = explicit
+        .map(|p| env.read_manifest(&p).map(|proj| (p, proj)))
+        .transpose()?;
     venv::create(
         &start,
         env.flags.labview_version.as_deref(),

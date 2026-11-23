@@ -212,17 +212,14 @@ async fn project_without_labview_and_dest(world: &mut CliWorld) {
 async fn project_with_labview_as_written(world: &mut CliWorld, written: String) {
     world.sandbox.use_local_project(None);
     let path = world.sandbox.work_dir().join(MANIFEST_FILE);
-    let text = std::fs::read_to_string(&path).expect("read lvpm.toml");
-    let text = text.replacen(
-        "[project]
-",
-        &format!(
-            "[project]
-labview = \"{written}\"
-"
-        ),
+    let rendered = std::fs::read_to_string(&path).expect("read lvpm.toml");
+    // The builder always writes ">=": the line goes in as written.
+    let text = rendered.replacen(
+        "[project]\n",
+        &format!("[project]\nlabview = \"{written}\"\n"),
         1,
     );
+    assert_ne!(text, rendered, "no [project] line in:\n{rendered}");
     std::fs::write(&path, text).expect("write lvpm.toml");
 }
 
@@ -535,14 +532,13 @@ fn labview_warnings(world: &CliWorld) -> Vec<String> {
         .collect()
 }
 
-#[then(regex = r#"^a warning names labview = "([^"]+)" as the form to write$"#)]
-async fn a_warning_names_the_form(world: &mut CliWorld, form: String) {
+#[then(regex = r#"^one warning names labview = "([^"]+)" as the form to write$"#)]
+async fn one_warning_names_the_form(world: &mut CliWorld, form: String) {
     let wanted = format!("labview = \"{form}\"");
     let warnings = labview_warnings(world);
     assert!(
-        warnings.iter().any(|l| l.contains(&wanted)),
-        "{wanted:?} in no warning of:
-{}",
+        warnings.len() == 1 && warnings[0].contains(&wanted),
+        "{wanted:?} not in exactly one warning of:\n{}",
         world.printed()
     );
 }

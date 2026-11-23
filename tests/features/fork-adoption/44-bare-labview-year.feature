@@ -20,7 +20,16 @@ Feature: project.labview is required, and a bare year is read as a minimum
     When I run "lvpm lock"
     Then the command succeeds
     And lvpm.lock records labview "2026"
-    And a warning names labview = ">=2026" as the form to write
+    And one warning names labview = ">=2026" as the form to write
+
+  Scenario: a command that reads the manifest more than once warns once
+    Given a project whose lvpm.toml says labview = "2026"
+    And the project depends on "beta" ">=1.0"
+    And an empty dest
+    And no lvpm.lock exists
+    When I run "lvpm sync --prefix dest"
+    Then the command succeeds
+    And one warning names labview = ">=2026" as the form to write
 
   Scenario: the explicit form gives no warning
     Given a project whose lvpm.toml says labview = ">=2026"

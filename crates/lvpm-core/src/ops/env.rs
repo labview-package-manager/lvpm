@@ -22,6 +22,7 @@ use anyhow::{Result, bail, ensure};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The flags that say where a command's packages live.
 #[derive(Debug, Clone, Default)]
@@ -73,6 +74,9 @@ pub struct OpEnv<'a> {
     /// The OCI registry client and the logins it holds. Anonymous until the
     /// front end installs credentials.
     pub oci: Arc<Oci>,
+    /// A command can read its manifest more than once; the bare-year warning
+    /// is said once.
+    bare_year_warned: AtomicBool,
 }
 
 /// Where a command's packages live.
@@ -126,6 +130,7 @@ impl<'a> OpEnv<'a> {
             machine: None,
             github: GitHub::default(),
             oci: Arc::new(Oci::default()),
+            bare_year_warned: AtomicBool::new(false),
         }
     }
 
@@ -308,10 +313,15 @@ impl<'a> OpEnv<'a> {
             true => crate::vipm_interop::read_toml(path, self.sink),
             false => {
                 let project = project::read(path)?;
-                if project.labview_bare_year {
+                if let Some(year) = project
+                    .labview
+                    .as_ref()
+                    .filter(|_| project.labview_bare_year)
+                    && !self.bare_year_warned.swap(true, Ordering::Relaxed)
+                {
                     self.sink.emit(Event::LabviewBareYear {
                         path: path.to_path_buf(),
-                        year: project.labview.clone().unwrap_or_default(),
+                        year: year.clone(),
                     });
                 }
                 Ok(project)
