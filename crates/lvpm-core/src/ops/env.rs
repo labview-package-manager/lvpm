@@ -75,7 +75,7 @@ pub struct OpEnv<'a> {
     /// front end installs credentials.
     pub oci: Arc<Oci>,
     /// A command can read its manifest more than once; the bare-year warning
-    /// is said once.
+    /// is said once per command, for the first manifest that has one.
     bare_year_warned: AtomicBool,
 }
 

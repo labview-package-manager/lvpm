@@ -168,6 +168,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&elsewhere);
     }
+
+    #[test]
+    fn create_warns_once_about_a_bare_labview_year_in_the_project_found() {
+        let repo = scratch_dir("venv-create-bare-year");
+        let manifest = repo.join(crate::project::FILE_NAME);
+        std::fs::write(&manifest, "[project]\nlabview = \"2026\"\n").unwrap();
+        let sink = testing::Recorded::default();
+        let env = testing::env_on(&sink, &repo);
+
+        create(&env, None).unwrap();
+        let warned: Vec<Event> = sink
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, Event::LabviewBareYear { .. }))
+            .collect();
+        assert_eq!(
+            warned,
+            vec![Event::LabviewBareYear {
+                path: manifest,
+                year: "2026".into(),
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 }
 
 /// A shortcut `venv shortcut` wrote.

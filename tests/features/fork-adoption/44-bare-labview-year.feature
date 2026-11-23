@@ -22,7 +22,7 @@ Feature: project.labview is required, and a bare year is read as a minimum
     And lvpm.lock records labview "2026"
     And one warning names labview = ">=2026" as the form to write
 
-  Scenario: a command that reads the manifest more than once warns once
+  Scenario: a sync with no lock warns once about a bare year
     Given a project whose lvpm.toml says labview = "2026"
     And the project depends on "beta" ">=1.0"
     And an empty dest
