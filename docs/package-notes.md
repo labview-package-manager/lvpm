@@ -10,9 +10,9 @@ each hook VI's link table and diagram strings (`tools/linkfix/linkobjs.py`,
 [lvkit](https://github.com/Freddd13/lvkit) `describe`) and running the hooks
 that matter in a LabVIEW installation.
 
-A venv runs no install hook, and nothing allows one there
-([Hooks](labview-integration.md#hooks)). "Hook not needed" below means the
-package works without it.
+A venv install runs no install hook, and nothing allows one there
+([Hooks](labview-integration.md#hooks)); `lvpm run-hooks` runs a kept one by
+hand. "Hook not needed" below means the package works without it.
 
 | Package | Checked | Status |
 | ------- | ------- | ------ |

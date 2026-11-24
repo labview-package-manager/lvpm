@@ -44,15 +44,17 @@ flowchart LR
   S["Package sources<br/>VIPM / NI indexes · GitHub releases · your indexes · local folders"] --> L["lvpm<br/>resolve · download · verify · unpack"]
   P["lvpm.toml + lvpm.lock<br/>(optional, per project)"] -.-> L
   L --> T["LabVIEW installation<br/>or project .lv-venv"]
-  L -- "VI Server" --> LV["LabVIEW<br/>relink VIs · run allowed install hooks"]
+  L -- "VI Server" --> LV["LabVIEW<br/>resave or relink when asked · run allowed install hooks"]
 ```
 
 1. lvpm resolves the package and its dependencies, downloads them and checks
    their MD5.
 2. It unpacks them into the target: a LabVIEW installation, or a project venv
    that LabVIEW overlays onto its own tree.
-3. Over VI Server, it has LabVIEW relink the installed VIs and run the
-   packages' install hooks, for the packages you allowed.
+3. Linkfix repairs the installed VIs' links without LabVIEW. Over VI Server,
+   LabVIEW relinks them only with `--relink` or for a package marked
+   `relink = true`, resaves a venv's packages, and runs the install hooks of the
+   packages you allowed, outside a venv.
 
 In a project, `lvpm.toml` says what you depend on. `lvpm.lock` records the
 exact versions, so every machine and CI job gets the same packages, byte for
@@ -94,7 +96,7 @@ $ lvpm uninstall oglib_error
 Or browse and install in a terminal UI: `lvpm tui`.
 
 `--labview-version` picks the target when more than one LabVIEW is
-installed. Relinking and hooks need LabVIEW's VI Server (TCP) enabled, which
+installed. Relinking, hooks and a venv's resave need LabVIEW's VI Server (TCP) enabled, which
 is its default setting (Tools » Options » VI Server). lvpm starts LabVIEW
 itself when it is not running, and says so.
 

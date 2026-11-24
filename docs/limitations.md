@@ -16,7 +16,8 @@
   but runs to completion reports as ok.
 - A failure part-way through unpacking leaves files behind with no record,
   and one failed download aborts the rest of the plan.
-- In a venv, no install or uninstall hook runs, and nothing allows one: they
+- In a venv, no install or uninstall hook runs during an install or uninstall,
+  and nothing allows one (`lvpm run-hooks` runs a kept PostInstall by hand): they
   act on the LabVIEW installation, not on an overlay. File groups aimed at
   machine locations (`<OS ...>`, `<temp>`) are skipped. Both are recorded and
   shown by `lvpm list`.

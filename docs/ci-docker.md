@@ -41,8 +41,8 @@ in a container blocks forever on an activation prompt nobody can see. Nobody
 sets it on a workstation, so its presence is a reliable sign of an
 automation machine with no developer at it, and lvpm reads it as exactly
 that. On a headless machine these decisions go the other way, each announced
-on one line and each overridable (the relink pass is off on both, behind
-`--relink`):
+on one line and each overridable (the relink pass is the same on both: off,
+except with `--relink` or for a package marked `relink = true`):
 
 |                                    | developer's machine                                                                 | headless (`LV_RTE_HEADLESS`)                                                                                                         | override                         |
 | ---------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------- |
