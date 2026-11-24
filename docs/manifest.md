@@ -488,11 +488,12 @@ lock still lists, so tooling installed by `lvpm sync --group ci` survives a late
 
 ### Groups written the lvpm 0.3 way
 
-lvpm 0.3 wrote a group as `[dependencies.<name>]`: a table under
+lvpm 0.3 wrote a group as `[dependencies.<name>]`: a non-empty table under
 `[dependencies]` with none of a dependency line's keys (`version`, `github`,
 `index`, `hooks`, `relink`). That form is still read, as the group
 `<name>`; `[dependencies.dev]` is read as `[dev-dependencies]`. Each command
-warns once per group and names the header to write:
+warns once per group and names the header to write (the real line shows the
+manifest's full path):
 
 ```text
 warning: [dependencies.test] in lvpm.toml is read as a group: write [dependency-groups.test]
@@ -502,11 +503,17 @@ warning: [dependencies.test] in lvpm.toml is read as a group: write [dependency-
 - **One form per group.** `[dependencies.test]` beside
   `[dependency-groups.test]` (or `[dependencies.dev]` beside a non-empty
   `[dev-dependencies]`) is refused, naming both.
-- **`add` and `remove` refuse it.** `lvpm add` and `lvpm remove` write only the
-  current form, so `--group test` (or `--dev`) on a group still written the old
-  way fails before anything changes, with the header to rename.
+- **Edits refuse it.** `lvpm add`, `lvpm remove`, `lvpm import` and
+  `lvpm lock --upgrade-package` write only the current form, so an edit to a
+  group still written the old way (`--group test`, `--dev`, or an upgrade that
+  rewrites a constraint in it) fails before anything changes, with the header
+  to rename.
 - **A table with a line's key is a package.** `[dependencies.test]` with
-  `version = "*"` is the package `test`, as before.
+  `version = "*"` is the package `test`, as before. An empty
+  `[dependencies.test]` is a package line too, and refused as one.
+- **A misspelt key makes a group.** `[dependencies.pkg]` with only
+  `verison = "*"` has none of a line's keys, so it is read as the group `pkg`
+  (with the warning) instead of being refused as a bad line.
 
 ## `[nipm.dependencies]`
 

@@ -562,9 +562,12 @@ fn group_warnings(world: &CliWorld) -> Vec<String> {
     regex = r"^one warning names (\[dev-dependencies\]|\[dependency-groups\.[\w-]+\]) as the form to write$"
 )]
 async fn one_warning_names_the_group_form(world: &mut CliWorld, form: String) {
-    let warnings = group_warnings(world);
+    let tail = format!("write {form}");
+    let naming = group_warnings(world)
+        .into_iter()
+        .filter(|w| w.ends_with(&tail));
     assert!(
-        warnings.len() == 1 && warnings[0].contains(&form),
+        naming.count() == 1,
         "{form:?} not in exactly one warning of:\n{}",
         world.printed()
     );

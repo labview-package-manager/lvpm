@@ -48,7 +48,7 @@ pub fn add(
 ) -> Result<(), EditError> {
     let request = Request::parse(spec, source_pin)?;
     let prepared = Prepared::of(env)?;
-    refuse_old_form_group(&prepared.found.1, &table)?;
+    project::refuse_old_form_edit(&prepared.found.1, &table)?;
     let dest = env.destination()?;
     announce_project(env, &prepared, &dest);
 
@@ -85,7 +85,7 @@ pub fn remove(
     options: &InstallOptions,
 ) -> Result<(), EditError> {
     let prepared = Prepared::of(env)?;
-    refuse_old_form_group(&prepared.found.1, &table)?;
+    project::refuse_old_form_edit(&prepared.found.1, &table)?;
     if let DependencyTable::Group(group) = &table {
         refuse_unknown_groups(&prepared.found.1, std::slice::from_ref(group))?;
     }
@@ -101,26 +101,6 @@ pub fn remove(
         &Moving::Nothing,
     )?;
     commit(env, prepared, edit, &index, dest, options)
-}
-
-/// The editor writes only `[dependency-groups.<group>]`, so an edit to a group
-/// written the lvpm 0.3 way, `[dependencies.<group>]`, is refused before
-/// anything changes, with the header to rename.
-fn refuse_old_form_group(project: &Project, table: &DependencyTable) -> Result<(), EditError> {
-    match table.group() {
-        Some(group) => match (project.old_form_groups.iter()).find(|old| {
-            old.as_str() == group || project::is_dev_group(old) && project::is_dev_group(group)
-        }) {
-            Some(old) => Err(anyhow!(
-                "[dependencies.{old}] is the lvpm 0.3 form of a group; rename the header to {}, \
-                 then run this again",
-                project::group_header(old)
-            )
-            .into()),
-            None => Ok(()),
-        },
-        _ => Ok(()),
-    }
 }
 
 /// What `add` was asked for: a package, the constraint if one was written, and

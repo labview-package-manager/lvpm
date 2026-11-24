@@ -292,6 +292,9 @@ impl Pins {
             updates.extend(constraint_updates(&found.1, &target.name, raw, &version));
             constraints.push((target.name.clone(), Constraint::Exact(version)));
         }
+        for update in &updates {
+            crate::project::refuse_old_form_edit(&found.1, &update.table)?;
+        }
         let rewrite = match updates.is_empty() {
             true => None,
             false => Some(Rewrite::of(&found.0, updates)?),

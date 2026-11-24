@@ -78,7 +78,7 @@ pub struct OpEnv<'a> {
     /// is said once per command, for the first manifest that has one.
     bare_year_warned: AtomicBool,
     /// The same for the old-form group warning.
-    old_groups_warned: AtomicBool,
+    old_form_groups_warned: AtomicBool,
 }
 
 /// Where a command's packages live.
@@ -133,7 +133,7 @@ impl<'a> OpEnv<'a> {
             github: GitHub::default(),
             oci: Arc::new(Oci::default()),
             bare_year_warned: AtomicBool::new(false),
-            old_groups_warned: AtomicBool::new(false),
+            old_form_groups_warned: AtomicBool::new(false),
         }
     }
 
@@ -328,7 +328,7 @@ impl<'a> OpEnv<'a> {
                     });
                 }
                 if !project.old_form_groups.is_empty()
-                    && !self.old_groups_warned.swap(true, Ordering::Relaxed)
+                    && !self.old_form_groups_warned.swap(true, Ordering::Relaxed)
                 {
                     for group in &project.old_form_groups {
                         self.sink.emit(Event::OldFormGroup {

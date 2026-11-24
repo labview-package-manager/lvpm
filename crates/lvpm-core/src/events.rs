@@ -122,7 +122,8 @@ pub enum Event {
     /// form. It is read as `">=2024"`, which is the form to write.
     LabviewBareYear { path: PathBuf, year: String },
     /// The manifest writes a group as `[dependencies.<group>]`, the lvpm 0.3
-    /// form. It is read as `[dependency-groups.<group>]`, the form to write.
+    /// form. It is read as the table `project::group_header` names
+    /// (`[dev-dependencies]` for `dev`), the form to write.
     OldFormGroup { path: PathBuf, group: String },
     /// The install reads its packages from a project manifest. `name` and
     /// `labview` are what the manifest states, if anything.

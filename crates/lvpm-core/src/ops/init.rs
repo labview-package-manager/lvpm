@@ -434,12 +434,13 @@ pub fn import(
     let manifest = root.join(project::FILE_NAME);
     let created = !manifest.is_file();
     let (seed, _) = read_source(&env.cwd, file, all)?;
-    let before = match created {
-        true => None,
+    let (before, existing) = match created {
+        true => (None, None),
         false => {
             // A manifest lvpm cannot read is refused before any edit.
-            project::read(&manifest)?;
-            Some(std::fs::read_to_string(&manifest).map_err(anyhow::Error::from)?)
+            let existing = project::read(&manifest)?;
+            let text = std::fs::read_to_string(&manifest).map_err(anyhow::Error::from)?;
+            (Some(text), Some(existing))
         }
     };
     let mut text = before.clone().unwrap_or_else(|| {
@@ -463,6 +464,9 @@ pub fn import(
                 (_, Some((table, _, _))) => table.clone(),
                 _ => default.clone(),
             };
+            if let Some(existing) = &existing {
+                project::refuse_old_form_edit(existing, &table)?;
+            }
             // The manifest's own spelling, so a key differing only in case is
             // rewritten, not added beside it.
             let (key, was) = match declared {
@@ -2079,6 +2083,26 @@ Alpha = \"1.0\"
             text.contains("[dependency-groups.tools]\nalpha = \"2.0\"\ndep_only = \">=1.0\""),
             "{text}"
         );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn import_into_a_group_written_the_old_way_is_refused_and_writes_nothing() {
+        let (scratch, root) = folder("import-old-group", "App");
+        vipc_in(&root, "p.vipc", "23.0", &[("alpha-2.0", true, false)]);
+        let manifest = root.join("lvpm.toml");
+        let before = "[project]\nname = \"App\"\n\n[dependencies.tools]\nbeta = \"*\"\n";
+        std::fs::write(&manifest, before).unwrap();
+        let sink = Recorded::default();
+        let env = env_on(&sink, &root);
+
+        let error = import(&env, Path::new("p.vipc"), false, Some("tools"), false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "[dependencies.tools] is the lvpm 0.3 form of a group; \
+             rename the header to [dependency-groups.tools], then run this again"
+        );
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), before);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
