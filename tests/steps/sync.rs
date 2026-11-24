@@ -57,6 +57,8 @@ struct Installed {
     name: String,
     version: String,
     archive_sha256: Option<String>,
+    /// As the record lists them: relative to where lvpm ran when `--prefix` was.
+    files: Vec<String>,
 }
 
 /// The packages installed in `dest`, by name.
@@ -82,6 +84,12 @@ fn records_in(dir: &Path) -> Vec<Installed> {
                 name: json["name"].as_str().expect("a name").to_string(),
                 version: json["version"].as_str().expect("a version").to_string(),
                 archive_sha256: json["archive_sha256"].as_str().map(str::to_string),
+                files: json["files"]
+                    .as_array()
+                    .expect("a file list")
+                    .iter()
+                    .map(|file| file.as_str().expect("a path").to_string())
+                    .collect(),
             }
         })
         .collect();
@@ -703,6 +711,28 @@ async fn dest_holds_exactly(world: &mut CliWorld, packages: String) {
 #[then(regex = r"^dest has exactly (.+)$")]
 async fn dest_has_exactly(world: &mut CliWorld, packages: String) {
     assert_exactly(world, &packages);
+}
+
+#[then(regex = r"^(\w+)'s files are under dest$")]
+async fn files_are_under_dest(world: &mut CliWorld, name: String) {
+    let dest = world.dest_dir().canonicalize().expect("dest exists");
+    let package = installed_in(&dest)
+        .into_iter()
+        .find(|package| package.name == name)
+        .unwrap_or_else(|| panic!("{name} is not installed in dest"));
+    assert!(!package.files.is_empty(), "{name}'s record lists no files");
+    for file in &package.files {
+        // A relative --prefix leaves the paths relative to where lvpm ran: dest's parent.
+        let path = dest.parent().expect("a sandbox").join(file);
+        let path = path
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert!(
+            path.starts_with(&dest),
+            "{file} is not under {}",
+            dest.display()
+        );
+    }
 }
 
 #[then("each install manifest's archive SHA-256 equals the locked one")]
