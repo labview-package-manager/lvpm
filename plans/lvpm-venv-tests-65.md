@@ -18,7 +18,7 @@ it waits on.
 
 - [ ] A debug build reads `LVPM_FAKE_LABVIEW=<version>,<bitness>,<dir>` as the one LabVIEW installed. Unchanged and not tested here: a release build never compiles the hook (`cfg(debug_assertions)`), and `LVPM_TEST_LABVIEW=1` is not touched.
 - [ ] With each malformed `LVPM_FAKE_LABVIEW` (missing field, non-numeric version, bitness 7), `lvpm venv create` in a debug build exits non-zero and stderr names `<version>,<bitness>,<dir>`. It never falls back to the machine's LabVIEW.
-- [ ] `cargo test --test venv`: every test passes or is `#[ignore = "#NN"]`, where #NN is an open sub-issue of labview-package-manager/lvpm#43. The allowed set is #45, #48, #50, #54, #55.
+- [ ] `cargo test --test venv`: every test passes or is `#[ignore = "#NN"]`, where #NN is an open sub-issue of labview-package-manager/lvpm#43. The allowed set is #48, #50, #54, #55, #68.
 - [ ] `cargo test --test venv -- --ignored`: every ignored test fails on its own assertion, not on setup, so no ignore hides a test that already passes.
 - [ ] No test reads the machine's own LabVIEW: the harness sets the fake 2099 and removes `LVPM_TEST_LABVIEW` from the child's environment.
 - [ ] `grep -n -- --no-save tests/venv.rs` returns nothing. Assertions on those lines (upstream 392, 446, 525, 579–580) that do not need `--no-save` are kept without it.
@@ -110,7 +110,7 @@ Feature: the venv workflow is tested without LabVIEW
 - Every `LVPM_TEST_LABVIEW` in the header becomes `LVPM_FAKE_LABVIEW`. A header line says where the port differs from upstream.
 **TEST**:
 - `cargo test --test venv` gives only passes and ignores.
-- `grep 'ignore = "' tests/venv.rs` shows only `#45`, `#48`, `#50`, `#54` and `#55`, all open.
+- `grep 'ignore = "' tests/venv.rs` shows only `#48`, `#50`, `#54`, `#55` and `#68`, all open.
 - `cargo test --test venv -- --ignored` fails every ignored test.
 - `cargo test --workspace` and `cargo clippy --all-targets` are green.
 **REFACTOR**: Remove helpers that no running test uses only if clippy flags them. Ignored tests keep theirs.
@@ -160,9 +160,10 @@ graph TD
 - **Upstream is wrong for the fork.** Upstream's test can encode behaviour the fork rejects on purpose: shadow reporting, the JSON log, `>=` years. In those cases the test takes the fork's way, and the PR lists each one for Jonathan.
 - **#45 lands first or later.** The groups test is ignored `#45` either way. #45 removes the ignore. The only conflict is the `FEATURE_FILES` line in `tests/acceptance.rs`, and this slice does not touch that file.
   *Amended 2026-11-24:* the test also needs `include-groups` and `--with` /
-  `--without` / `--only`, which #45 does not port. #45 retags it `#68` and adds
-  `manifest_install_reads_a_group_written_under_dependencies`. #68 joins the
-  allowed set.
+  `--without` / `--only`, which labview-package-manager/lvpm#45 does not port.
+  That slice retags it `#68` (labview-package-manager/lvpm#68) and adds
+  `manifest_install_reads_a_group_written_under_dependencies`. `#68` replaces
+  `#45` in the allowed set.
 - The resume guard reported `resume` from an old ThatsTheEnd "#65" in `plans/lvpm-attestations-s6.md`. That is a false positive.
 
 ## Criteria gate (build Step 3)

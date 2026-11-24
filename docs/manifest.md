@@ -507,7 +507,8 @@ warning: [dependencies.test] in lvpm.toml is read as a group: write [dependency-
   `lvpm lock --upgrade-package` write only the current form, so an edit to a
   group still written the old way (`--group test`, `--dev`, or an upgrade that
   rewrites a constraint in it) fails before anything changes, with the header
-  to rename.
+  to rename. So does an entry in `[dependencies]` named like the group, such
+  as `lvpm add test` beside `[dependencies.test]`.
 - **A table with a line's key is a package.** `[dependencies.test]` with
   `version = "*"` is the package `test`, as before. An empty
   `[dependencies.test]` is a package line too, and refused as one.

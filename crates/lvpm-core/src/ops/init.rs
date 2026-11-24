@@ -438,7 +438,7 @@ pub fn import(
         true => (None, None),
         false => {
             // A manifest lvpm cannot read is refused before any edit.
-            let existing = project::read(&manifest)?;
+            let existing = env.read_manifest(&manifest)?;
             let text = std::fs::read_to_string(&manifest).map_err(anyhow::Error::from)?;
             (Some(text), Some(existing))
         }
@@ -465,7 +465,7 @@ pub fn import(
                 _ => default.clone(),
             };
             if let Some(existing) = &existing {
-                project::refuse_old_form_edit(existing, &table)?;
+                project::refuse_old_form_edit(existing, &table, name)?;
             }
             // The manifest's own spelling, so a key differing only in case is
             // rewritten, not added beside it.

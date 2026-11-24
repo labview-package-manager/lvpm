@@ -696,7 +696,7 @@ chose.
 spells a table-form dependency: `[dependencies.test]` with `version = "*"` is a
 package called `test`, so a group and a package cannot share the header. ADR 1
 also keeps `[dev-dependencies]` as the group `dev`. The 2026-10-30 merge left
-upstream's group code out, and none of it was ported. A manifest with groups is
+upstream's group code out. A manifest with groups is
 not one upstream reads; this is on the upstream agenda above.
 
 *Amended 2026-11-24 (labview-package-manager/lvpm#45):* upstream's
