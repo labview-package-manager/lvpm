@@ -65,14 +65,14 @@ it). `--relink-timeout <SECS>`
 started for a venv relink running. `sync`, `add` and `remove` take `--dry-run`
 and the relink and hook flags as well.
 
-lvpm 0.3 had three `install` flags that are gone
+lvpm 0.3 had three `install` flags that are gone or refused
 ([labview-package-manager/lvpm#47](https://github.com/labview-package-manager/lvpm/issues/47)):
 
 | lvpm 0.3                                   | Now                                                                                              |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------ |
 | `install --no-hooks`                       | Nothing to pass: hooks are off unless turned on ([Install hooks](#install-hooks)). A package with `hooks = "run"` cannot be held back for one command |
-| `install <name> --no-save` in a venv       | No equivalent: the next `sync` would remove the package. Outside a venv, use `--prefix`, `--global` or `--labview-version` |
-| `install --manifest <FILE> --prefix <DIR>` | `sync --project <folder of lvpm.toml> --prefix <DIR>`; the manifest must be named `lvpm.toml`    |
+| `install <name> --no-save` in a venv       | No equivalent: the next `sync` would remove the package. `--prefix`, `--global` or `--labview-version` install without writing `lvpm.toml` |
+| `install --manifest <FILE> --prefix <DIR>` | `sync --prefix <DIR>`, run in the folder of `lvpm.toml` (`--project` and `--prefix` do not combine); the manifest must be named `lvpm.toml` |
 
 ## Install hooks
 

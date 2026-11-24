@@ -57,7 +57,7 @@ struct Installed {
     name: String,
     version: String,
     archive_sha256: Option<String>,
-    /// As the record lists them: relative to where lvpm ran when `--prefix` was.
+    /// As the record lists them: relative to where lvpm ran when `--prefix` was relative.
     files: Vec<String>,
 }
 
@@ -722,9 +722,11 @@ async fn files_are_under_dest(world: &mut CliWorld, name: String) {
         .unwrap_or_else(|| panic!("{name} is not installed in dest"));
     assert!(!package.files.is_empty(), "{name}'s record lists no files");
     for file in &package.files {
-        // A relative --prefix leaves the paths relative to where lvpm ran: dest's parent.
-        let path = dest.parent().expect("a sandbox").join(file);
-        let path = path
+        // A relative --prefix leaves the paths relative to where lvpm ran.
+        let path = world
+            .sandbox
+            .work_dir()
+            .join(file)
             .canonicalize()
             .unwrap_or_else(|e| panic!("{file}: {e}"));
         assert!(
