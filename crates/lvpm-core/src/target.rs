@@ -101,11 +101,15 @@ fn parse_fake_labview(spec: &str) -> Result<LvTarget> {
         bail!("LVPM_FAKE_LABVIEW is <version>,<bitness>,<dir>; got {spec:?}");
     };
     match (version.trim().parse::<f64>(), bitness.trim().parse::<u8>()) {
-        (Ok(version), Ok(bitness @ (32 | 64))) if !dir.is_empty() => Ok(LvTarget {
-            version,
-            bitness,
-            path: PathBuf::from(dir),
-        }),
+        (Ok(version), Ok(bitness @ (32 | 64)))
+            if version.is_finite() && version >= 0.0 && !dir.is_empty() =>
+        {
+            Ok(LvTarget {
+                version,
+                bitness,
+                path: PathBuf::from(dir),
+            })
+        }
         _ => bail!("LVPM_FAKE_LABVIEW is <version>,<bitness>,<dir>; got {spec:?}"),
     }
 }
@@ -704,7 +708,10 @@ mod tests {
         let t = parse_fake_labview("99.0, 64,C:\\lv,with comma").unwrap();
         assert_eq!((t.version, t.bitness), (99.0, 64));
         assert_eq!(t.path, PathBuf::from("C:\\lv,with comma"));
-        for bad in ["", "99.0,64", "99.0,64,", "x,64,d", "99.0,x,d", "99.0,7,d"] {
+        for bad in [
+            "", "99.0,64", "99.0,64,", "x,64,d", "inf,64,d", "NaN,64,d", "-5,64,d", "99.0,x,d",
+            "99.0,7,d",
+        ] {
             let err = parse_fake_labview(bad).unwrap_err().to_string();
             assert!(err.contains("<version>,<bitness>,<dir>"), "{bad:?}: {err}");
         }

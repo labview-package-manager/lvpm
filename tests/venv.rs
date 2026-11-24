@@ -154,12 +154,15 @@ impl Lab {
     }
 
     fn run_in(&self, dir: &Path, args: &[&str]) -> Run {
+        let fake = format!("99.0,64,{}", self.root.join("labview").display());
+        self.run_with_fake(dir, &fake, args)
+    }
+
+    /// `run_in`, with `LVPM_FAKE_LABVIEW` set to `fake`.
+    fn run_with_fake(&self, dir: &Path, fake: &str, args: &[&str]) -> Run {
         let out = Command::new(env!("CARGO_BIN_EXE_lvpm"))
             .current_dir(dir)
-            .env(
-                "LVPM_FAKE_LABVIEW",
-                format!("99.0,64,{}", self.root.join("labview").display()),
-            )
+            .env("LVPM_FAKE_LABVIEW", fake)
             .env("LVPM_CONFIG_CACHE", self.root.join("cache"))
             .env("LVPM_CONFIG_SOURCES_LOCAL", self.root.join("packages"))
             .env("LVPM_CONFIG_VENV_DIR", ".lv-venv")
@@ -234,10 +237,7 @@ fn create_binds_the_project_and_remove_takes_it_away() {
     let binding: serde_json::Value =
         serde_json::from_slice(&std::fs::read(lab.venv().join("venv.json")).unwrap()).unwrap();
     // fork: a binding leaves `manifest` out when it is lvpm.toml.
-    assert!(matches!(
-        binding.get("manifest").and_then(|m| m.as_str()),
-        None | Some("lvpm.toml")
-    ));
+    assert!(binding.get("manifest").is_none_or(|m| m == "lvpm.toml"));
     assert_eq!(binding["target_key"], "LabVIEW-2099-64bit");
 
     // fork: the venv's own labview.ini is written at its first launch, not
@@ -895,20 +895,13 @@ fn a_malformed_fake_labview_is_refused_and_never_falls_back() {
         format!("x,64,{dir}"),
         format!("99.0,7,{dir}"),
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_lvpm"))
-            .current_dir(lab.project())
-            .env("LVPM_FAKE_LABVIEW", &spec)
-            .env("LVPM_CONFIG_LOG_DIR", lab.root.join("logs"))
-            .env_remove("LVPM_TEST_LABVIEW")
-            .args(["venv", "create", "--labview-version", "2099"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(!out.status.success(), "{spec:?} was accepted");
-        has(
-            &String::from_utf8_lossy(&out.stderr),
-            "<version>,<bitness>,<dir>",
+        let r = lab.run_with_fake(
+            &lab.project(),
+            &spec,
+            &["venv", "create", "--labview-version", "2099"],
         );
+        assert!(!r.ok, "{spec:?} was accepted");
+        has(&r.text, "<version>,<bitness>,<dir>");
     }
     assert!(!lab.venv().exists());
 }
