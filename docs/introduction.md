@@ -10,9 +10,8 @@ use different versions of the same library.
 
 Not affiliated with JKI or NI. Working, in active development; the
 [roadmap](https://github.com/ThatsTheEnd/lvpm/blob/main/docs/roadmap.md) has
-what is planned, the
-[README](https://github.com/ThatsTheEnd/lvpm#known-limitations) the known
-limitations.
+what is planned, and
+[Known limitations](limitations.md) what does not work yet.
 
 {{#include ../README.md:how-it-works}}
 
