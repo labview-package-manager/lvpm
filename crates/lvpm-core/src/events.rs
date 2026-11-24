@@ -118,6 +118,9 @@ pub enum Event {
         /// The venv's LabVIEW is running: it reads palettes only at startup.
         restart: bool,
     },
+    /// The manifest writes `labview` as a bare year, `"2024"`, the lvpm 0.3
+    /// form. It is read as `">=2024"`, which is the form to write.
+    LabviewBareYear { path: PathBuf, year: String },
     /// The install reads its packages from a project manifest. `name` and
     /// `labview` are what the manifest states, if anything.
     ManifestInUse {

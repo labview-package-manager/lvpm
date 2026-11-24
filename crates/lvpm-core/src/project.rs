@@ -196,6 +196,9 @@ pub struct Project {
     /// oldest LabVIEW the project is meant for. A venv binds to this version or a newer one; a global
     /// install still takes its target from `--labview-version`.
     pub labview: Option<String>,
+    /// `labview` is written as a bare year, `"2024"`, the lvpm 0.3 form: read
+    /// as `">=2024"`, with a warning that names that form.
+    pub labview_bare_year: bool,
     /// `[sources]`, in file order: a name and an index URL or `oci://` registry
     /// URL as written.
     pub sources: Vec<(String, String)>,
@@ -248,6 +251,7 @@ impl Default for Project {
             name: None,
             version: None,
             labview: None,
+            labview_bare_year: false,
             sources: Vec::new(),
             default_sources: true,
             min_age_days: 0,
@@ -478,15 +482,18 @@ const SOURCE_SETTINGS: [&str; 2] = [DEFAULTS, MIN_AGE_DAYS];
 
 pub(crate) fn parse(text: &str) -> Result<Project> {
     let f: File = toml::from_str(text)?;
+    let written = f.project.labview.as_deref().map(str::trim);
+    let labview_bare_year = written.is_some_and(is_year);
     let mut p = Project {
         name: f.project.name,
         version: f.project.version,
-        labview: f
-            .project
-            .labview
-            .as_deref()
-            .map(labview_minimum)
+        labview: written
+            .map(|year| match labview_bare_year {
+                true => Ok(year.to_string()),
+                false => labview_minimum(year),
+            })
             .transpose()?,
+        labview_bare_year,
         distribution: f.distribution,
         ..Project::default()
     };
@@ -606,10 +613,14 @@ fn trusted_publisher(value: toml::Value) -> Result<String> {
     }
 }
 
-/// `project.labview` as written, `">=2024"`, to the year it starts at, `"2024"`:
-/// what [`Project::labview`] holds, so every reader of it sees a plain year.
+fn is_year(s: &str) -> bool {
+    s.len() == 4 && s.bytes().all(|b| b.is_ascii_digit()) && s >= "2000"
+}
+
+/// `labview` as written, `">=2024"`, to the year it starts at, `"2024"`, so
+/// every reader of it sees a plain year. The strict form, which a package.toml
+/// is held to: a bare year is refused. lvpm.toml's [`parse`] reads one first.
 pub(crate) fn labview_minimum(text: &str) -> Result<String> {
-    let is_year = |s: &str| s.len() == 4 && s.bytes().all(|b| b.is_ascii_digit()) && s >= "2000";
     let text = text.trim();
     match text.strip_prefix(">=").map(str::trim) {
         Some(year) if is_year(year) => Ok(year.to_string()),
@@ -1004,24 +1015,28 @@ mod tests {
     }
 
     #[test]
-    fn labview_is_a_minimum_year_and_every_other_form_is_refused_by_key() {
+    fn labview_is_a_minimum_year_and_every_form_but_a_bare_year_is_refused_by_key() {
         let labview = |value: &str| parse(&format!("[project]\nlabview = {value:?}\n"));
-        assert_eq!(labview(">=2024").unwrap().labview.as_deref(), Some("2024"));
-        assert_eq!(
-            labview(" >= 2024 ").unwrap().labview.as_deref(),
-            Some("2024")
-        );
-        let plain = labview("2024").unwrap_err().to_string();
-        assert!(
-            plain.contains("project.labview") && plain.contains("\">=2024\""),
-            "{plain}"
-        );
+        for value in [">=2024", " >= 2024 "] {
+            let explicit = labview(value).unwrap();
+            assert_eq!(explicit.labview.as_deref(), Some("2024"), "{value:?}");
+            assert!(!explicit.labview_bare_year, "{value:?}");
+        }
+        assert!(!parse("[project]\n").unwrap().labview_bare_year);
         for value in [
-            ">2024", "^2024", "<=2024", ">=24", ">=2024.1", ">=", "", ">=1999", "soon",
+            ">2024", "^2024", "<=2024", ">=24", ">=2024.1", ">=", "", ">=1999", "soon", "1999",
+            "24", "20244", "2024.1", "202a",
         ] {
             let why = labview(value).unwrap_err().to_string();
             assert!(why.contains("project.labview"), "{value:?}: {why}");
         }
+    }
+
+    #[test]
+    fn a_bare_labview_year_is_read_as_that_minimum_and_marked_for_the_warning() {
+        let bare = parse("[project]\nlabview = \" 2024 \"\n").unwrap();
+        assert_eq!(bare.labview.as_deref(), Some("2024"));
+        assert!(bare.labview_bare_year);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 use super::env::OpEnv;
 use crate::events::Event;
 use crate::paths;
+use crate::project;
 use crate::venv::{self, Venv};
 use crate::{install, launch};
 use anyhow::{Result, bail};
@@ -22,13 +23,13 @@ pub fn create(env: &OpEnv, manifest: Option<&Path>) -> Result<Venv> {
         None => env.cwd.clone(),
     };
     let explicit = match manifest {
-        Some(p) => {
-            let p = paths::resolve(&env.cwd, p);
-            let proj = env.read_manifest(&p)?;
-            Some((p, proj))
-        }
-        None => None,
+        Some(p) => Some(paths::resolve(&env.cwd, p)),
+        // Found here, not in venv::create, so a bare labview year warns.
+        None => project::find_manifest(&paths::clean(&start)),
     };
+    let explicit = explicit
+        .map(|p| env.read_manifest(&p).map(|proj| (p, proj)))
+        .transpose()?;
     venv::create(
         &start,
         env.flags.labview_version.as_deref(),
@@ -166,6 +167,31 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn create_warns_once_about_a_bare_labview_year_in_the_project_found() {
+        let repo = scratch_dir("venv-create-bare-year");
+        let manifest = repo.join(crate::project::FILE_NAME);
+        std::fs::write(&manifest, "[project]\nlabview = \"2026\"\n").unwrap();
+        let sink = testing::Recorded::default();
+        let env = testing::env_on(&sink, &repo);
+
+        create(&env, None).unwrap();
+        let warned: Vec<Event> = sink
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, Event::LabviewBareYear { .. }))
+            .collect();
+        assert_eq!(
+            warned,
+            vec![Event::LabviewBareYear {
+                path: manifest,
+                year: "2026".into(),
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
 

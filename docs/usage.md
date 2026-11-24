@@ -264,8 +264,9 @@ The `hexagon_lib_motion` line carries a source pin: that package comes from
 one. Dependencies a package carries are always floors, so what a project pins
 exactly stays exact and the rest resolves to the newest version that fits.
 
-Before 0.6, `labview` was a bare year. lvpm now refuses `labview = "2025"`
-and asks for `labview = ">=2025"`; change the line and nothing else.
+Before 0.6, `labview` was a bare year. lvpm still reads `labview = "2025"`
+as `">=2025"`, and warns that `labview = ">=2025"` is the form to write;
+change the line and nothing else.
 
 ## The lock file
 

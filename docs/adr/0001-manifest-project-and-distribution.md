@@ -12,6 +12,11 @@ Amended by [ADR 6](0006-lvpkg-only-vip-read-only.md) on 2026-10-29: `formats`
 and `[distribution.vip]` (decisions 2 and 4, and the example) went away when
 S7a landed; lvpm writes `.lvpkg` only. The example below is the current one.
 
+Amended on 2026-11-23 (labview-package-manager/lvpm#44): a bare
+`labview = "2025"` in `lvpm.toml` is read as `">=2025"`, with a warning that
+names that form, instead of being an error, so a 0.3 manifest keeps working.
+`package.toml` in a `.lvpkg` still refuses it.
+
 ## Context
 
 S1 adds `lvpm build`, so `lvpm.toml` needs keys that describe a package. The
@@ -109,7 +114,8 @@ hexagon_ci_tools = "*"
 - S1 parses `[distribution]` and changes the `labview` parser from a plain
   version to a constraint. S1 accepts only `>=`, and `project.rs` hands the
   lock and venv code the lower bound, so they don't change. A plain `labview = "2025"` (the form in docs/usage.md)
-  becomes an error that suggests `">=2025"`.
+  becomes an error that suggests `">=2025"`; since the 2026-11-23
+  amendment (labview-package-manager/lvpm#44), a warning (see Status).
 - `package.toml` inside a `.lvpkg` (S7a) reuses these key names.
 - S11 changes the lockfile's per-package `dev = true` into a list of groups,
   before any lockfile is public.

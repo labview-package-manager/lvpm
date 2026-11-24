@@ -25,7 +25,7 @@ is, start `lvpm tui` inside a scratch project that has a venv:
 ```bash
 mkdir %TEMP%\tui-test
 cd %TEMP%\tui-test
-(echo [project]& echo name = "tui-test"& echo version = "0.1.0"& echo labview = "2026") > lvpm.toml
+(echo [project]& echo name = "tui-test"& echo version = "0.1.0"& echo labview = ">=2026") > lvpm.toml
 <repo>\target\debug\lvpm.exe venv create
 <repo>\target\debug\lvpm.exe tui
 ```

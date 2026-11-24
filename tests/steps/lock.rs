@@ -202,6 +202,27 @@ async fn project_without_labview(world: &mut CliWorld) {
     world.sandbox.use_local_project(None);
 }
 
+#[given(r#"a project manifest without labview, with a scratch destination "dest""#)]
+async fn project_without_labview_and_dest(world: &mut CliWorld) {
+    world.sandbox.use_local_project(None);
+    world.sandbox.make_empty_dest();
+}
+
+#[given(regex = r#"^a project whose lvpm\.toml says labview = "([^"]+)"$"#)]
+async fn project_with_labview_as_written(world: &mut CliWorld, written: String) {
+    world.sandbox.use_local_project(None);
+    let path = world.sandbox.work_dir().join(MANIFEST_FILE);
+    let rendered = std::fs::read_to_string(&path).expect("read lvpm.toml");
+    // The builder always writes ">=": the line goes in as written.
+    let text = rendered.replacen(
+        "[project]\n",
+        &format!("[project]\nlabview = \"{written}\"\n"),
+        1,
+    );
+    assert_ne!(text, rendered, "no [project] line in:\n{rendered}");
+    std::fs::write(&path, text).expect("write lvpm.toml");
+}
+
 #[given(regex = r#"^the project depends on "([^"]+)" "([^"]*)"$"#)]
 async fn depends_on(world: &mut CliWorld, name: String, constraint: String) {
     world.depend(DependencyTable::Dependencies, &name, &constraint);
@@ -494,6 +515,37 @@ async fn no_lock_has_a_temp_root(world: &mut CliWorld) {
 #[then("the command succeeds")]
 async fn the_command_succeeds(world: &mut CliWorld) {
     assert_eq!(world.output().exit_code, 0, "{}", world.printed());
+}
+
+#[then(regex = r#"^lvpm\.lock records labview "([^"]+)"$"#)]
+async fn lock_records_labview(world: &mut CliWorld, year: String) {
+    assert_eq!(world.lock_table()["labview"].as_str(), Some(year.as_str()));
+}
+
+/// The warning lines of stderr that name `labview`.
+fn labview_warnings(world: &CliWorld) -> Vec<String> {
+    let stderr = &world.output().stderr;
+    let warnings = stderr.lines().filter(|l| l.starts_with("warning:"));
+    warnings
+        .filter(|l| l.contains("labview"))
+        .map(String::from)
+        .collect()
+}
+
+#[then(regex = r#"^one warning names labview = "([^"]+)" as the form to write$"#)]
+async fn one_warning_names_the_form(world: &mut CliWorld, form: String) {
+    let wanted = format!("labview = \"{form}\"");
+    let warnings = labview_warnings(world);
+    assert!(
+        warnings.len() == 1 && warnings[0].contains(&wanted),
+        "{wanted:?} not in exactly one warning of:\n{}",
+        world.printed()
+    );
+}
+
+#[then("no warning names labview")]
+async fn no_warning_names_labview(world: &mut CliWorld) {
+    assert_eq!(labview_warnings(world), Vec::<String>::new());
 }
 
 #[then(regex = r"^the command fails with: (.+)$")]
