@@ -199,6 +199,9 @@ pub struct Project {
     /// `labview` is written as a bare year, `"2024"`, the lvpm 0.3 form: read
     /// as `">=2024"`, with a warning that names that form.
     pub labview_bare_year: bool,
+    /// Groups written `[dependencies.<group>]`, the lvpm 0.3 form, in file
+    /// order: read as `[dependency-groups.<group>]`, with a warning.
+    pub old_form_groups: Vec<String>,
     /// `[sources]`, in file order: a name and an index URL or `oci://` registry
     /// URL as written.
     pub sources: Vec<(String, String)>,
@@ -252,6 +255,7 @@ impl Default for Project {
             version: None,
             labview: None,
             labview_bare_year: false,
+            old_form_groups: Vec::new(),
             sources: Vec::new(),
             default_sources: true,
             min_age_days: 0,
@@ -481,7 +485,8 @@ const MIN_AGE_DAYS: &str = "min-age-days";
 const SOURCE_SETTINGS: [&str; 2] = [DEFAULTS, MIN_AGE_DAYS];
 
 pub(crate) fn parse(text: &str) -> Result<Project> {
-    let f: File = toml::from_str(text)?;
+    let mut f: File = toml::from_str(text)?;
+    let old_form_groups = move_old_form_groups(&mut f)?;
     let written = f.project.labview.as_deref().map(str::trim);
     let labview_bare_year = written.is_some_and(is_year);
     let mut p = Project {
@@ -494,6 +499,7 @@ pub(crate) fn parse(text: &str) -> Result<Project> {
             })
             .transpose()?,
         labview_bare_year,
+        old_form_groups,
         distribution: f.distribution,
         ..Project::default()
     };
@@ -656,6 +662,49 @@ pub fn valid_group_name(name: &str) -> Result<()> {
 
 /// One dependency table's lines, in file order.
 type Entries = Vec<(String, Constraint)>;
+
+/// The header a group is written under: `[dev-dependencies]` for `dev`, in
+/// any case, and `[dependency-groups.<group>]` for every other group.
+pub fn group_header(group: &str) -> String {
+    match is_dev_group(group) {
+        true => "[dev-dependencies]".to_string(),
+        false => format!("[dependency-groups.{group}]"),
+    }
+}
+
+/// lvpm 0.3 wrote a group as `[dependencies.<group>]`: a table under
+/// `[dependencies]` with none of a line's keys. Each one moves to the table
+/// [`group_header`] names, and its name is returned for the warning.
+fn move_old_form_groups(f: &mut File) -> Result<Vec<String>> {
+    let old: Vec<String> = (f.dependencies.iter())
+        .filter(|(_, value)| {
+            value.as_table().is_some_and(|fields| {
+                !fields.is_empty() && !fields.keys().any(|k| LINE_KEYS.contains(&k.as_str()))
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in &old {
+        let group = f.dependencies.remove(name).expect("listed above");
+        let header = group_header(name);
+        let taken = match is_dev_group(name) {
+            true => !f.dev_dependencies.is_empty(),
+            false => f.dependency_groups.contains_key(name),
+        };
+        if taken {
+            bail!(
+                "[dependencies.{name}] and {header} are the same group: move its lines into {header}"
+            );
+        }
+        match (is_dev_group(name), group) {
+            (true, toml::Value::Table(lines)) => f.dev_dependencies = lines,
+            (_, group) => {
+                f.dependency_groups.insert(name.clone(), group);
+            }
+        }
+    }
+    Ok(old)
+}
 
 /// `[dependency-groups]`: each key a group name, each value that group's
 /// dependency table, in file order. `dev` is `[dev-dependencies]`, not a group.
@@ -867,17 +916,6 @@ fn dependency_table(
     if fields.contains_key("index") && fields.contains_key("github") {
         bail!(
             "{at}: github and index cannot be used together; a github dependency comes only from its repo"
-        );
-    }
-    // Upstream lvpm spells a group `[dependencies.<group>]`; here that is a
-    // dependency line with none of a line's keys.
-    if table == "dependencies"
-        && !fields.is_empty()
-        && !fields.keys().any(|k| LINE_KEYS.contains(&k.as_str()))
-    {
-        bail!(
-            "{at}: a table under [dependencies] is one dependency line; \
-             a group is written [dependency-groups.{name}]"
         );
     }
     if let Some(key) = fields.keys().find(|k| !LINE_KEYS.contains(&k.as_str())) {
@@ -1538,17 +1576,32 @@ ni-daqmx-labview-support = "26.0.0.49434-0+f282"
     }
 
     #[test]
-    fn an_upstream_style_group_table_names_the_group_spelling() {
-        let e = format!(
-            "{:#}",
-            parse(
-                "[dependencies.test]
-jki_lib_caraya = \"*\"
-"
-            )
-            .unwrap_err()
+    fn an_upstream_style_group_table_is_read_as_that_group_and_marked_for_the_warning() {
+        let p =
+            parse("[dependencies]\nalpha = \"*\"\n\n[dependencies.test]\njki_lib_caraya = \"*\"\n")
+                .unwrap();
+        assert_eq!(p.dependencies, vec![("alpha".to_string(), Constraint::Any)]);
+        assert_eq!(
+            p.groups,
+            vec![(
+                "test".to_string(),
+                vec![("jki_lib_caraya".to_string(), Constraint::Any)]
+            )]
         );
-        assert!(e.contains("[dependency-groups.test]"), "{e}");
+        assert_eq!(p.old_form_groups, vec!["test".to_string()]);
+        assert!(
+            parse("[dependency-groups.test]\njki_lib_caraya = \"*\"\n")
+                .unwrap()
+                .old_form_groups
+                .is_empty()
+        );
+        let both = parse("[dependencies.test]\na = \"*\"\n\n[dependency-groups.test]\nb = \"*\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            both.contains("[dependencies.test] and [dependency-groups.test] are the same group"),
+            "{both}"
+        );
     }
 
     #[test]

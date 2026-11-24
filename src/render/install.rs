@@ -76,6 +76,14 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 path.display()
             ),
         ),
+        Event::OldFormGroup { path, group } => r.line(
+            Stream::Err,
+            &format!(
+                "warning: [dependencies.{group}] in {} is read as a group: write {}",
+                path.display(),
+                lvpm_core::project::group_header(group)
+            ),
+        ),
         Event::VipmManifestConverted {
             path,
             unused,

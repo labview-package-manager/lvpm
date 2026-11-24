@@ -16,6 +16,8 @@ at the end and in
 > (Flydroid/lvpm). Named dependency groups are built here as
 > `[dependency-groups.<name>]` tables, as in uv, not as upstream's
 > `[dependencies.<name>]` ([why](vision/build-slices.md#slice-s11-dependency-groups)).
+> Upstream's form is still read, with a warning
+> ([below](#groups-written-the-lvpm-03-way)).
 > `[dev-dependencies]` is the group `dev`: synced by default, skipped with
 > `--no-dev` (see [usage.md](usage.md)). A `vipm.toml`'s `[dev-dependencies]`
 > is read into it.
@@ -484,6 +486,28 @@ table that holds it, with the flag for each. `add` and `remove` install
 lock still lists, so tooling installed by `lvpm sync --group ci` survives a later
 `lvpm add x`. Plain `lvpm sync` is the exact one.
 
+### Groups written the lvpm 0.3 way
+
+lvpm 0.3 wrote a group as `[dependencies.<name>]`: a table under
+`[dependencies]` with none of a dependency line's keys (`version`, `github`,
+`index`, `hooks`, `relink`). That form is still read, as the group
+`<name>`; `[dependencies.dev]` is read as `[dev-dependencies]`. Each command
+warns once per group and names the header to write:
+
+```text
+warning: [dependencies.test] in lvpm.toml is read as a group: write [dependency-groups.test]
+```
+
+- **Rename the header to switch.** The lines under it stay as they are.
+- **One form per group.** `[dependencies.test]` beside
+  `[dependency-groups.test]` (or `[dependencies.dev]` beside a non-empty
+  `[dev-dependencies]`) is refused, naming both.
+- **`add` and `remove` refuse it.** `lvpm add` and `lvpm remove` write only the
+  current form, so `--group test` (or `--dev`) on a group still written the old
+  way fails before anything changes, with the header to rename.
+- **A table with a line's key is a package.** `[dependencies.test]` with
+  `version = "*"` is the package `test`, as before.
+
 ## `[nipm.dependencies]`
 
 NI Package Manager packages the project needs (drivers, toolkits). lvpm
@@ -571,7 +595,8 @@ echoes the manifest path, project name, groups and `labview` minimum it read.
 Inside a dependency table, in `[policy]` and in `[application]` the rule is the opposite: an unknown key is refused
 ([above](#a-dependency-from-github)), because ignoring it would drop what you
 asked for. (Upstream ignores `[dev-dependencies]` in an `lvpm.toml` and reads
-`[dependencies.dev]`; here `[dev-dependencies]` is the group `dev`.)
+`[dependencies.dev]`; here `[dev-dependencies]` is the group `dev`, and
+`[dependencies.dev]` is read as it, with a warning.)
 
 ## Compatibility with `vipm.toml`
 
