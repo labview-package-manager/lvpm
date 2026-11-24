@@ -54,11 +54,13 @@ This is required for the default `x86_64-pc-windows-msvc` Rust target; the boots
 (create, install, the manifest, uninstall, groups, the launch check,
 shadowing, import, the log) without LabVIEW: a debug build of lvpm takes
 `LVPM_FAKE_LABVIEW=<version>,<bitness>,<dir>` as the one LabVIEW installed,
-and each test makes a fake one. A release build never reads it. This is not
+and each test makes a fake one. A release build never reads it, so the file
+runs only in a debug build. Tests for behaviour the fork has not taken over yet
+are `#[ignore]`d with the number of the issue that brings it. This is not
 `LVPM_TEST_LABVIEW=1`, which turns on the `@labview` scenarios on a machine
 with a real LabVIEW. What needs a running LabVIEW (relink, hooks, the overlay
 loading) is covered by the suite in `ci/e2e/`, which CI runs on every pull
-request.
+request that changes code (a docs-only pull request skips it).
 
 ## Contribution workflow
 

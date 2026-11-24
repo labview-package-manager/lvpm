@@ -16,6 +16,9 @@
 //! the fork's words; where the fork does not do the thing yet, the test is
 //! ignored with the number of the slice it waits on.
 
+// A release build compiles the hook out, so these would reach the real LabVIEW.
+#![cfg(debug_assertions)]
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,6 +37,7 @@ struct Lab {
 struct Run {
     ok: bool,
     text: String,
+    stderr: String,
 }
 
 impl Lab {
@@ -43,7 +47,7 @@ impl Lab {
         let _ = std::fs::remove_dir_all(&root);
         let labview = root.join("labview");
         std::fs::create_dir_all(labview.join("vi.lib")).unwrap();
-        // Present, so detection takes it; empty, so nothing can ever start.
+        // Present, so the launch check finds it; empty, so nothing can ever start.
         std::fs::write(labview.join(EXE), b"").unwrap();
         std::fs::write(
             labview.join("LabVIEW.ini"),
@@ -160,15 +164,32 @@ impl Lab {
 
     /// `run_in`, with `LVPM_FAKE_LABVIEW` set to `fake`.
     fn run_with_fake(&self, dir: &Path, fake: &str, args: &[&str]) -> Run {
-        let out = Command::new(env!("CARGO_BIN_EXE_lvpm"))
+        let home = self.root.join("home");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_lvpm"));
+        // The developer's own lvpm settings stay out of the test.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("LVPM_CONFIG_") {
+                cmd.env_remove(key);
+            }
+        }
+        // The user config, the LabVIEW ini and the logins are read per user.
+        for var in [
+            "HOME",
+            "USERPROFILE",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+        ] {
+            cmd.env(var, &home);
+        }
+        let out = cmd
             .current_dir(dir)
             .env("LVPM_FAKE_LABVIEW", fake)
             .env("LVPM_CONFIG_CACHE", self.root.join("cache"))
             .env("LVPM_CONFIG_SOURCES_LOCAL", self.root.join("packages"))
             .env("LVPM_CONFIG_VENV_DIR", ".lv-venv")
             .env("LVPM_CONFIG_LOG_DIR", self.root.join("logs"))
-            // Linux reads the LabVIEW ini per user; keep it inside the test.
-            .env("HOME", self.root.join("home"))
             .env_remove("LV_RTE_HEADLESS")
             .env_remove("LVPM_LOG")
             .env_remove("LVPM_TEST_LABVIEW")
@@ -180,6 +201,7 @@ impl Lab {
             ok: out.status.success(),
             text: String::from_utf8_lossy(&out.stdout).into_owned()
                 + &String::from_utf8_lossy(&out.stderr),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         }
     }
 
@@ -227,7 +249,8 @@ fn create_binds_the_project_and_remove_takes_it_away() {
     has(&lab.fails(&["venv", "create"]), "which LabVIEW?");
     let created = lab.ok(&["venv", "create", "--labview-version", "2099"]);
     has(&created, "bound to       LabVIEW 2099 (64-bit)");
-    // fork: a new manifest takes the year as a minimum (#64).
+    // fork: a new manifest takes the year as a minimum, so a newer LabVIEW
+    // can stand in.
     has(&lab.manifest(), "labview = \">=2099\"");
     has(&lab.manifest(), "[dependencies]");
     assert_eq!(
@@ -237,7 +260,7 @@ fn create_binds_the_project_and_remove_takes_it_away() {
     let binding: serde_json::Value =
         serde_json::from_slice(&std::fs::read(lab.venv().join("venv.json")).unwrap()).unwrap();
     // fork: a binding leaves `manifest` out when it is lvpm.toml.
-    assert!(binding.get("manifest").is_none_or(|m| m == "lvpm.toml"));
+    assert!(binding.get("manifest").is_none());
     assert_eq!(binding["target_key"], "LabVIEW-2099-64bit");
 
     // fork: the venv's own labview.ini is written at its first launch, not
@@ -498,7 +521,7 @@ fn install_by_name_keeps_the_manifest_in_step() {
         &lab.ok(&["install", "bar", "--group", "test"]),
         "[dependencies.test]",
     );
-    // fork: install has no flag to skip the manifest (#65); upstream's
+    // fork: install has no flag to leave the manifest alone; upstream's
     // `install baz` without saving, its `lacks baz` and record checks go.
     let manifest = lab.manifest();
     assert!(manifest.starts_with("[project]"), "{manifest}");
@@ -576,7 +599,7 @@ fn uninstall_keeps_packages_dependencies_and_the_manifest_in_step() {
     );
     assert!(lab.record("lib").is_file());
 
-    // fork: uninstall has no flag to skip the manifest (#65); that call goes.
+    // fork: uninstall has no flag to leave the manifest alone; that call goes.
     has(&lab.manifest(), "lib = \"*\"");
 
     // --all empties the venv and never edits the manifest.
@@ -672,7 +695,15 @@ fn launch_checks_the_venv_against_the_manifest_before_starting_anything() {
     has(&lab.fails(&["launch"]), "app: 1 of 2 files missing");
 
     // In line again: the check passes, and only starting the fake LabVIEW fails.
+    // fork: upstream kept app in the manifest with a flag the fork lacks;
+    // write it back, so this holds whether or not uninstall edits it.
     lab.ok(&["uninstall", "app", "--keep-deps"]);
+    lab.write_manifest(
+        "[dependencies]
+app = \"2.0.0.1\"
+lib = \"*\"
+",
+    );
     lab.ok(&["install"]);
     let r = lab.run_in(&lab.project(), &["launch"]);
     has(&r.text, "checked 2 package(s)");
@@ -881,7 +912,11 @@ fn every_command_on_the_venv_is_in_the_venvs_log() {
     has(&text, "---- lvpm");
     has(&text, "install app");
     // fork: the log holds JSON events.
-    has(&text, "{\"event\":\"manifest_edited\"");
+    assert!(
+        text.lines()
+            .any(|l| l.contains("{\"event\":\"manifest_edited\"") && l.contains("\"app\"")),
+        "{text}"
+    );
     has(&text, "---- done");
     has(&text, "---- failed:");
 }
@@ -901,7 +936,7 @@ fn a_malformed_fake_labview_is_refused_and_never_falls_back() {
             &["venv", "create", "--labview-version", "2099"],
         );
         assert!(!r.ok, "{spec:?} was accepted");
-        has(&r.text, "<version>,<bitness>,<dir>");
+        has(&r.stderr, "<version>,<bitness>,<dir>");
     }
     assert!(!lab.venv().exists());
 }

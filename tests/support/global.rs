@@ -259,7 +259,7 @@ impl GlobalRun {
             claim: None,
             busy: None,
         };
-        let targets = lvpm_core::target::detect().unwrap_or_default();
+        let targets = lvpm_core::target::detect_installed().unwrap_or_default();
         let Some(labview) = targets.iter().find(|t| t.year() == year) else {
             return free();
         };

@@ -142,7 +142,7 @@ const NAMES_NO_PACKAGE: &[&str] = &["refresh", "start"];
 
 /// The LabVIEW installations on this machine, read once.
 static MACHINE_TARGETS: LazyLock<Vec<LvTarget>> =
-    LazyLock::new(|| target::detect().unwrap_or_default());
+    LazyLock::new(|| target::detect_installed().unwrap_or_default());
 
 /// The value of a flag that takes one: `--prefix dest` or `--prefix=dest`.
 fn flag_value<'a>(

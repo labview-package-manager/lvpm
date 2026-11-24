@@ -72,7 +72,8 @@ impl LvTarget {
     }
 }
 
-/// The LabVIEW installations on this machine, newest first.
+/// The LabVIEW installations on this machine, newest first. In a debug build
+/// with `LVPM_FAKE_LABVIEW` set, only that one (see `fake_labview`).
 pub fn detect() -> Result<Vec<LvTarget>> {
     #[cfg(debug_assertions)]
     if let Some(fake) = fake_labview()? {
@@ -120,7 +121,8 @@ const EXE: &str = "LabVIEW.exe";
 const EXE: &str = "labview";
 
 #[cfg(windows)]
-fn detect_installed() -> Result<Vec<LvTarget>> {
+/// The LabVIEW installations the machine really has, ignoring `LVPM_FAKE_LABVIEW`.
+pub fn detect_installed() -> Result<Vec<LvTarget>> {
     use winreg::RegKey;
     use winreg::enums::*;
 
@@ -176,7 +178,8 @@ fn detect_installed() -> Result<Vec<LvTarget>> {
 }
 
 #[cfg(target_os = "linux")]
-fn detect_installed() -> Result<Vec<LvTarget>> {
+/// The LabVIEW installations the machine really has, ignoring `LVPM_FAKE_LABVIEW`.
+pub fn detect_installed() -> Result<Vec<LvTarget>> {
     // LabVIEW on Linux lives under /usr/local/natinst/LabVIEW-<year>-64 unless
     // its prefix was moved at install time; either way its package links
     // /etc/natinst/labview-<year>-64 to the install's `etc`, where
