@@ -168,7 +168,12 @@ impl Lab {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_lvpm"));
         // The developer's own lvpm settings stay out of the test.
         for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("LVPM_CONFIG_") {
+            // Config reads LVPM_CONFIG_<KEY>, else lvpm_config_<key>.
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("LVPM_CONFIG_")
+            {
                 cmd.env_remove(key);
             }
         }
@@ -193,6 +198,8 @@ impl Lab {
             .env_remove("LV_RTE_HEADLESS")
             .env_remove("LVPM_LOG")
             .env_remove("LVPM_TEST_LABVIEW")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .args(args)
             .stdin(Stdio::null())
             .output()
@@ -806,7 +813,8 @@ fn import_writes_vipm_files_into_the_manifest_and_adopts_an_old_venv() {
     has(&imported, "this project's venv now follows lvpm.toml");
     let binding: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&binding_path).unwrap()).unwrap();
-    assert_eq!(binding["manifest"], "lvpm.toml");
+    // fork: a binding leaves `manifest` out when it is lvpm.toml.
+    assert!(binding.get("manifest").is_none());
     assert_eq!(
         std::fs::read_to_string(lab.project().join("vipm.toml")).unwrap(),
         vipm,
