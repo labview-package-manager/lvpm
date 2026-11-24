@@ -350,7 +350,35 @@ fn commands_find_the_venv_from_below_and_from_outside_and_a_bare_manifest_is_ref
 }
 
 #[test]
-#[ignore = "#45"]
+fn manifest_install_reads_a_group_written_under_dependencies() {
+    let lab = Lab::new("old-group");
+    lab.package("app", "1.0.0.1", "lib");
+    lab.package("lib", "1.0.0.1", "");
+    lab.package("tester", "1.0.0.1", "");
+    lab.write_manifest(
+        "[dependencies]
+app = \"*\"
+
+[dependencies.test]
+tester = \"*\"
+",
+    );
+    lab.ok(&["venv", "create"]);
+
+    let installed = lab.ok(&["install"]);
+    has(
+        &installed,
+        "is read as a group: write [dependency-groups.test]",
+    );
+    for (name, there) in [("app", true), ("lib", true), ("tester", false)] {
+        assert_eq!(lab.record(name).is_file(), there, "{name}");
+    }
+    lab.ok(&["install", "--group", "test"]);
+    assert!(lab.record("tester").is_file());
+}
+
+#[test]
+#[ignore = "#68"]
 fn manifest_install_brings_in_main_and_the_selected_groups_only() {
     let lab = Lab::new("groups");
     lab.package("app", "1.0.0.1", "lib");

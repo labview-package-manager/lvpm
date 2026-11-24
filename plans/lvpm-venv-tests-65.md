@@ -159,6 +159,10 @@ graph TD
 - **An adapt that turns into a behaviour gap.** If no open slice owns the gap, it goes to the user and is not decided here.
 - **Upstream is wrong for the fork.** Upstream's test can encode behaviour the fork rejects on purpose: shadow reporting, the JSON log, `>=` years. In those cases the test takes the fork's way, and the PR lists each one for Jonathan.
 - **#45 lands first or later.** The groups test is ignored `#45` either way. #45 removes the ignore. The only conflict is the `FEATURE_FILES` line in `tests/acceptance.rs`, and this slice does not touch that file.
+  *Amended 2026-11-24:* the test also needs `include-groups` and `--with` /
+  `--without` / `--only`, which #45 does not port. #45 retags it `#68` and adds
+  `manifest_install_reads_a_group_written_under_dependencies`. #68 joins the
+  allowed set.
 - The resume guard reported `resume` from an old ThatsTheEnd "#65" in `plans/lvpm-attestations-s6.md`. That is a false positive.
 
 ## Criteria gate (build Step 3)
