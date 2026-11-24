@@ -33,7 +33,8 @@ Freshly unpacked VIs still declare the paths their build machine wrote:
 from the build machine.
 
 **The LabVIEW load-and-save pass is opt-in, behind `--relink`, and replaces
-linkfix rather than following it.** In measurements across 10 packages saved
+linkfix rather than following it** (a package marked `relink = true`, below,
+gets it after linkfix). In measurements across 10 packages saved
 between LabVIEW 8.6 and 2020, unrelinked VIs load and run from a venv
 untouched: LabVIEW resolves what the linker tables miss by searching vi.lib,
 and an LVAddons overlay *is* vi.lib. LabVIEW can also record dependencies
