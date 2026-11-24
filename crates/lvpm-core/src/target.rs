@@ -72,13 +72,51 @@ impl LvTarget {
     }
 }
 
+/// The LabVIEW installations on this machine, newest first.
+pub fn detect() -> Result<Vec<LvTarget>> {
+    #[cfg(debug_assertions)]
+    if let Some(fake) = fake_labview()? {
+        return Ok(vec![fake]);
+    }
+    detect_installed()
+}
+
+/// Tests only, and only in a debug build (what `cargo test` runs): with
+/// `LVPM_FAKE_LABVIEW=<version>,<bitness>,<dir>` set, that folder is the one
+/// LabVIEW installed, so the venv workflow can be driven end to end on a
+/// machine without LabVIEW. A release build never reads it: this relies on
+/// release profiles keeping `debug-assertions` off, which is cargo's default.
+#[cfg(debug_assertions)]
+fn fake_labview() -> Result<Option<LvTarget>> {
+    std::env::var_os("LVPM_FAKE_LABVIEW")
+        .map(|spec| parse_fake_labview(&spec.to_string_lossy()))
+        .transpose()
+}
+
+#[cfg(debug_assertions)]
+fn parse_fake_labview(spec: &str) -> Result<LvTarget> {
+    let mut parts = spec.splitn(3, ',');
+    let (Some(version), Some(bitness), Some(dir)) = (parts.next(), parts.next(), parts.next())
+    else {
+        bail!("LVPM_FAKE_LABVIEW is <version>,<bitness>,<dir>; got {spec:?}");
+    };
+    match (version.trim().parse::<f64>(), bitness.trim().parse::<u8>()) {
+        (Ok(version), Ok(bitness @ (32 | 64))) if !dir.is_empty() => Ok(LvTarget {
+            version,
+            bitness,
+            path: PathBuf::from(dir),
+        }),
+        _ => bail!("LVPM_FAKE_LABVIEW is <version>,<bitness>,<dir>; got {spec:?}"),
+    }
+}
+
 #[cfg(windows)]
 const EXE: &str = "LabVIEW.exe";
 #[cfg(target_os = "linux")]
 const EXE: &str = "labview";
 
 #[cfg(windows)]
-pub fn detect() -> Result<Vec<LvTarget>> {
+fn detect_installed() -> Result<Vec<LvTarget>> {
     use winreg::RegKey;
     use winreg::enums::*;
 
@@ -134,7 +172,7 @@ pub fn detect() -> Result<Vec<LvTarget>> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn detect() -> Result<Vec<LvTarget>> {
+fn detect_installed() -> Result<Vec<LvTarget>> {
     // LabVIEW on Linux lives under /usr/local/natinst/LabVIEW-<year>-64 unless
     // its prefix was moved at install time; either way its package links
     // /etc/natinst/labview-<year>-64 to the install's `etc`, where
@@ -659,6 +697,18 @@ impl Roots {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_fake_labview_spec_is_version_bitness_dir() {
+        let t = parse_fake_labview("99.0, 64,C:\\lv,with comma").unwrap();
+        assert_eq!((t.version, t.bitness), (99.0, 64));
+        assert_eq!(t.path, PathBuf::from("C:\\lv,with comma"));
+        for bad in ["", "99.0,64", "99.0,64,", "x,64,d", "99.0,x,d", "99.0,7,d"] {
+            let err = parse_fake_labview(bad).unwrap_err().to_string();
+            assert!(err.contains("<version>,<bitness>,<dir>"), "{bad:?}: {err}");
+        }
+    }
 
     #[test]
     fn an_empty_relative_or_root_env_value_falls_back() {
