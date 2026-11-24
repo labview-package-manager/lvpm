@@ -2134,27 +2134,17 @@ Alpha = \"1.0\"
         let (scratch, root) = folder("import-old-group-warns", "App");
         vipc_in(&root, "p.vipc", "23.0", &[("alpha-2.0", true, false)]);
         let manifest = root.join("lvpm.toml");
-        let before = "[project]
-name = \"App\"
-
-[dependencies.tools]
-beta = \"*\"
-";
+        let before = "[project]\nname = \"App\"\n\n[dependencies.tools]\nbeta = \"*\"\n";
         std::fs::write(&manifest, before).unwrap();
         let sink = Recorded::default();
         let env = env_on(&sink, &root);
 
         import(&env, Path::new("p.vipc"), false, None, false).unwrap();
-        let after = std::fs::read_to_string(&manifest).unwrap();
-        assert!(
-            after.contains(
-                "[dependencies.tools]
-beta = \"*\"
-"
-            ),
-            "{after}"
-        );
-        assert!(after.contains("alpha = "), "{after}");
+        let after = project::read(&manifest).unwrap();
+        let names: Vec<_> = after.dependencies.iter().map(|(name, _)| name).collect();
+        assert_eq!(names, ["alpha"]);
+        let beta = ("beta".to_string(), project::Constraint::Any);
+        assert_eq!(after.groups, vec![("tools".to_string(), vec![beta])]);
         let warned: Vec<_> = (sink.events().into_iter())
             .filter_map(|e| match e {
                 Event::OldFormGroup { group, .. } => Some(group),

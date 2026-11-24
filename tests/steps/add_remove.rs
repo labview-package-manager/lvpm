@@ -471,6 +471,7 @@ async fn the_dev_table_says(world: &mut CliWorld, name: String, constraint: Stri
 
 #[then(regex = r#"^\[dependencies\] itself has the "([^"]+)" line$"#)]
 async fn the_dependencies_table_itself_has(world: &mut CliWorld, name: String) {
+    world.assert_succeeded();
     let entries = entries_of(&world.manifest_text(), "dependencies");
     let line = entries.iter().find(|(entry, _)| *entry == name);
     assert!(
