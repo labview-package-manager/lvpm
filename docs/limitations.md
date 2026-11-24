@@ -21,7 +21,7 @@
   machine locations (`<OS ...>`, `<temp>`) are skipped. Both are recorded and
   shown by `lvpm list`.
 - Some packages don't work in a venv yet (Panther Dashboard for DQMH), and
-  some need a hook a venv does not run (AsciiDoc for LabVIEW).
+  some need a hook run by hand (AsciiDoc for LabVIEW).
   [Package notes](package-notes.md) lists them.
 - `lvpm launch` checks install records, not file contents: a package VI
   edited or resaved since install is not detected.

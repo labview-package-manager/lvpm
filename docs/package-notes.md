@@ -25,7 +25,7 @@ package works without it.
 | [`pantherlab_lib_panther_dashboard`](#pantherlab_lib_panther_dashboard) | 9.4.9.78 | **Does not work** |
 | [`sklein_lib_webview2`](#sklein_lib_webview2) | 2.1.1.2 | Works with `relink = true` |
 | [`wovalab_lib_antidoc`](#wovalab_lib_antidoc) | 3.3.2.887 | Works; hook not needed |
-| [`wovalab_lib_asciidoc_for_labview`](#wovalab_lib_asciidoc_for_labview) | 1.12.1.492 | **Cannot render** until its PostInstall hook has run |
+| [`wovalab_lib_asciidoc_for_labview`](#wovalab_lib_asciidoc_for_labview) | 1.12.1.492 | Works once its PostInstall hook has run: `lvpm run-hooks` |
 
 ## Patterns that break in a venv
 
@@ -159,15 +159,19 @@ Antidoc. Checked: 3.3.2.887.
 
 AsciiDoc for LabVIEW. Checked: 1.12.1.492.
 
-- **Its PostInstall hook must run, and a venv does not run it.** The hook
+- **Its PostInstall hook must run, and a venv install does not run it.** The hook
   checks for the Asciidoctor toolchain (Ruby) and installs or updates it.
   Windows only; takes about 40 s. Without it, the toolkit, and Antidoc on top
   of it, cannot render HTML or PDF.
 - **The toolchain is per user, not per venv.** The hook installs it under
   `%LOCALAPPDATA%\Asciidoc For LabVIEW\RubyInstance`, so one run serves every
   venv and LabVIEW installation of that user, and removing the venv leaves it
-  behind. A user who already has it, from VIPM or an install into LabVIEW
-  with the hook allowed, can render from a venv too.
+  behind.
+- **Run it once by hand.** In the project, `lvpm run-hooks
+  wovalab_lib_asciidoc_for_labview` runs the PostInstall the venv kept. It
+  runs in the LabVIEW installation the venv is bound to, not in the venv's
+  own LabVIEW, which is fine here: what it installs is per user, not per
+  LabVIEW.
 
 ## Adding an entry
 
