@@ -2107,6 +2107,65 @@ Alpha = \"1.0\"
     }
 
     #[test]
+    fn import_of_a_package_named_like_an_old_form_group_is_refused_and_writes_nothing() {
+        for package in ["tools", "Tools"] {
+            let (scratch, root) = folder("import-old-group-name", "App");
+            let vipc_package = format!("{package}-1.0");
+            vipc_in(&root, "p.vipc", "23.0", &[(&vipc_package, true, false)]);
+            let manifest = root.join("lvpm.toml");
+            let before = "[project]\nname = \"App\"\n\n[dependencies.tools]\nbeta = \"*\"\n";
+            std::fs::write(&manifest, before).unwrap();
+            let sink = Recorded::default();
+            let env = env_on(&sink, &root);
+
+            let error = import(&env, Path::new("p.vipc"), false, None, false).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "[dependencies.tools] is the lvpm 0.3 form of a group; \
+                 rename the header to [dependency-groups.tools], then run this again"
+            );
+            assert_eq!(std::fs::read_to_string(&manifest).unwrap(), before);
+            let _ = std::fs::remove_dir_all(&scratch);
+        }
+    }
+
+    #[test]
+    fn import_beside_a_group_written_the_old_way_warns_and_leaves_the_group() {
+        let (scratch, root) = folder("import-old-group-warns", "App");
+        vipc_in(&root, "p.vipc", "23.0", &[("alpha-2.0", true, false)]);
+        let manifest = root.join("lvpm.toml");
+        let before = "[project]
+name = \"App\"
+
+[dependencies.tools]
+beta = \"*\"
+";
+        std::fs::write(&manifest, before).unwrap();
+        let sink = Recorded::default();
+        let env = env_on(&sink, &root);
+
+        import(&env, Path::new("p.vipc"), false, None, false).unwrap();
+        let after = std::fs::read_to_string(&manifest).unwrap();
+        assert!(
+            after.contains(
+                "[dependencies.tools]
+beta = \"*\"
+"
+            ),
+            "{after}"
+        );
+        assert!(after.contains("alpha = "), "{after}");
+        let warned: Vec<_> = (sink.events().into_iter())
+            .filter_map(|e| match e {
+                Event::OldFormGroup { group, .. } => Some(group),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(warned, vec!["tools".to_string()]);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
     fn import_refuses_all_for_a_vipm_toml_and_an_empty_group() {
         let (scratch, root) = folder("import-refused", "App");
         let sink = Recorded::default();

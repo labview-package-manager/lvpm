@@ -46,6 +46,7 @@ Feature: a group written [dependencies.<group>] is still read
     Given lvpm.toml has [dependencies.test] "ci_tools" "*"
     When I run "lvpm add beta --prefix dest"
     Then lvpm.toml differs from before by exactly the "beta" line
+    And [dependencies] itself has the "beta" line
 
   Scenario: a package named like an old-style group is refused with the fix
     Given lvpm.toml has [dependencies.test] "ci_tools" "*"

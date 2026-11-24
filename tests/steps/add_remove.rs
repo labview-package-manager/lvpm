@@ -469,6 +469,16 @@ async fn the_dev_table_says(world: &mut CliWorld, name: String, constraint: Stri
     assert!(entries.contains(&(name, constraint)), "{entries:?}");
 }
 
+#[then(regex = r#"^\[dependencies\] itself has the "([^"]+)" line$"#)]
+async fn the_dependencies_table_itself_has(world: &mut CliWorld, name: String) {
+    let entries = entries_of(&world.manifest_text(), "dependencies");
+    let line = entries.iter().find(|(entry, _)| *entry == name);
+    assert!(
+        line.is_some_and(|(_, constraint)| !constraint.is_empty()),
+        "{entries:?}"
+    );
+}
+
 #[then(regex = r#"^lvpm\.toml differs from before by exactly the "([^"]+)" line$"#)]
 async fn the_manifest_differs_by_one_line(world: &mut CliWorld, name: String) {
     world.assert_succeeded();

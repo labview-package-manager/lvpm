@@ -1700,13 +1700,20 @@ ni-daqmx-labview-support = "26.0.0.49434-0+f282"
 
     #[test]
     fn an_empty_dotted_table_is_a_package_line_and_refused_as_one() {
-        assert!(parse("[dependencies.test]\n").is_err());
+        let error = parse("[dependencies.test]\n").unwrap_err().to_string();
+        assert!(
+            error.contains("[dependencies] test: a table needs version"),
+            "{error}"
+        );
     }
 
     #[test]
     fn a_dotted_table_with_a_misspelt_key_is_read_as_a_group() {
         let p = parse("[dependencies.pkg]\nverison = \"*\"\n").unwrap();
         assert_eq!(p.old_form_groups, vec!["pkg".to_string()]);
+        let line = ("verison".to_string(), Constraint::Any);
+        assert_eq!(p.groups, vec![("pkg".to_string(), vec![line])]);
+        assert!(p.dependencies.is_empty());
     }
 
     #[test]
