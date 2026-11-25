@@ -515,7 +515,7 @@ fn venv_installs_merge_palette_trees_and_rebuild_them_after_uninstall() {
 }
 
 #[test]
-#[ignore = "#54"]
+#[ignore = "#54 slice 4"]
 fn install_by_name_keeps_the_manifest_in_step() {
     let lab = Lab::new("save");
     lab.package("foo", "1.0.0.1", "");
@@ -577,7 +577,62 @@ fn install_by_name_keeps_the_manifest_in_step() {
 }
 
 #[test]
-#[ignore = "#54"]
+fn uninstall_in_a_project_takes_the_package_out_of_the_manifest_and_all_leaves_it() {
+    let lab = Lab::new("uninstall-project");
+    lab.package("app", "1.0.0.1", "lib");
+    lab.package("lib", "1.0.0.1", "core");
+    lab.package("other", "1.0.0.1", "core");
+    lab.package("core", "1.0.0.1", "");
+    lab.write_manifest("[dependencies]\n");
+    lab.ok(&["venv", "create"]);
+    lab.ok(&["install", "app"]);
+    lab.ok(&["install", "other"]);
+
+    // A named uninstall is the project's: no prompt, so no --with-deps to give.
+    let removed = lab.ok(&["uninstall", "app"]);
+    has(&removed, "removing app from lvpm.toml");
+    has(&removed, "lvpm.toml: removed app = \">=1.0.0.1\"");
+    // What only app needed goes with it; core stays for `other`, which the
+    // manifest declares.
+    for (name, there) in [
+        ("app", false),
+        ("lib", false),
+        ("core", true),
+        ("other", true),
+    ] {
+        assert_eq!(lab.record(name).is_file(), there, "{name}");
+    }
+    assert!(!lab.file("app", "app.txt").exists());
+    assert!(!lab.venv().join("packages").join("app").exists());
+    lacks(&lab.manifest(), "app =");
+    has(&lab.manifest(), "other =");
+
+    // A dependency the manifest declares is the project's: kept, and the
+    // --with-deps of the old uninstall is accepted.
+    lab.ok(&["install", "app"]);
+    std::fs::write(
+        lab.manifest_path(),
+        lab.manifest()
+            .replace("[dependencies]\n", "[dependencies]\nlib = \"*\"\n"),
+    )
+    .unwrap();
+    lab.ok(&["uninstall", "app", "--with-deps"]);
+    assert!(lab.record("lib").is_file());
+    assert!(!lab.record("app").is_file());
+    has(&lab.manifest(), "lib = \"*\"");
+
+    // --all empties the venv and never edits the manifest.
+    let before = lab.manifest();
+    lab.ok(&["uninstall", "--all"]);
+    assert_eq!(lab.manifest(), before);
+    has(
+        &lab.ok(&["list"]),
+        "lvpm has installed nothing into this target",
+    );
+}
+
+#[test]
+#[ignore = "#54 slice 3"]
 fn uninstall_keeps_packages_dependencies_and_the_manifest_in_step() {
     let lab = Lab::new("uninstall");
     lab.package("app", "1.0.0.1", "lib");
@@ -647,8 +702,10 @@ fn uninstall_keeps_packages_dependencies_and_the_manifest_in_step() {
     );
 }
 
+// Waits on a decision, not a slice: the fork puts lvpm.toml and lvpm.lock back when the
+// sync stops (add_remove.rs), so the manifest still lists what was uninstalled.
 #[test]
-#[ignore = "#54"]
+#[ignore = "#54: a stopped sync puts lvpm.toml back"]
 fn uninstall_takes_the_named_package_out_of_the_manifest_even_when_a_dependency_fails() {
     let lab = Lab::new("uninstall-fails");
     lab.package("app", "1.0.0.1", "lib");
@@ -662,7 +719,7 @@ fn uninstall_takes_the_named_package_out_of_the_manifest_even_when_a_dependency_
     std::fs::create_dir_all(blocked.join("in-the-way")).unwrap();
 
     let failed = lab.fails(&["uninstall", "app", "--with-deps"]);
-    has(&failed, "removed app from lvpm.toml [dependencies]");
+    has(&failed, "lvpm.toml: removed app = \">=1.0.0.1\"");
     has(&failed, "lib.txt");
     lacks(&lab.manifest(), "app =");
     assert!(!lab.record("app").exists());

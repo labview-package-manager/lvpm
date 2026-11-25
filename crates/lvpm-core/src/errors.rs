@@ -510,11 +510,26 @@ pub enum RouteError {
     UninstallNotWithLock { flag: &'static str },
     /// A direct uninstall was given `flag`, which only an uninstall in a project
     /// takes: `--dev`, `--group`, `--dry-run`, `--no-linkfix`, `--relink`, `--hooks`.
+    /// `because` is why the uninstall is direct.
     #[error("{flag} can only be used when uninstalling a package from a project")]
-    OnlyInAProject { flag: &'static str },
+    OnlyInAProject {
+        flag: &'static str,
+        because: DirectBecause,
+    },
     /// Anything else that went wrong: its own text.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// Why an uninstall is direct, which decides how it is told to be a project's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectBecause {
+    /// No package is named (`--all`, or nothing): naming one is the way in.
+    NoPackage,
+    /// `--no-project` was given.
+    NoProject,
+    /// No `lvpm.toml` was found at or above the current directory.
+    NotInAProject,
 }
 
 /// What a request asks for that a sync from a lock cannot give.

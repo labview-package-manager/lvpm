@@ -313,6 +313,21 @@ Bare `install` in and outside a project, and a named install outside one, stay c
 
 Between Slice 2 and Slice 3, a project uninstall of a required package still keeps it locked with a note (today's `remove`). Slice 3 lands in the same PR.
 
+**Built differently in Step 2.1** (decided while building and reviewing; the scenarios and tests are the record):
+
+- The scenarios name a destination (`--prefix dest`), because a project with no venv has none and the sandbox never writes into a LabVIEW. The `--group` Given reuses the existing manifest step ("lvpm.toml has [dependency-groups.test] ... synced with ..."). Outline row 2 of the wrong-table outline uses `--dev`; an undefined group (`uninstall caraya --group ci`) has its own scenario and names `unknown group 'ci'`.
+- A bare `uninstall` in a project fails "give a package name, or --all", as before; it is direct, not a sync.
+- Wording the plan did not give:
+  - "removing X from lvpm.toml and syncing the project to lvpm.lock" is the first line, and is said only once X is known to be in the table being edited (`add_remove::remove_announcing`); a refusal (not a dependency, wrong table, not in the group, unknown group) says none of it. Under `--dry-run` both it and the install line say "would remove X from ... and sync" / "would add X to ... and sync" (`dry_run` on both events). The upgrader note under it is not reworded for a dry run.
+  - `--keep-deps` and `--force` in a project: "{flag} cannot be used in a project, because lvpm.lock decides what stays", next line names `--no-project`.
+  - A project-only flag on a direct uninstall (`OnlyInAProject`) says why the uninstall is direct: no package ("drop F, or name a package"), `--no-project` ("drop F, or drop --no-project"), or no lvpm.toml found (the "run this in a project" text).
+  - `NotADependency` for an installed name has the next line `lvpm uninstall x --no-project` plus the destination flags as typed, with values (`--prefix dest`, `--global`, `--labview-version 2026`); so do the `UninstalledStillListed` note and the other-table hints. They are listed in the order that decides the target: `--prefix`, `--labview-version` (not when a venv wins and `--global` is absent), `--global`. The `NotInGroup` hint (`lvpm add x --group g`) does not carry them yet.
+- The other-table hints use the verb the user ran: `lvpm uninstall x --dev` for `uninstall`, and `lvpm remove` stays `lvpm remove` for `lvpm remove` until Slice 5.
+- `--no-relink` (hidden, a no-op on every command) is not refused on a direct uninstall. `--relink-timeout` is not either: it has a default, so a typed one cannot be told from none without carrying clap's `value_source` to `flag_given`; `--keep-open` and `--relink-progress` are refused. Both are marked with a `shortcut:` comment on `ApplyArgs::flag_given`.
+- Slice-1 characterization rows 34 and 147 need no migration: they run in a directory with no project. `tests/support/sandbox.rs` (`restore_labview_installation`) gets `--no-project`, since the work directory can hold a scenario's project.
+- `remove`'s not-a-dependency probe (`installed_in_the_target`) finds the venv and the roots without `destination()`, so it adds no `VenvSelected` event. A headless, venv-less project is not probed there, and reads as holding nothing.
+- tests/venv.rs: `uninstall_keeps_packages_dependencies_and_the_manifest_in_step` is split. The Slice 2 half runs (`uninstall_in_a_project_takes_the_package_out_of_the_manifest_and_all_leaves_it`); the required-by half stays ignored as `#[ignore = "#54 slice 3"]`. `install_by_name_keeps_the_manifest_in_step` waits on `#54 slice 4`. `uninstall_takes_the_named_package_out_of_the_manifest_even_when_a_dependency_fails` stays ignored on a decision, not a slice: upstream keeps the manifest edit when the sync stops partway, the fork puts lvpm.toml and lvpm.lock back (and says so), so the manifest still lists the package whose files are gone, until `lvpm sync` runs.
+
 ### Slice 3: a package another one requires cannot be removed
 
 **Depends-on:** 2

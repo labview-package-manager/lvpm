@@ -196,7 +196,7 @@ Feature: Dependency groups
   Scenario: remove from the wrong table lists every table holding it
     Given lvpm.toml has [dependencies] "beta" "*"; [dependency-groups.ci] "beta" "*"
     When I run "lvpm remove beta --dev --prefix dest"
-    Then the command fails saying "beta" is in [dependencies] and [dependency-groups.ci], with one next line each: "lvpm remove beta" and "lvpm remove beta --group ci"
+    Then the command fails saying "beta" is in [dependencies] and [dependency-groups.ci], with one next line each: "lvpm remove beta --prefix dest" and "lvpm remove beta --group ci --prefix dest"
 
   Scenario Outline: remove --group of something that is not there fails
     Given lvpm.toml has [dependency-groups.ci] "ci_tools" "*"

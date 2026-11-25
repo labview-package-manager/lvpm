@@ -40,6 +40,29 @@ pub struct DestinationFlags {
     pub project: Option<PathBuf>,
 }
 
+impl DestinationFlags {
+    /// The flags that picked the target, as typed, each with its value: first
+    /// the one that decided it, `--prefix`, then `--labview-version`, then
+    /// `--global`. `--labview-version` picks nothing when `venv_wins` and
+    /// `--global` is not there to say otherwise (see [`OpEnv::destination`]).
+    pub fn picked(&self, venv_wins: bool) -> Vec<(&'static str, Option<String>)> {
+        let version = self
+            .labview_version
+            .as_ref()
+            .filter(|_| !venv_wins || self.global);
+        [
+            self.prefix
+                .as_ref()
+                .map(|p| ("--prefix", Some(p.display().to_string()))),
+            version.map(|v| ("--labview-version", Some(v.clone()))),
+            self.global.then_some(("--global", None)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
 /// What an operation runs in.
 pub struct OpEnv<'a> {
     pub flags: DestinationFlags,
@@ -164,6 +187,32 @@ impl<'a> OpEnv<'a> {
                  hint: `lvpm targets` lists detected LabVIEW installations"
             ),
         }
+    }
+
+    /// The destination flag that decided the target, as typed: the one a named
+    /// install or uninstall in a project tells the user only picks where the
+    /// project syncs. A venv lookup that fails fails the command after it.
+    pub fn destination_flag(&self) -> Option<&'static str> {
+        self.picked().first().map(|(flag, _)| *flag)
+    }
+
+    /// Every destination flag that picked the target, with its value, as one
+    /// command-line fragment (`--prefix dest`): what a suggested command needs
+    /// to act on the same target.
+    pub fn destination_flags_as_typed(&self) -> Option<String> {
+        let typed: Vec<String> = (self.picked().into_iter())
+            .map(|(flag, value)| match value {
+                Some(v) if v.contains(char::is_whitespace) => format!("{flag} \"{v}\""),
+                Some(v) => format!("{flag} {v}"),
+                None => flag.to_string(),
+            })
+            .collect();
+        (!typed.is_empty()).then(|| typed.join(" "))
+    }
+
+    fn picked(&self) -> Vec<(&'static str, Option<String>)> {
+        let venv_wins = self.find_venv().is_ok_and(|venv| venv.is_some());
+        self.flags.picked(venv_wins)
     }
 
     /// Settle where a command's packages live, the way cargo settles which crate
@@ -436,6 +485,79 @@ pub(super) fn wanted_names(project: Option<&Project>, own: &[String]) -> Vec<Str
 mod tests {
     use super::*;
     use crate::events::NullSink;
+
+    #[test]
+    fn the_destination_flags_that_picked_the_target_are_listed_with_their_values_in_the_order_that_decides()
+     {
+        let picked = |flags: &DestinationFlags, venv_wins| flags.picked(venv_wins);
+        let version = DestinationFlags {
+            labview_version: Some("2026".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&version, false),
+            [("--labview-version", Some("2026".to_string()))]
+        );
+        // A venv wins over --labview-version, so it picked nothing.
+        assert_eq!(picked(&version, true), []);
+        let prefix_and_version = DestinationFlags {
+            prefix: Some("dest".into()),
+            labview_version: Some("2026".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&prefix_and_version, true),
+            [("--prefix", Some("dest".to_string()))]
+        );
+        let global = DestinationFlags {
+            global: true,
+            ..Default::default()
+        };
+        assert_eq!(picked(&global, true), [("--global", None)]);
+        // --prefix picked the roots, whatever else was typed.
+        let prefix_and_global = DestinationFlags {
+            prefix: Some("dest".into()),
+            global: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&prefix_and_global, true),
+            [("--prefix", Some("dest".to_string())), ("--global", None)]
+        );
+        // With --global a venv does not win, so the version it names is the target.
+        let global_and_version = DestinationFlags {
+            global: true,
+            labview_version: Some("2026".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&global_and_version, true),
+            [
+                ("--labview-version", Some("2026".to_string())),
+                ("--global", None)
+            ]
+        );
+        assert_eq!(picked(&DestinationFlags::default(), false), []);
+    }
+
+    #[test]
+    fn the_destination_flags_are_one_command_line_fragment_with_a_spaced_value_quoted() {
+        let mut env = OpEnv::new(&NullSink, config(), Vec::new(), PathBuf::from("."));
+        assert_eq!(env.destination_flag(), None);
+        assert_eq!(env.destination_flags_as_typed(), None);
+        env.flags.prefix = Some(PathBuf::from("dest"));
+        env.flags.global = true;
+        assert_eq!(env.destination_flag(), Some("--prefix"));
+        assert_eq!(
+            env.destination_flags_as_typed().as_deref(),
+            Some("--prefix dest --global")
+        );
+        env.flags.prefix = Some(PathBuf::from("my dest"));
+        assert_eq!(
+            env.destination_flags_as_typed().as_deref(),
+            Some("--prefix \"my dest\" --global")
+        );
+    }
 
     #[test]
     fn the_wanted_names_are_every_dependency_in_any_table_then_the_commands_own() {

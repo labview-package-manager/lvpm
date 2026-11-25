@@ -108,6 +108,9 @@ Feature: install and uninstall are the project commands
     Given <given>
     When I run "lvpm uninstall caraya <flag> --prefix dest"
     Then the command fails saying "caraya" is in <table>
+    And the error's next line names "lvpm uninstall caraya"
+    And the error's next line names "--prefix dest"
+    And the output does not say "removing"
     And nothing changed
 
     Examples:
@@ -127,7 +130,8 @@ Feature: install and uninstall are the project commands
     Given "caraya" 1.0 is installed in dest with "lvpm install caraya --no-project --prefix dest"
     When I run "lvpm uninstall caraya --prefix dest"
     Then the command fails with: caraya is not a dependency of this project
-    And the error's next line names "lvpm uninstall caraya --no-project"
+    And the error's next line names "lvpm uninstall caraya --no-project --prefix dest"
+    And the output does not say "removing"
     And nothing changed
 
   Scenario: uninstall of a name that is nowhere suggests a typo
@@ -135,6 +139,13 @@ Feature: install and uninstall are the project commands
     Then the command fails with: zeta is not a dependency of this project
     And the error's next line says to check the name
     And the error does not mention "--no-project"
+    And the output does not say "removing"
+    And nothing changed
+
+  Scenario: uninstall --group of a group the project does not define names it and changes nothing
+    When I run "lvpm uninstall caraya --group ci --prefix dest"
+    Then the command fails naming "unknown group 'ci'"
+    And the output does not say "removing"
     And nothing changed
 
   Scenario Outline: flags the lock overrules are refused in a project

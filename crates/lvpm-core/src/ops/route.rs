@@ -7,7 +7,7 @@
 //! that package where it was asked to and leaves the project alone.
 
 use super::env::OpEnv;
-use crate::errors::{LockIncompatible, RouteError};
+use crate::errors::{DirectBecause, LockIncompatible, RouteError};
 use anyhow::anyhow;
 use std::path::Path;
 
@@ -140,8 +140,23 @@ pub fn uninstall_mode(
         };
     }
     match request.table_flag.or(request.apply_flag) {
-        Some(flag) => Err(RouteError::OnlyInAProject { flag }),
+        Some(flag) => Err(RouteError::OnlyInAProject {
+            flag,
+            because: direct_because(env, request),
+        }),
         None => Ok(UninstallMode::Direct),
+    }
+}
+
+/// Why `request`, which a project would have taken, is direct. A manifest that
+/// cannot be read is no project: the answer only words the refusal.
+fn direct_because(env: &OpEnv, request: &UninstallRequest) -> DirectBecause {
+    let in_a_project = || matches!(env.manifest_for(None, None), Ok(Some(_)));
+    match (request.no_project, request.package, request.all) {
+        (true, ..) => DirectBecause::NoProject,
+        (_, Some(_), false) => DirectBecause::NotInAProject,
+        _ if in_a_project() => DirectBecause::NoPackage,
+        _ => DirectBecause::NotInAProject,
     }
 }
 
@@ -522,6 +537,7 @@ mod tests {
                         no_project: true,
                         ..request
                     },
+                    DirectBecause::NoProject,
                 ),
                 (
                     &in_a_project,
@@ -530,6 +546,7 @@ mod tests {
                         all: true,
                         ..request
                     },
+                    DirectBecause::NoPackage,
                 ),
                 (
                     &in_a_project,
@@ -537,14 +554,28 @@ mod tests {
                         package: None,
                         ..request
                     },
+                    DirectBecause::NoPackage,
                 ),
-                (&outside, request),
+                (&outside, request, DirectBecause::NotInAProject),
+                // Nothing to name a package for where there is no project either.
+                (
+                    &outside,
+                    UninstallRequest {
+                        package: None,
+                        ..request
+                    },
+                    DirectBecause::NotInAProject,
+                ),
             ];
-            for (dir, request) in direct {
+            for (dir, request, because) in direct {
                 let why = uninstall(dir, request).unwrap_err();
                 assert!(
-                    matches!(why, RouteError::OnlyInAProject { flag: refused } if refused == flag),
-                    "{flag}: {why:?}"
+                    matches!(
+                        why,
+                        RouteError::OnlyInAProject { flag: refused, because: said }
+                            if refused == flag && said == because
+                    ),
+                    "{flag}: {why:?}, wanted {because:?}"
                 );
             }
         }

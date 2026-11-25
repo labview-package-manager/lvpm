@@ -84,6 +84,29 @@ pub fn remove(
     table: DependencyTable,
     options: &InstallOptions,
 ) -> Result<(), EditError> {
+    take_out_and_sync(env, name, table, options, None)
+}
+
+/// [`remove`] for a command that says what it is doing first: `announce` is
+/// the first thing said, once `name` is known to be in `table` and not before,
+/// so a refusal never says it.
+pub fn remove_announcing(
+    env: &OpEnv,
+    name: &str,
+    table: DependencyTable,
+    options: &InstallOptions,
+    announce: Event,
+) -> Result<(), EditError> {
+    take_out_and_sync(env, name, table, options, Some(announce))
+}
+
+fn take_out_and_sync(
+    env: &OpEnv,
+    name: &str,
+    table: DependencyTable,
+    options: &InstallOptions,
+    announce: Option<Event>,
+) -> Result<(), EditError> {
     let prepared = Prepared::of(env)?;
     project::refuse_old_form_edit(&prepared.found.1, &table, name)?;
     if let DependencyTable::Group(group) = &table {
@@ -96,6 +119,9 @@ pub fn remove(
         }
         other => other,
     })?;
+    if let Some(event) = announce {
+        env.sink.emit(event);
+    }
     let dest = env.destination()?;
     announce_project(env, &prepared, &dest);
 
@@ -110,13 +136,21 @@ pub fn remove(
 }
 
 /// `name` is installed in the target, as far as it can be told: a target that
-/// cannot be resolved or read holds nothing.
+/// cannot be resolved or read holds nothing. It picks the target the way
+/// [`OpEnv::destination`] does but says nothing about it: this is a probe for a
+/// refusal that changes nothing, so a venv is found, never "selected".
+// shortcut: a headless venv-less project is not probed, so it reads as holding nothing; when that matters, make `destination` quiet.
 fn installed_in_the_target(env: &OpEnv, name: &str) -> bool {
-    let Ok(dest) = env.destination() else {
-        return false;
+    let explicit = env.flags.prefix.is_some() || env.flags.global;
+    let store = match (explicit, env.find_venv()) {
+        (false, Ok(Some(venv))) => Ok(venv.store()),
+        (true, _) | (false, Ok(None)) => env.roots(),
+        (false, Err(why)) => Err(why),
     };
-    install::list_installed(&dest.store())
-        .is_ok_and(|all| all.iter().any(|m| project::same_name(&m.name, name)))
+    store.is_ok_and(|store| {
+        install::list_installed(&store)
+            .is_ok_and(|all| all.iter().any(|m| project::same_name(&m.name, name)))
+    })
 }
 
 /// What `add` was asked for: a package, the constraint if one was written, and
@@ -501,7 +535,7 @@ mod tests {
     use crate::cancel::CancelToken;
     use crate::config::Config;
     use crate::events::EventSink;
-    use crate::ops::testing::CancelOn;
+    use crate::ops::testing::{self, CancelOn};
     use crate::target::Roots;
     use std::io::Write;
     use std::path::Path;
@@ -1477,28 +1511,81 @@ alpha = \"1.0\"
 
     #[test]
     fn a_name_that_is_not_a_dependency_changes_nothing_and_syncs_nothing() {
-        let world = World::new("not-a-dependency", PROJECT);
+        for in_a_venv in [false, true] {
+            let world = World::new(&format!("not-a-dependency-{in_a_venv}"), PROJECT);
+            let sink = Recorder::default();
+            let mut env = world.env(&sink);
+            if in_a_venv {
+                // The venv is found, never announced: nothing was selected.
+                testing::venv_in(&world.root);
+                env.flags.prefix = None;
+                env.targets = vec![testing::labview_2026()];
+            }
+            let why = remove(
+                &env,
+                "zeta",
+                DependencyTable::Dependencies,
+                &InstallOptions::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    why,
+                    EditError::NotADependency {
+                        installed: false,
+                        ..
+                    }
+                ),
+                "venv {in_a_venv}: {why:?}"
+            );
+            assert!(
+                sink.events().is_empty(),
+                "venv {in_a_venv}: {:?}",
+                sink.events()
+            );
+            assert_eq!(world.manifest(), PROJECT);
+            assert_eq!(world.lock(), None);
+        }
+    }
+
+    #[test]
+    fn what_a_removal_announces_is_the_first_thing_it_says_and_only_once_the_name_is_listed() {
+        let announced = Event::UninstallRemovesFromProject {
+            package: "beta".into(),
+            destination: None,
+            dry_run: false,
+        };
+        let world = World::new("announce", PROJECT);
+        let refused = |table, name: &str| {
+            let sink = Recorder::default();
+            let why = remove_announcing(
+                &world.env(&sink),
+                name,
+                table,
+                &InstallOptions::default(),
+                announced.clone(),
+            )
+            .unwrap_err();
+            (why, sink.events())
+        };
+        for (table, name) in [
+            (DependencyTable::Dependencies, "zeta"),
+            (DependencyTable::DevDependencies, "beta"),
+            (ci(), "beta"),
+        ] {
+            let (why, events) = refused(table, name);
+            assert!(events.is_empty(), "{name}: {why:?} said {events:?}");
+        }
         let sink = Recorder::default();
-        let why = remove(
+        remove_announcing(
             &world.env(&sink),
-            "zeta",
+            "beta",
             DependencyTable::Dependencies,
             &InstallOptions::default(),
+            announced.clone(),
         )
-        .unwrap_err();
-        assert!(
-            matches!(
-                why,
-                EditError::NotADependency {
-                    installed: false,
-                    ..
-                }
-            ),
-            "{why:?}"
-        );
-        assert!(sink.events().is_empty(), "{:?}", sink.events());
-        assert_eq!(world.manifest(), PROJECT);
-        assert_eq!(world.lock(), None);
+        .unwrap();
+        assert_eq!(sink.events().first(), Some(&announced));
     }
 
     #[test]

@@ -846,9 +846,12 @@ impl Sandbox {
         let labview = self.detected_labview();
         let program_data = global::program_data();
         if !global::manifests(&program_data).is_empty() {
+            // The work directory can hold a scenario's project, which a bare
+            // named uninstall would edit.
             let uninstall = [
                 "uninstall",
                 global::FIXTURE_NAME,
+                "--no-project",
                 "--labview-version",
                 LABVIEW_YEAR,
             ];

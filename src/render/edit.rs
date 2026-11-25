@@ -38,11 +38,17 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
         Event::InstallAddsToProject {
             package,
             destination,
+            dry_run,
         } => {
-            r.line(
-                Stream::Out,
-                &format!("adding {package} to lvpm.toml and syncing the project to lvpm.lock"),
-            );
+            let said = match dry_run {
+                false => {
+                    format!("adding {package} to lvpm.toml and syncing the project to lvpm.lock")
+                }
+                true => {
+                    format!("would add {package} to lvpm.toml and sync the project to lvpm.lock")
+                }
+            };
+            r.line(Stream::Out, &said);
             if let Some(flag) = destination {
                 let note = destination_note(flag, &format!("gets {package}"), "install");
                 r.line(Stream::Out, &note);
@@ -51,24 +57,35 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
         Event::UninstallRemovesFromProject {
             package,
             destination,
+            dry_run,
         } => {
-            r.line(
-                Stream::Out,
-                &format!("removing {package} from lvpm.toml and syncing the project to lvpm.lock"),
-            );
+            let said = match dry_run {
+                false => format!(
+                    "removing {package} from lvpm.toml and syncing the project to lvpm.lock"
+                ),
+                true => format!(
+                    "would remove {package} from lvpm.toml and sync the project to lvpm.lock"
+                ),
+            };
+            r.line(Stream::Out, &said);
             if let Some(flag) = destination {
                 let note = destination_note(flag, &format!("loses {package}"), "uninstall");
                 r.line(Stream::Out, &note);
             }
         }
-        Event::UninstalledStillListed { name, dev, group } => {
+        Event::UninstalledStillListed {
+            name,
+            dev,
+            group,
+            destination,
+        } => {
             let table = DependencyTable::from_flags(*dev, group.as_deref());
             r.line(
                 Stream::Out,
                 &format!(
                     "note: {name} is still in lvpm.toml; `{}` removes it for good (a sync \
                      would install it again)",
-                    command_for("uninstall", name, &table)
+                    command_for("uninstall", name, &table, destination.as_deref())
                 ),
             )
         }
@@ -95,11 +112,27 @@ fn flag_for(table: &DependencyTable) -> String {
     }
 }
 
-/// The `lvpm <verb>` (`remove` or `uninstall`) that takes `name` out of `table`.
-fn command_for(verb: &str, name: &str, table: &DependencyTable) -> String {
-    match flag_for(table).as_str() {
+/// The `lvpm <verb>` (`remove` or `uninstall`) that takes `name` out of `table`,
+/// on the target the user picked.
+fn command_for(
+    verb: &str,
+    name: &str,
+    table: &DependencyTable,
+    destination: Option<&str>,
+) -> String {
+    let command = match flag_for(table).as_str() {
         "" => format!("lvpm {verb} {name}"),
         flag => format!("lvpm {verb} {name} {flag}"),
+    };
+    on_the_target(command, destination)
+}
+
+/// `command` with the destination flags the user gave, as typed with their
+/// values: without them it could act on another target.
+fn on_the_target(command: String, destination: Option<&str>) -> String {
+    match destination {
+        Some(flags) => format!("{command} {flags}"),
+        None => command,
     }
 }
 
@@ -146,8 +179,9 @@ fn edit_line(edit: &ManifestEdit, table: &DependencyTable, dry_run: bool) -> Str
 
 /// What `lvpm add` and `lvpm remove` print when they fail: what happened, then
 /// the next thing to do. `rerun` is the command to run again, as "run {rerun}
-/// again" reads.
-pub fn error(error: &EditError, rerun: &str) -> String {
+/// again" reads. `destination` is the destination flags the user gave, as typed
+/// with their values, for a suggested command that acts on the target.
+pub fn error(error: &EditError, rerun: &str, destination: Option<&str>) -> String {
     match error {
         EditError::Lock(LockError::NeedsNewerLabview {
             name, project_year, ..
@@ -185,8 +219,8 @@ pub fn error(error: &EditError, rerun: &str) -> String {
             installed: true,
         } => format!(
             "{error}\n\
-             next: `lvpm uninstall {name} --no-project` uninstalls it from the target without \
-             changing the project"
+             next: `{}` uninstalls it from the target without changing the project",
+            on_the_target(format!("lvpm uninstall {name} --no-project"), destination)
         ),
         EditError::NotADependency {
             installed: false, ..
@@ -197,7 +231,14 @@ pub fn error(error: &EditError, rerun: &str) -> String {
              `lvpm add {name} --group {group}`"
         ),
         EditError::InOtherTable { name, found_in } => {
-            format!("{error}\n{}", other_table_hints(name, found_in))
+            // The verb the user ran; `lvpm remove` stays `remove` until it is an alias.
+            let verb = if rerun.contains("uninstall") {
+                "uninstall"
+            } else {
+                "remove"
+            };
+            let hints = other_table_hints(verb, name, found_in, destination);
+            format!("{error}\n{hints}")
         }
         EditError::Other(cause) => format!("{cause:#}"),
     }
@@ -205,10 +246,15 @@ pub fn error(error: &EditError, rerun: &str) -> String {
 
 /// The way out of naming a table that does not hold the package: one `next:`
 /// for the one table that does, one line for each of several.
-fn other_table_hints(name: &str, found_in: &[DependencyTable]) -> String {
+fn other_table_hints(
+    verb: &str,
+    name: &str,
+    found_in: &[DependencyTable],
+    destination: Option<&str>,
+) -> String {
     match found_in {
         [only] => {
-            let command = command_for("remove", name, only);
+            let command = command_for(verb, name, only, destination);
             match flag_for(only).as_str() {
                 "" => format!("next: `{command}` removes it from [dependencies]"),
                 flag => format!("next: use {flag}: `{command}`"),
@@ -218,7 +264,7 @@ fn other_table_hints(name: &str, found_in: &[DependencyTable]) -> String {
             .map(|table| {
                 format!(
                     "next: `{}` removes it from [{}]",
-                    command_for("remove", name, table),
+                    command_for(verb, name, table, destination),
                     table.key()
                 )
             })
@@ -350,6 +396,7 @@ mod tests {
         renderer.render(&Event::InstallAddsToProject {
             package: "gamma@1.0".into(),
             destination: None,
+            dry_run: false,
         });
         assert_eq!(
             out.text(),
@@ -364,6 +411,7 @@ mod tests {
         renderer.render(&Event::InstallAddsToProject {
             package: "gamma".into(),
             destination: Some("--prefix".into()),
+            dry_run: false,
         });
         assert_eq!(
             out.text(),
@@ -381,6 +429,7 @@ mod tests {
             renderer.render(&Event::UninstallRemovesFromProject {
                 package: "gamma".into(),
                 destination,
+                dry_run: false,
             });
         }
         assert_eq!(
@@ -393,22 +442,79 @@ mod tests {
     }
 
     #[test]
+    fn a_dry_run_of_an_install_or_uninstall_in_a_project_says_what_it_would_do_not_what_it_does() {
+        let (mut renderer, out, _) = renderer();
+        renderer.render(&Event::InstallAddsToProject {
+            package: "gamma".into(),
+            destination: None,
+            dry_run: true,
+        });
+        renderer.render(&Event::UninstallRemovesFromProject {
+            package: "gamma".into(),
+            destination: None,
+            dry_run: true,
+        });
+        assert_eq!(
+            out.text(),
+            "would add gamma to lvpm.toml and sync the project to lvpm.lock\n\
+             would remove gamma from lvpm.toml and sync the project to lvpm.lock\n"
+        );
+    }
+
+    #[test]
+    fn the_json_of_the_project_events_has_dry_run_and_destination_only_when_they_are_set() {
+        let json = |event: Event| serde_json::to_value(event).unwrap();
+        assert_eq!(
+            json(Event::UninstallRemovesFromProject {
+                package: "gamma".into(),
+                destination: None,
+                dry_run: false,
+            }),
+            serde_json::json!({"event": "uninstall_removes_from_project", "data": {"package": "gamma"}})
+        );
+        assert_eq!(
+            json(Event::InstallAddsToProject {
+                package: "gamma".into(),
+                destination: Some("--prefix".into()),
+                dry_run: true,
+            }),
+            serde_json::json!({"event": "install_adds_to_project", "data": {
+                "package": "gamma", "destination": "--prefix", "dry_run": true
+            }})
+        );
+    }
+
+    #[test]
     fn a_name_that_is_not_a_dependency_says_to_uninstall_it_directly_only_when_the_target_holds_it()
     {
-        let said = |installed| {
-            written(&EditError::NotADependency {
-                name: "gamma".into(),
-                installed,
-            })
+        let said = |installed, destination| {
+            written_on(
+                &EditError::NotADependency {
+                    name: "gamma".into(),
+                    installed,
+                },
+                destination,
+            )
         };
         assert_eq!(
-            said(true),
+            said(true, None),
             "gamma is not a dependency of this project\n\
              next: `lvpm uninstall gamma --no-project` uninstalls it from the target without \
              changing the project"
         );
+        // The target it was asked about is the one to uninstall from.
+        for flags in ["--prefix dest", "--global", "--labview-version 2026"] {
+            assert_eq!(
+                said(true, Some(flags)),
+                format!(
+                    "gamma is not a dependency of this project\n\
+                     next: `lvpm uninstall gamma --no-project {flags}` uninstalls it from the \
+                     target without changing the project"
+                )
+            );
+        }
         assert_eq!(
-            said(false),
+            said(false, Some("--prefix dest")),
             "gamma is not a dependency of this project\nnext: check the name"
         );
     }
@@ -416,11 +522,17 @@ mod tests {
     #[test]
     fn an_uninstalled_package_that_the_manifest_still_lists_says_how_to_remove_it_for_good() {
         let (mut renderer, out, err) = renderer();
-        for dev in [false, true] {
+        for (dev, destination) in [
+            (false, None),
+            (true, None),
+            (true, Some("--prefix dest".to_string())),
+            (false, Some("--global".to_string())),
+        ] {
             renderer.render(&Event::UninstalledStillListed {
                 name: "caraya".into(),
                 dev,
                 group: None,
+                destination,
             });
         }
         assert_eq!(
@@ -428,7 +540,11 @@ mod tests {
             "note: caraya is still in lvpm.toml; `lvpm uninstall caraya` removes it for good (a sync \
              would install it again)\n\
              note: caraya is still in lvpm.toml; `lvpm uninstall caraya --dev` removes it for good \
-             (a sync would install it again)\n"
+             (a sync would install it again)\n\
+             note: caraya is still in lvpm.toml; `lvpm uninstall caraya --dev --prefix dest` removes \
+             it for good (a sync would install it again)\n\
+             note: caraya is still in lvpm.toml; `lvpm uninstall caraya --global` removes it for \
+             good (a sync would install it again)\n"
         );
         assert_eq!(err.text(), "");
     }
@@ -478,6 +594,7 @@ mod tests {
             name: "ci_tools".into(),
             dev: false,
             group: Some("ci".into()),
+            destination: None,
         });
         assert_eq!(
             out.text(),
@@ -528,7 +645,11 @@ mod tests {
     }
 
     fn written(error: &EditError) -> String {
-        super::error(error, "`lvpm add`")
+        super::error(error, "`lvpm add`", None)
+    }
+
+    fn written_on(error: &EditError, destination: Option<&str>) -> String {
+        super::error(error, "`lvpm remove`", destination)
     }
 
     #[test]
@@ -563,6 +684,35 @@ mod tests {
         assert_eq!(
             in_normal,
             "beta is in [dependencies]\nnext: `lvpm remove beta` removes it from [dependencies]"
+        );
+    }
+
+    #[test]
+    fn the_hint_for_another_table_is_the_command_the_user_ran_on_the_target_they_picked() {
+        let in_dev = EditError::InOtherTable {
+            name: "caraya".into(),
+            found_in: vec![DependencyTable::DevDependencies],
+        };
+        let said = |rerun, destination| super::error(&in_dev, rerun, destination);
+        assert_eq!(
+            said("`lvpm uninstall`", Some("--prefix dest")),
+            "caraya is in [dev-dependencies]\n\
+             next: use --dev: `lvpm uninstall caraya --dev --prefix dest`"
+        );
+        assert_eq!(
+            said("`lvpm remove`", Some("--labview-version 2026")),
+            "caraya is in [dev-dependencies]\n\
+             next: use --dev: `lvpm remove caraya --dev --labview-version 2026`"
+        );
+        let in_normal = EditError::InOtherTable {
+            name: "beta".into(),
+            found_in: vec![DependencyTable::Dependencies, group("ci")],
+        };
+        assert_eq!(
+            super::error(&in_normal, "`lvpm uninstall`", Some("--global")),
+            "beta is in [dependencies] and [dependency-groups.ci]\n\
+             next: `lvpm uninstall beta --global` removes it from [dependencies]\n\
+             next: `lvpm uninstall beta --group ci --global` removes it from [dependency-groups.ci]"
         );
     }
 

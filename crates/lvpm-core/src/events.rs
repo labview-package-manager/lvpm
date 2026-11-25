@@ -481,29 +481,40 @@ pub enum Event {
     /// `install` with a package name, inside a project and without
     /// `--no-project`, is an `add`. `package` is as it was typed;
     /// `destination` is the destination flag it was given, if any (`--prefix`),
-    /// which only picks where the project syncs. The first thing it says.
+    /// which only picks where the project syncs. The first thing it says;
+    /// `dry_run`: nothing is written, so it is what would be added.
     InstallAddsToProject {
         package: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
     },
     /// `uninstall` with a package name, inside a project and without
     /// `--no-project`, is a `remove`. `package` is as it was typed;
     /// `destination` is the destination flag that picked the target, if any,
-    /// which only says where the project syncs. The first thing it says.
+    /// which only says where the project syncs. The first thing it says, once
+    /// the package is known to be in the table `lvpm.toml` is edited in;
+    /// `dry_run`: nothing is written, so it is what would be removed.
     UninstallRemovesFromProject {
         package: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
     },
     /// An `uninstall` took out a package that `lvpm.toml` still lists, in
     /// `[dev-dependencies]` when `dev`, `[dependency-groups.<group>]` when
-    /// `group`: the next sync would put it back.
+    /// `group`: the next sync would put it back. `destination` is the
+    /// destination flags the uninstall was given, as typed, with their values:
+    /// the command that removes it for good needs them to act on the same target.
     UninstalledStillListed {
         name: String,
         dev: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
     },
     /// The lock on disk still represents the manifest, so it was left alone.
     LockUpToDate { path: PathBuf },

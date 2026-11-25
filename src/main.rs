@@ -4,6 +4,7 @@
 // it from `lvpm-core` only.
 #![allow(clippy::disallowed_methods)]
 
+use lvpm_core::errors::EditError;
 use lvpm_core::events::{Event, EventSink};
 use lvpm_core::github::{GitHub, gh, gh_auth_token};
 use lvpm_core::manifest_edit::DependencyTable;
@@ -147,12 +148,15 @@ struct ApplyArgs {
 
 impl ApplyArgs {
     /// The first of the flags that only matter to a project's sync, as typed.
+    // shortcut: `--relink-timeout` has a default, so a typed one reads as none, and the hidden `--no-relink` is accepted and ignored here as everywhere; refuse them when clap's value_source is carried here.
     fn flag_given(&self) -> Option<&'static str> {
         let typed = [
             (self.dry_run, "--dry-run"),
             (self.no_linkfix, "--no-linkfix"),
             (self.force_relink, "--relink"),
             (self.run_hooks, "--hooks"),
+            (self.relink.keep_open, "--keep-open"),
+            (self.relink.progress.is_some(), "--relink-progress"),
         ];
         typed
             .into_iter()
@@ -394,11 +398,12 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         timeout: u64,
     },
-    /// Remove a previously installed package. In a project, a named uninstall
-    /// is `lvpm remove`: it takes the package out of lvpm.toml, locks and
-    /// syncs, whatever --global, --prefix or --labview-version say: they only
-    /// pick where the project syncs. --no-project uninstalls the package
-    /// alone, leaving the project's files as they are.
+    /// Remove a package. In a project, a named uninstall takes the package out
+    /// of lvpm.toml, locks and syncs, whatever --global, --prefix or
+    /// --labview-version say: they only pick where the project syncs.
+    /// --no-project uninstalls the package alone, leaving the project's files
+    /// as they are; so does --all, and so does naming no package outside a
+    /// project.
     Uninstall {
         /// Package to remove. Omit when using --all.
         package: Option<String>,
@@ -1085,7 +1090,8 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 (InstallMode::Add, Some(spec)) => {
                     env.sink.emit(Event::InstallAddsToProject {
                         package: spec.to_string(),
-                        destination: picked_destination(&env),
+                        destination: env.destination_flag().map(str::to_string),
+                        dry_run: apply.dry_run,
                     });
                     cmd_add(&env, spec, DependencyTable::Dependencies, None, apply)
                 }
@@ -1365,30 +1371,6 @@ fn dependency_table(dev: bool, group: Option<&str>) -> Result<DependencyTable> {
     Ok(table)
 }
 
-/// The destination flag that picked the project's target, as typed, if any.
-fn picked_destination(env: &OpEnv) -> Option<String> {
-    // A lookup that fails fails the sync after it with the same error.
-    let venv_wins = env.find_venv().is_ok_and(|venv| venv.is_some());
-    destination_flag(&env.flags, venv_wins)
-}
-
-/// The destination flag that picked the target, as typed: the one a named
-/// install in a project tells the user only picks where the project syncs.
-/// `--labview-version` picks nothing when a venv wins (see `OpEnv::destination`).
-fn destination_flag(flags: &DestinationFlags, venv_wins: bool) -> Option<String> {
-    let typed = [
-        (flags.global, "--global"),
-        (flags.prefix.is_some(), "--prefix"),
-        (
-            flags.labview_version.is_some() && !venv_wins,
-            "--labview-version",
-        ),
-    ];
-    typed
-        .into_iter()
-        .find_map(|(given, name)| given.then(|| name.to_string()))
-}
-
 /// `--dev` or `--group`, as typed: the table a project uninstall takes a
 /// package out of.
 fn table_flag(dev: bool, group: Option<&str>) -> Option<&'static str> {
@@ -1399,8 +1381,8 @@ fn table_flag(dev: bool, group: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// A named `uninstall` in a project is a `remove`: it says so, then takes the
-/// package out of the project's `lvpm.toml`.
+/// A named `uninstall` in a project takes the package out of the project's
+/// `lvpm.toml`, and says so once it is known to be listed in the table.
 fn cmd_uninstall_project(
     env: &OpEnv,
     package: &str,
@@ -1409,11 +1391,14 @@ fn cmd_uninstall_project(
     apply: &ApplyArgs,
 ) -> Result<()> {
     let table = dependency_table(dev, group)?;
-    env.sink.emit(Event::UninstallRemovesFromProject {
+    let announce = Event::UninstallRemovesFromProject {
         package: package.to_string(),
-        destination: picked_destination(env),
-    });
-    cmd_remove(env, package, table, apply, "`lvpm uninstall`")
+        destination: env.destination_flag().map(str::to_string),
+        dry_run: apply.dry_run,
+    };
+    let options = apply.options(false, false);
+    ops::add_remove::remove_announcing(env, package, table, &options, announce)
+        .map_err(|why| edit_error(env, &why, "`lvpm uninstall`"))
 }
 
 /// `uninstall` that leaves the project alone: the named package, or `--all`, out
@@ -1464,7 +1449,7 @@ fn cmd_add(
         source_pin,
         &apply.options(false, false),
     )
-    .map_err(|why| anyhow!(render::edit::error(&why, "`lvpm add`")))
+    .map_err(|why| edit_error(env, &why, "`lvpm add`"))
 }
 
 /// `rerun` is the command a failure says to run again.
@@ -1476,7 +1461,18 @@ fn cmd_remove(
     rerun: &str,
 ) -> Result<()> {
     ops::add_remove::remove(env, package, table, &apply.options(false, false))
-        .map_err(|why| anyhow!(render::edit::error(&why, rerun)))
+        .map_err(|why| edit_error(env, &why, rerun))
+}
+
+/// What an `add`, `remove` or project `uninstall` that failed prints: its next
+/// step names the destination flags it was given, so a command it suggests acts
+/// on the same target.
+fn edit_error(env: &OpEnv, why: &EditError, rerun: &str) -> anyhow::Error {
+    anyhow!(render::edit::error(
+        why,
+        rerun,
+        env.destination_flags_as_typed().as_deref()
+    ))
 }
 
 /// A refused build is a result, not an error: its stdout and `--json` are
@@ -2009,28 +2005,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn labview_version_is_not_the_destination_flag_when_a_venv_wins() {
-        let version = DestinationFlags {
-            labview_version: Some("2026".into()),
-            ..Default::default()
+    fn a_relink_flag_on_a_direct_uninstall_is_refused_like_the_other_sync_flags() {
+        let given = |flags: &[&str]| {
+            let args = ["lvpm", "uninstall", "alpha"]
+                .into_iter()
+                .chain(flags.iter().copied());
+            match Cli::try_parse_from(args).unwrap().cmd {
+                Cmd::Uninstall { apply, .. } => apply.flag_given(),
+                _ => unreachable!("an uninstall"),
+            }
         };
+        assert_eq!(given(&[]), None);
+        assert_eq!(given(&["--keep-open"]), Some("--keep-open"));
         assert_eq!(
-            destination_flag(&version, false).as_deref(),
-            Some("--labview-version")
+            given(&["--relink-progress", "bar"]),
+            Some("--relink-progress")
         );
-        assert_eq!(destination_flag(&version, true), None);
-        // --prefix and --global win over a venv, so they are still named.
-        let prefix = DestinationFlags {
-            prefix: Some("dest".into()),
-            labview_version: Some("2026".into()),
-            ..Default::default()
-        };
-        assert_eq!(destination_flag(&prefix, true).as_deref(), Some("--prefix"));
-        let global = DestinationFlags {
-            global: true,
-            ..Default::default()
-        };
-        assert_eq!(destination_flag(&global, true).as_deref(), Some("--global"));
+        assert_eq!(given(&["--dry-run", "--keep-open"]), Some("--dry-run"));
+        // Not told apart from its default, and hidden: the plan records both.
+        assert_eq!(given(&["--relink-timeout", "5"]), None);
+        assert_eq!(given(&["--no-relink"]), None);
     }
 
     #[test]

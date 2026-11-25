@@ -131,8 +131,12 @@ fn say_if_still_listed(env: &OpEnv, bound: Option<&Path>, package: &str) {
     });
     if let Some((name, table)) = found {
         let (dev, group) = table.flags();
-        env.sink
-            .emit(Event::UninstalledStillListed { name, dev, group });
+        env.sink.emit(Event::UninstalledStillListed {
+            name,
+            dev,
+            group,
+            destination: env.destination_flags_as_typed(),
+        });
     }
 }
 
@@ -560,6 +564,8 @@ mod tests {
                     name: "alpha".into(),
                     dev,
                     group,
+                    // The command that removes it for good acts on the same target.
+                    destination: Some(format!("--prefix {}", dir.display())),
                 }),
                 "{table}: {events:?}"
             );

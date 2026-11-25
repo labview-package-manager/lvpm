@@ -150,7 +150,7 @@ Feature: add and remove edit the manifest, then lock and sync
     When I run "lvpm install --no-deps" inside the project
     Then the command fails saying --no-deps cannot be used in a project, because lvpm.lock decides the dependencies
 
-  Scenario: uninstall inside a project hints at remove
+  Scenario: uninstall --no-project inside a project leaves lvpm.toml and says it still lists the package
     When I run "lvpm uninstall beta --no-project --keep-deps --prefix dest"
     Then "beta" is uninstalled
     And the output says "beta" is still in lvpm.toml and "lvpm uninstall beta" removes it for good

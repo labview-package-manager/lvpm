@@ -4,7 +4,8 @@
 use super::lock::{error as lock_error, stale_reason};
 use super::{Renderer, Stream};
 use lvpm_core::errors::{
-    ArchiveFault, LockError, LockIncompatible, LockedArchiveProblem, RouteError, SyncError,
+    ArchiveFault, DirectBecause, LockError, LockIncompatible, LockedArchiveProblem, RouteError,
+    SyncError,
 };
 use lvpm_core::events::{Event, PackageRef, RemoveReason, SyncStep};
 
@@ -252,11 +253,16 @@ pub fn route_error(error: &RouteError) -> String {
              next: drop {flag}, or uninstall the package without changing the project: \
              `lvpm uninstall <package> {flag} --no-project`"
         ),
-        RouteError::OnlyInAProject { flag } => format!(
-            "{error}\n\
-             next: drop {flag}, or run this in a project, where uninstalling a package takes it \
-             out of lvpm.toml"
-        ),
+        RouteError::OnlyInAProject { flag, because } => {
+            let way_in = match because {
+                DirectBecause::NoPackage => "name a package",
+                DirectBecause::NoProject => "drop --no-project",
+                DirectBecause::NotInAProject => {
+                    "run this in a project, where uninstalling a package takes it out of lvpm.toml"
+                }
+            };
+            format!("{error}\nnext: drop {flag}, or {way_in}")
+        }
         RouteError::Other(cause) => format!("{cause:#}"),
     }
 }
@@ -582,12 +588,34 @@ mod tests {
 
     #[test]
     fn a_project_only_flag_on_a_direct_uninstall_is_named_and_the_way_out_is_a_project() {
-        let text = route_error(&RouteError::OnlyInAProject { flag: "--dev" });
-        assert!(
-            text.starts_with(
-                "--dev can only be used when uninstalling a package from a project\nnext: drop --dev, "
-            ),
-            "{text}"
+        let text = route_error(&RouteError::OnlyInAProject {
+            flag: "--dev",
+            because: DirectBecause::NotInAProject,
+        });
+        assert_eq!(
+            text,
+            "--dev can only be used when uninstalling a package from a project\n\
+             next: drop --dev, or run this in a project, where uninstalling a package takes it \
+             out of lvpm.toml"
+        );
+    }
+
+    #[test]
+    fn the_way_in_to_a_project_only_flag_follows_why_the_uninstall_is_direct() {
+        let said = |because| {
+            route_error(&RouteError::OnlyInAProject {
+                flag: "--dry-run",
+                because,
+            })
+        };
+        let refusal = "--dry-run can only be used when uninstalling a package from a project\n";
+        assert_eq!(
+            said(DirectBecause::NoPackage),
+            format!("{refusal}next: drop --dry-run, or name a package")
+        );
+        assert_eq!(
+            said(DirectBecause::NoProject),
+            format!("{refusal}next: drop --dry-run, or drop --no-project")
         );
     }
 
