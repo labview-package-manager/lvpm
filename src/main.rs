@@ -37,8 +37,7 @@ use std::sync::Arc;
     about = "Open-source package manager for LabVIEW packages (.lvpkg; reads .vip and .ogp) — proof of concept"
 )]
 struct Cli {
-    /// Install into this LabVIEW version, e.g. 2026. Writing into LabVIEW itself needs --global.
-    /// See `lvpm targets`.
+    /// Which LabVIEW version, e.g. 2026; a write into LabVIEW itself also needs --global. See `lvpm targets`.
     #[arg(long = "labview-version", global = true, value_name = "YYYY")]
     labview_version: Option<String>,
 
@@ -56,8 +55,7 @@ struct Cli {
     )]
     labview_bitness: Option<u8>,
 
-    /// Use the LabVIEW installation itself, even from inside a project that
-    /// has a venv. A write into it needs this flag.
+    /// Write into LabVIEW itself, even from a project with a venv; alone, it picks the project's LabVIEW, the venv's, or the only installation.
     #[arg(long, global = true, conflicts_with = "project")]
     global: bool,
 
@@ -1613,7 +1611,7 @@ fn confirm_removal(v: &venv::Venv) -> Result<bool> {
 /// method that wants arguments answers with a complaint about those instead,
 /// and that too proves the id resolved.
 fn cmd_app_probe(env: &OpEnv, ids: &[String]) -> Result<()> {
-    let roots = env.roots()?;
+    let roots = env.flagged_roots()?;
     let Some(t) = roots.target.clone() else {
         bail!("app-probe needs a real LabVIEW target, not --prefix");
     };

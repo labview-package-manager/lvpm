@@ -191,14 +191,17 @@ fn required(lock: &Lockfile, project: &Project, name: &str) -> Option<EditError>
 
 /// `name` is installed in the target, as far as it can be told: a target that
 /// cannot be resolved or read holds nothing. It picks the target the way
-/// [`OpEnv::destination`] does but says nothing about it: this is a probe for a
-/// refusal that changes nothing, so a venv is found, never "selected".
+/// [`OpEnv::destination`] does (`--prefix`, `--global` and `--labview-version`
+/// through [`OpEnv::flagged_roots`], so `--global` alone settles as it does for
+/// a write) but says nothing about it: this is a probe for a refusal that
+/// changes nothing, so a venv is found, never "selected".
 // shortcut: a headless venv-less project is not probed, so it reads as holding nothing; when that matters, make `destination` quiet.
 fn installed_in_the_target(env: &OpEnv, name: &str) -> bool {
     let explicit = env.flags.prefix.is_some() || env.flags.global;
     let store = match (explicit, env.find_venv()) {
         (false, Ok(Some(venv))) => Ok(venv.store()),
-        (true, _) | (false, Ok(None)) => env.roots(),
+        (true, _) => env.flagged_roots(),
+        (false, Ok(None)) => env.roots(),
         (false, Err(why)) => Err(why),
     };
     store.is_ok_and(|store| {
@@ -1849,6 +1852,41 @@ alpha = \"1.0\"
                 }
             ),
             "nowhere"
+        );
+    }
+
+    #[test]
+    fn a_global_alone_sees_what_the_installation_holds_when_a_name_is_not_a_dependency() {
+        let world = World::new("not-a-dependency-global", PROJECT);
+        let fake = crate::ops::testing::FakeInstallation::new(&world.root);
+        let store = fake.roots().store_dir();
+        std::fs::create_dir_all(&store).unwrap();
+        let record = serde_json::json!({
+            "name": "gamma", "version": "1.0", "display_name": null, "installed_at": 0,
+            "target": "LabVIEW 2099", "files": [], "skipped_hooks": [],
+        });
+        std::fs::write(store.join("gamma.json"), record.to_string()).unwrap();
+        let sink = Recorder::default();
+        let mut env = world.env(&sink);
+        env.flags.prefix = None;
+        env.flags.global = true;
+        fake.place(&mut env);
+        let why = remove(
+            &env,
+            "gamma",
+            DependencyTable::Dependencies,
+            &InstallOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                why,
+                EditError::NotADependency {
+                    installed: true,
+                    ..
+                }
+            ),
+            "{why:?}"
         );
     }
 }

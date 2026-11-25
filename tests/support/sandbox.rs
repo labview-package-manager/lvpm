@@ -30,6 +30,18 @@ use tempfile::TempDir;
 
 /// The LabVIEW the `@labview` scenarios work with.
 pub const LABVIEW_YEAR: &str = "2026";
+
+/// What the restore runs to take the fixture package out of the LabVIEW
+/// installation. `--no-project` because the work directory can hold a
+/// scenario's project, which a bare named uninstall would edit.
+const FIXTURE_UNINSTALL: [&str; 6] = [
+    "uninstall",
+    global::FIXTURE_NAME,
+    "--no-project",
+    "--global",
+    "--labview-version",
+    LABVIEW_YEAR,
+];
 /// The project root and the child's working directory.
 pub const WORK_DIR: &str = "work";
 pub const CACHE_DIR: &str = "cache";
@@ -193,6 +205,8 @@ pub fn real_installation_risk(
             flags.prefix = Some(PathBuf::from(prefix));
         } else if let Some(year) = flag_value(arg, "--labview-version", &mut rest) {
             flags.labview_version = Some(year.to_string());
+        } else if let Some(bits) = flag_value(arg, "--labview-bitness", &mut rest) {
+            flags.labview_bitness = bits.parse().ok();
         } else if let Some(project) = flag_value(arg, "--project", &mut rest) {
             flags.project = Some(PathBuf::from(project));
         } else if !arg.starts_with('-') {
@@ -220,13 +234,12 @@ pub fn real_installation_risk(
     // Read, not write: `lvpm` itself refuses `--labview-version` without
     // `--global`, and this guard must refuse whatever it would not.
     let roots = match by_labview {
-        // `run-hooks` takes `--global` alone, as `lvpm` does; refresh and start do not.
-        true => match command {
-            "run-hooks" => env.flagged_roots(),
-            _ => env.roots(),
-        }
-        .ok()
-        .filter(|roots| roots.target.is_some())?,
+        // `run-hooks`, `refresh` and `start` all settle `--global` alone as
+        // `lvpm` does, through `flagged_roots`.
+        true => env
+            .flagged_roots()
+            .ok()
+            .filter(|roots| roots.target.is_some())?,
         false => {
             let Ok(Destination::Global(roots)) = env.read_destination() else {
                 return None;
@@ -854,16 +867,7 @@ impl Sandbox {
         let labview = self.detected_labview();
         let program_data = global::program_data();
         if !global::manifests(&program_data).is_empty() {
-            // The work directory can hold a scenario's project, which a bare
-            // named uninstall would edit.
-            let uninstall = [
-                "uninstall",
-                global::FIXTURE_NAME,
-                "--no-project",
-                "--labview-version",
-                LABVIEW_YEAR,
-            ];
-            self.run_lvpm(&uninstall, None);
+            self.run_lvpm(&FIXTURE_UNINSTALL, None);
         }
         global::remove_leftovers(&labview.dir, &program_data, &global::marker_path())?;
         if !store_existed {
@@ -1075,6 +1079,40 @@ mod tests {
     }
 
     #[test]
+    fn a_labview_bitness_picks_between_two_installations_of_a_year_and_is_still_refused() {
+        // `--global` alone with both bitnesses installed asks "which LabVIEW?",
+        // so a guard that ignores `--labview-bitness` lets the one `lvpm`
+        // settles on through.
+        let both = |bitness| LvTarget {
+            version: 26.3,
+            bitness,
+            path: PathBuf::from(format!("LabVIEW 2026 {bitness}")),
+        };
+        let targets = [both(64), both(32)];
+        let cwd = tempfile::tempdir().expect("a working directory");
+        let risky_here = |command_line: &str| {
+            let args: Vec<&str> = command_line.split_whitespace().collect();
+            real_installation_risk(&args, cwd.path(), &targets, false, false).is_some()
+        };
+        assert!(!risky_here("install beta --global"), "which LabVIEW?");
+        for command in [
+            "install beta --global --labview-bitness 32",
+            "install beta --global --labview-bitness=64",
+            "install beta --labview-bitness 32 --global --labview-version 2026",
+        ] {
+            assert!(risky_here(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn the_fixture_uninstall_the_restore_runs_names_global_and_the_guard_lets_it_through() {
+        let command = FIXTURE_UNINSTALL.join(" ");
+        assert!(command.contains(" --global "), "{command}");
+        assert!(!risky(&command, true));
+        assert!(risky(&command, false), "before it is armed");
+    }
+
+    #[test]
     fn only_the_fixture_may_be_installed_or_uninstalled_and_only_once_the_installation_is_proved_clean()
      {
         for command in [
@@ -1165,10 +1203,11 @@ mod tests {
     #[test]
     fn a_refresh_is_refused_at_the_installation_the_flag_names_even_beside_a_venv() {
         assert!(risky("refresh --labview-version 2026", false));
+        assert!(risky("refresh --global", false));
         assert!(risky_in_a_project_with_a_venv(
             "refresh --labview-version 2026"
         ));
-        for command in ["refresh --prefix dest", "refresh", "refresh --global"] {
+        for command in ["refresh --prefix dest", "refresh"] {
             assert!(!risky(command, false), "{command}");
         }
     }
@@ -1176,10 +1215,12 @@ mod tests {
     #[test]
     fn a_start_is_refused_at_the_installation_the_flag_names_even_beside_a_venv() {
         assert!(risky("start --labview-version 2026", false));
+        // `--global` alone settles on the one installation, as it does for a write.
+        assert!(risky("start --global", false));
         assert!(risky_in_a_project_with_a_venv(
             "start --labview-version=2026"
         ));
-        for command in ["start --prefix dest", "start", "start --global"] {
+        for command in ["start --prefix dest", "start"] {
             assert!(!risky(command, false), "{command}");
         }
     }

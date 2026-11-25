@@ -96,7 +96,9 @@ async fn an_env(world: &mut CliWorld, flags: String, cwd: String, headless: bool
         "anywhere" => {}
         "a project with a venv" => {
             has_manifest(&project, MANIFEST_YEAR);
-            create_venv(&project, &targets[1]);
+            // Bound to the newer LabVIEW, not the manifest's, so that the venv's
+            // binding and the manifest's labview cannot be mistaken for each other.
+            create_venv(&project, &targets[0]);
         }
         "a project without a venv" => has_manifest(&project, MANIFEST_YEAR),
         "a project whose labview is not installed" => has_manifest(&project, NOT_INSTALLED_YEAR),
@@ -155,7 +157,7 @@ async fn the_result_is(world: &mut CliWorld, expected: String) {
         }
         ("the venv", Ok(Destination::Venv(venv))) => {
             assert_eq!(venv.dir, state.cwd.join(VENV_DIR));
-            assert_eq!(venv.target.path, state.targets[1].path);
+            assert_eq!(venv.target.path, state.targets[0].path);
             assert!(
                 matches!(state.events.as_slice(), [Event::VenvSelected { dir, .. }] if dir == &venv.dir),
                 "the venv is announced: {:?}",
@@ -193,7 +195,7 @@ async fn the_result_is(world: &mut CliWorld, expected: String) {
         }
         ("the venv's LabVIEW itself, no venv announced", Ok(Destination::Global(roots))) => {
             let chosen = roots.target.as_ref().expect("a LabVIEW installation");
-            assert_eq!(chosen.path, state.targets[1].path);
+            assert_eq!(chosen.path, state.targets[0].path);
             assert!(
                 !state
                     .events
@@ -227,6 +229,10 @@ async fn the_result_is(world: &mut CliWorld, expected: String) {
         }
         ("error \"mutually exclusive\"", Err(why)) => {
             assert!(why.contains("mutually exclusive"), "{why}");
+        }
+        ("error naming lvpm venv create and --global", Err(why)) => {
+            assert!(why.contains("`lvpm venv create`"), "{why}");
+            assert!(why.contains("--global installs into"), "{why}");
         }
         ("error naming lvpm venv create", Err(why)) => {
             assert!(why.contains("`lvpm venv create`"), "{why}");
