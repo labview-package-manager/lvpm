@@ -169,7 +169,11 @@ async fn install_help_says_what_it_does_in_a_project(world: &mut CliWorld) {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    for phrase in ["bare install is `lvpm sync`", "named install is `lvpm add`"] {
+    for phrase in [
+        "bare install is `lvpm sync`",
+        "a named install adds the package to lvpm.toml",
+        "`add` is the same command",
+    ] {
         assert!(help.contains(phrase), "`{phrase}` is not in:\n{help}");
     }
 }

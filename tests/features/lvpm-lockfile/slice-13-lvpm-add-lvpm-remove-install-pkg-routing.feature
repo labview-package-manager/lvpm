@@ -134,7 +134,7 @@ Feature: add and remove edit the manifest, then lock and sync
     Given a project with a venv
     When I run "lvpm install gamma", and "lvpm add gamma" in an identical world
     Then the output says gamma is being added to lvpm.toml and the project synced to lvpm.lock
-    And both manifests, locks and destinations are identical
+    And both manifests, locks, destinations and outputs are identical
 
   Scenario Outline: --no-project keeps a named install additive
     When I run "lvpm install gamma <flag>" inside the project
@@ -161,8 +161,6 @@ Feature: add and remove edit the manifest, then lock and sync
 
     Examples:
       | command          |
-      | lvpm add gamma   |
-      | lvpm remove beta |
       | lvpm lock         |
       | lvpm lock --check |
       | lvpm sync         |

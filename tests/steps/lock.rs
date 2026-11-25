@@ -63,7 +63,12 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn add_dependency(sandbox: &Sandbox, table: DependencyTable, name: &str, constraint: &str) {
+pub(super) fn add_dependency(
+    sandbox: &Sandbox,
+    table: DependencyTable,
+    name: &str,
+    constraint: &str,
+) {
     manifest_edit::set_file(
         &sandbox.work_dir().join(MANIFEST_FILE),
         &table,

@@ -29,8 +29,8 @@ Feature: Machine-readable output
       | lock --check                          | the project | {"up_to_date": true}                   | lock-check    |
       | lock                                  | the project | {"command": "lock"}                    | lock          |
       | sync --prefix dest                    | the project | {"command": "sync"}                    | sync          |
-      | add beta --prefix dest                | the project | {"command": "add"}                     | add           |
-      | remove alpha --prefix dest            | the project | {"command": "remove"}                  | remove        |
+      | add beta --prefix dest                | the project | {"command": "install"}                 | add           |
+      | remove alpha --prefix dest            | the project | {"command": "uninstall"}               | remove        |
       | venv status                           | any folder | an object with "exists" false           | venv-status   |
 
   # start, refresh and run-hooks have no row: they never use a venv, and the

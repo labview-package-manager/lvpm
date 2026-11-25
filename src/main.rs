@@ -280,12 +280,13 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Install a package by name, or name@version. In a project, a bare
-    /// install is `lvpm sync` and a named install is `lvpm add`, whatever
-    /// --global, --prefix or --labview-version say: they only pick where the
-    /// project syncs. --no-project installs the package alone, leaving the
-    /// project's files as they are.
-    #[command(mut_arg("group", |arg| arg.help(
+    /// Install a package by name, or name@version; `add` is the same command.
+    /// In a project, a bare install is `lvpm sync` and a named install adds
+    /// the package to lvpm.toml, locks and syncs, whatever --global, --prefix
+    /// or --labview-version say: they only pick where the project syncs.
+    /// --no-project installs the package alone, leaving the project's files as
+    /// they are.
+    #[command(visible_alias = "add", mut_arg("group", |arg| arg.help(
         "With a package: save it in [dependency-groups.NAME]. Without: also install this group (repeatable)"
     )))]
     Install {
@@ -333,42 +334,6 @@ enum Cmd {
         #[command(flatten)]
         sync: SyncArgs,
     },
-    /// Add a package to lvpm.toml, lock the project and sync the destination.
-    ///
-    /// With no constraint it writes `>=` the version it locked. Quote a
-    /// constraint, or the shell reads its `>` as a redirect: "gamma@>=0.5".
-    /// Nothing is written unless the lock and the sync both work.
-    Add {
-        /// The package, or package@constraint, e.g. "gamma@>=0.5".
-        package: String,
-        /// Add it to [dev-dependencies].
-        #[arg(long)]
-        dev: bool,
-        /// Add it to [dependency-groups.<NAME>], which is made if it is new.
-        #[arg(long, value_name = "NAME", conflicts_with = "dev")]
-        group: Option<String>,
-        /// Take this package only from this [sources] name; writes index = "<NAME>".
-        #[arg(long = "index", value_name = "NAME")]
-        source_pin: Option<String>,
-        #[command(flatten)]
-        apply: ApplyArgs,
-    },
-    /// Remove a package from lvpm.toml, lock the project and sync the
-    /// destination. A package that another one still requires stays.
-    ///
-    /// Nothing is written unless the lock and the sync both work.
-    Remove {
-        /// The package to take out of lvpm.toml.
-        package: String,
-        /// It is in [dev-dependencies].
-        #[arg(long)]
-        dev: bool,
-        /// It is in [dependency-groups.<NAME>].
-        #[arg(long, value_name = "NAME", conflicts_with = "dev")]
-        group: Option<String>,
-        #[command(flatten)]
-        apply: ApplyArgs,
-    },
     /// Relink an already-installed package, without reinstalling it.
     ///
     /// The install manifest records what went where, so this is the same pass
@@ -412,12 +377,13 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         timeout: u64,
     },
-    /// Remove a package. In a project, a named uninstall takes the package out
-    /// of lvpm.toml, locks and syncs, whatever --global, --prefix or
-    /// --labview-version say: they only pick where the project syncs.
-    /// --no-project uninstalls the package alone, leaving the project's files
-    /// as they are; so does --all, and so does naming no package outside a
-    /// project.
+    /// Remove a package; `remove` is the same command. In a project, a named
+    /// uninstall takes the package out of lvpm.toml, locks and syncs, whatever
+    /// --global, --prefix or --labview-version say: they only pick where the
+    /// project syncs. --no-project uninstalls the package alone, leaving the
+    /// project's files as they are; so does --all, and so does naming no
+    /// package outside a project.
+    #[command(visible_alias = "remove")]
     Uninstall {
         /// Package to remove. Omit when using --all.
         package: Option<String>,
@@ -1114,35 +1080,6 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
             }
             .map(|()| Report::done("install"))
         }
-        Cmd::Add {
-            package,
-            dev,
-            group,
-            source_pin,
-            apply,
-        } => cmd_add(
-            &env,
-            package,
-            dependency_table(*dev, group.as_deref())?,
-            source_pin.as_deref(),
-            apply,
-            None,
-            "`lvpm add`",
-        )
-        .map(|()| Report::done("add")),
-        Cmd::Remove {
-            package,
-            dev,
-            group,
-            apply,
-        } => cmd_remove(
-            &env,
-            package,
-            dependency_table(*dev, group.as_deref())?,
-            apply,
-            "`lvpm remove`",
-        )
-        .map(|()| Report::done("remove")),
         Cmd::Sync { apply, sync } => {
             cmd_sync(&env, &sync.options(apply, env.headless)).map(|()| Report::done("sync"))
         }
@@ -1491,58 +1428,14 @@ fn cmd_install_adds(
         destination: env.destination_flag().map(str::to_string),
         dry_run: apply.dry_run,
     };
-    cmd_add(
-        env,
-        package,
-        table,
-        source_pin,
-        apply,
-        Some(announce),
-        "`lvpm install`",
-    )
-}
-
-/// `announce` is what the command says once the lock is made, if it says one.
-/// `rerun` is the command a failure says to run again.
-fn cmd_add(
-    env: &OpEnv,
-    package: &str,
-    table: DependencyTable,
-    source_pin: Option<&str>,
-    apply: &ApplyArgs,
-    announce: Option<Event>,
-    rerun: &str,
-) -> Result<()> {
     let options = apply.options(false, false);
-    match announce {
-        Some(event) => ops::add_remove::add_announcing(
-            env,
-            package,
-            table.clone(),
-            source_pin,
-            &options,
-            event,
-        ),
-        None => ops::add_remove::add(env, package, table.clone(), source_pin, &options),
-    }
-    .map_err(|why| edit_error(env, &why, rerun, &table, source_pin))
+    ops::add_remove::add_announcing(env, package, table.clone(), source_pin, &options, announce)
+        .map_err(|why| edit_error(env, &why, "`lvpm install`", &table, source_pin))
 }
 
-/// `rerun` is the command a failure says to run again.
-fn cmd_remove(
-    env: &OpEnv,
-    package: &str,
-    table: DependencyTable,
-    apply: &ApplyArgs,
-    rerun: &str,
-) -> Result<()> {
-    ops::add_remove::remove(env, package, table.clone(), &apply.options(false, false))
-        .map_err(|why| edit_error(env, &why, rerun, &table, None))
-}
-
-/// What an `add`, `remove` or project `uninstall` that failed prints: its next
-/// step names the destination flags it was given, so a command it suggests acts
-/// on the same target, and the table and source pin it saved into.
+/// What a project `install` or `uninstall` that failed prints: its next step
+/// names the destination flags it was given, so a command it suggests acts on
+/// the same target, and the table and source pin it saved into.
 fn edit_error(
     env: &OpEnv,
     why: &EditError,

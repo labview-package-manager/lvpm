@@ -1,5 +1,6 @@
-//! The wording of `lvpm add` and `lvpm remove`: what they did to `lvpm.toml`,
-//! and the errors they end in. The lock and the sync they run say what they do
+//! The wording of a named `lvpm install` and `lvpm uninstall` in a project (and
+//! so of `add` and `remove`): what they did to `lvpm.toml`, and the errors they
+//! end in. The lock and the sync they run say what they do
 //! in their own words (`lock`, `sync`).
 
 use super::lock::error_for as lock_error;
@@ -99,7 +100,7 @@ fn destination_note(flag: &str, change: &str, verb: &str) -> String {
     )
 }
 
-/// The flag that names `table` to `add` and `remove`: none for `[dependencies]`.
+/// The flag that names `table` to `install` and `uninstall`: none for `[dependencies]`.
 fn flag_for(table: &DependencyTable) -> String {
     match table {
         DependencyTable::Dependencies => String::new(),
@@ -108,8 +109,8 @@ fn flag_for(table: &DependencyTable) -> String {
     }
 }
 
-/// The `lvpm <verb>` (`remove` or `uninstall`) that takes `name` out of `table`,
-/// on the target the user picked.
+/// The `lvpm <verb>` (`install` or `uninstall`) that puts `name` in `table` or
+/// takes it out, on the target the user picked.
 fn command_for(
     verb: &str,
     name: &str,
@@ -173,8 +174,8 @@ fn edit_line(edit: &ManifestEdit, table: &DependencyTable, dry_run: bool) -> Str
     }
 }
 
-/// What `lvpm add` and `lvpm remove` print when they fail: what happened, then
-/// the next thing to do. `rerun` is the command to run again, as "run {rerun}
+/// What a named `lvpm install` and `lvpm uninstall` in a project print when they
+/// fail: what happened, then the next thing to do. `rerun` is the command to run again, as "run {rerun}
 /// again" reads. `destination` is the destination flags the user gave, as typed
 /// with their values, for a suggested command that acts on the target. `table`
 /// and `index` are where the command saved the package and the source it pinned,
@@ -190,14 +191,8 @@ pub fn error(
         EditError::Lock(LockError::NeedsNewerLabview {
             name, project_year, ..
         }) => {
-            // The verb the user ran; `lvpm remove` and `lvpm uninstall` pick no version.
-            let verb = if rerun.contains("add") {
-                "add"
-            } else {
-                "install"
-            };
             let pin = index.map_or_else(String::new, |source| format!(" --index {source}"));
-            let pick = command_for(verb, &format!("{name}@<version>"), table, None);
+            let pick = command_for("install", &format!("{name}@<version>"), table, None);
             let command = on_the_target(format!("{pick}{pin}"), destination);
             format!(
                 "{error}\n\
@@ -226,8 +221,8 @@ pub fn error(
             "{error}\n\
              quote it, e.g. \"{name}@>=0.5\": an unquoted > sends the output to a file\n\
              the shell may have created a file named \"=0.5\" here; it can be deleted\n\
-             next: run `lvpm add \"{name}@>=0.5\"` with the constraint you mean, or \
-             `lvpm add {name}` for the newest version"
+             next: run `lvpm install \"{name}@>=0.5\"` with the constraint you mean, or \
+             `lvpm install {name}` for the newest version"
         ),
         EditError::NotADependency {
             name,
@@ -243,7 +238,7 @@ pub fn error(
         EditError::NotInGroup { name, group } => format!(
             "{error}\n\
              next: name a package that [dependency-groups.{group}] lists, or add it with `{}`",
-            on_the_target(format!("lvpm add {name} --group {group}"), destination)
+            on_the_target(format!("lvpm install {name} --group {group}"), destination)
         ),
         EditError::Required { roots, .. } => {
             // One command for each table that lists a root: `uninstall` takes
@@ -264,13 +259,7 @@ pub fn error(
             required(error, commands, None)
         }
         EditError::InOtherTable { name, found_in } => {
-            // The verb the user ran; `lvpm remove` stays `remove` until it is an alias.
-            let verb = if rerun.contains("uninstall") {
-                "uninstall"
-            } else {
-                "remove"
-            };
-            let hints = other_table_hints(verb, name, found_in, destination);
+            let hints = other_table_hints("uninstall", name, found_in, destination);
             format!("{error}\n{hints}")
         }
         EditError::Other(cause) => format!("{cause:#}"),
@@ -676,7 +665,7 @@ mod tests {
         });
         assert_eq!(
             in_group,
-            "beta is in [dependency-groups.ci]\nnext: use --group ci: `lvpm remove beta --group ci`"
+            "beta is in [dependency-groups.ci]\nnext: use --group ci: `lvpm uninstall beta --group ci`"
         );
         let in_several = written(&EditError::InOtherTable {
             name: "beta".into(),
@@ -689,9 +678,9 @@ mod tests {
         assert_eq!(
             in_several,
             "beta is in [dependencies], [dev-dependencies] and [dependency-groups.ci]\n\
-             next: `lvpm remove beta` removes it from [dependencies]\n\
-             next: `lvpm remove beta --dev` removes it from [dev-dependencies]\n\
-             next: `lvpm remove beta --group ci` removes it from [dependency-groups.ci]"
+             next: `lvpm uninstall beta` removes it from [dependencies]\n\
+             next: `lvpm uninstall beta --dev` removes it from [dev-dependencies]\n\
+             next: `lvpm uninstall beta --group ci` removes it from [dependency-groups.ci]"
         );
     }
 
@@ -705,14 +694,14 @@ mod tests {
             text,
             "beta is not in [dependency-groups.ci]\n\
              next: name a package that [dependency-groups.ci] lists, or add it with \
-             `lvpm add beta --group ci`"
+             `lvpm install beta --group ci`"
         );
     }
 
     fn written(error: &EditError) -> String {
         super::error(
             error,
-            "`lvpm add`",
+            "`lvpm install`",
             None,
             &DependencyTable::Dependencies,
             None,
@@ -720,7 +709,7 @@ mod tests {
     }
 
     fn written_on(error: &EditError, destination: Option<&str>) -> String {
-        written_for(error, "`lvpm remove`", destination)
+        written_for(error, "`lvpm uninstall`", destination)
     }
 
     fn written_for(error: &EditError, rerun: &str, destination: Option<&str>) -> String {
@@ -734,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn the_newer_labview_hint_is_the_command_the_user_ran_with_its_table_pin_and_destination() {
+    fn the_newer_labview_hint_is_an_install_with_its_table_pin_and_destination() {
         let error = EditError::Lock(LockError::NeedsNewerLabview {
             name: "omega".into(),
             version: "1.0".into(),
@@ -749,8 +738,19 @@ mod tests {
                 .to_string()
         };
         assert_eq!(
-            next("`lvpm add`", &DependencyTable::Dependencies, None, None),
-            "next: pick a version that runs on LabVIEW 2024 with `lvpm add omega@<version>`, \
+            next("`lvpm install`", &DependencyTable::Dependencies, None, None),
+            "next: pick a version that runs on LabVIEW 2024 with `lvpm install omega@<version>`, \
+             or raise labview in lvpm.toml"
+        );
+        // An uninstall picks no version, so the hint is the install that does.
+        assert_eq!(
+            next(
+                "`lvpm uninstall`",
+                &DependencyTable::Dependencies,
+                None,
+                None
+            ),
+            "next: pick a version that runs on LabVIEW 2024 with `lvpm install omega@<version>`, \
              or raise labview in lvpm.toml"
         );
         assert_eq!(
@@ -794,7 +794,7 @@ mod tests {
         });
         assert_eq!(
             in_dev,
-            "caraya is in [dev-dependencies]\nnext: use --dev: `lvpm remove caraya --dev`"
+            "caraya is in [dev-dependencies]\nnext: use --dev: `lvpm uninstall caraya --dev`"
         );
         let in_normal = written(&EditError::InOtherTable {
             name: "beta".into(),
@@ -802,7 +802,7 @@ mod tests {
         });
         assert_eq!(
             in_normal,
-            "beta is in [dependencies]\nnext: `lvpm remove beta` removes it from [dependencies]"
+            "beta is in [dependencies]\nnext: `lvpm uninstall beta` removes it from [dependencies]"
         );
     }
 
@@ -819,9 +819,9 @@ mod tests {
              next: use --dev: `lvpm uninstall caraya --dev --prefix dest`"
         );
         assert_eq!(
-            said("`lvpm remove`", Some("--labview-version 2026")),
+            said("`lvpm uninstall`", Some("--labview-version 2026")),
             "caraya is in [dev-dependencies]\n\
-             next: use --dev: `lvpm remove caraya --dev --labview-version 2026`"
+             next: use --dev: `lvpm uninstall caraya --dev --labview-version 2026`"
         );
         let in_normal = EditError::InOtherTable {
             name: "beta".into(),
@@ -851,7 +851,7 @@ mod tests {
             "sync stopped before it was done: disk full\n\
              not done:\n  install gamma 1.0\n\
              lvpm.toml and lvpm.lock were put back as they were\n\
-             next: fix what is wrong and run `lvpm add` again; `lvpm sync` puts the destination \
+             next: fix what is wrong and run `lvpm install` again; `lvpm sync` puts the destination \
              back in line with lvpm.lock"
         );
     }
@@ -903,13 +903,13 @@ mod tests {
         assert!(
             text.ends_with(
                 "\nnext: pin alpha to a source that lists it, or list it in that source, \
-                 then run `lvpm add` again"
+                 then run `lvpm install` again"
             ),
             "{text}"
         );
         assert!(!text.contains("index key"), "{text}");
         let text = written(&EditError::Lock(LockError::NoLabview));
-        assert!(text.ends_with("then run `lvpm add` again"), "{text}");
+        assert!(text.ends_with("then run `lvpm install` again"), "{text}");
         assert!(!text.contains("`lvpm lock`"), "{text}");
     }
 
@@ -918,7 +918,7 @@ mod tests {
         let text = written(&EditError::Cancelled);
         assert_eq!(
             text,
-            "cancelled; lvpm.toml and lvpm.lock are unchanged\nnext: run `lvpm add` again"
+            "cancelled; lvpm.toml and lvpm.lock are unchanged\nnext: run `lvpm install` again"
         );
     }
 
@@ -1027,7 +1027,7 @@ mod tests {
             Some("--prefix dest"),
         );
         assert!(
-            text.ends_with("or add it with `lvpm add beta --group ci --prefix dest`"),
+            text.ends_with("or add it with `lvpm install beta --group ci --prefix dest`"),
             "{text}"
         );
     }

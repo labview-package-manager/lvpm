@@ -568,6 +568,17 @@ In `s7c-pinned-sources.feature`, on its Background (`a project with labview "202
 **Files**: `src/main.rs`, `src/render/edit.rs`, `src/render/init.rs`, `tests/features/fork-adoption/54-install-uninstall.feature`, `tests/features/lvpm-lockfile/slice-13-lvpm-add-lvpm-remove-install-pkg-routing.feature`, `tests/features/lvpm-lockfile/slice-16-documentation-and-help-text.feature`, `tests/features/lvpm-tui/slice-3-json-and-the-exit-code-table.feature`, `tests/golden/json-add/stdout.txt`, `tests/golden/json-remove/stdout.txt`, `tests/steps/docs.rs`, `tests/steps/add_remove.rs`
 **Commit**: `feat(cli): add and remove are aliases of install and uninstall (#54)`
 
+**Built differently in Step 5.1** (decided while building; the scenarios and tests are the record):
+
+- `Cmd::Add`, `Cmd::Remove` and their arms are gone, and so are `cmd_add` and `cmd_remove`: `cmd_install_adds` calls `add_remove::add_announcing` itself, with `rerun` fixed at "`lvpm install`" (the `rerun` parameter of the fix before this step had one caller left). `Report::done("add")` and `("remove")` go with them: `lvpm --json add x` says `{"command": "install"}`.
+- Every hint says `install`/`uninstall`, as clap cannot tell an alias from its command: the newer-LabVIEW hint (also for an `uninstall`, which picks no version), the empty-constraint hint ("run `lvpm install \"x@>=0.5\"`"), the `NotInGroup` hint, the wrong-table hints (always `lvpm uninstall`, the `rerun.contains("uninstall")` test is gone), and the init hint "lvpm install puts packages in it" (s10a-lvpm-init.feature asserts it; not in the plan's file list). `remove_command` does not exist in `render/edit.rs`: nothing to delete.
+- The Install and Uninstall doc comments say the alias in their first sentence ("`add` is the same command", "`remove` is the same command") and clap adds `[alias: add]`. "a named install is `lvpm add`" would now be circular, so it reads "a named install adds the package to lvpm.toml, locks and syncs", and `tests/steps/docs.rs` checks those phrases; slice-16's feature text is unchanged ("named install is add" still reads true).
+- The twin step ("I run ..., and ... in an identical world") was wired to slice-13's world (ADD_PACKAGES, project on `beta`, a venv). It now repeats what built the world (`Setup` in add_remove.rs: the fixture packages, the project, each later "also depends on" or dev dependency), and makes a venv only when the world has one. `both manifests, locks, destinations and outputs are identical` compares stdout whole (no `skip(1)`, no line filter) and the `dest`, `other` and venv folders. Slice-13's `@labview` twin scenario uses the new step name; it was edited, not run (needs LabVIEW).
+- The Slice 5 scenarios name `--prefix dest` (`other` for the add twin), as the earlier slices do: the project has no venv. The aliases outline has a `package` column, since `caraya` is nothing to remove. "help lists the aliases" reads clap's `[alias: add]` on the item of the install line, which wraps.
+- Hand-edited, not re-recorded: `tests/golden/json-add` and `json-remove` gain the announce event (`install_adds_to_project` / `uninstall_removes_from_project`, `"destination": "--prefix"`, before `manifest_edited`) and say `install`/`uninstall`. Slice-3's rows run `add`/`remove` still (the alias) and expect the new results; their recordings keep the names `add` and `remove`.
+- Scenarios changed because the alias changes their text or behaviour: slice-13 `lock-editing commands outside a project are refused` (the `lvpm add gamma` and `lvpm remove beta` rows are gone: outside a project they install and uninstall directly, which "add outside a project installs directly" covers), slice-13 `install with a name in a project is add, and says so` (new twin step name only), slice-17 `remove from the wrong table lists every table holding it` (hints say `lvpm uninstall`), slice-3 rows `add beta` and `remove alpha` (result and recordings), s10a `an existing manifest` (init hint). Every other scenario that runs `lvpm add` or `lvpm remove` runs unchanged through the alias and passes, including slice-11's headless rows and s7c's `add --index` ones.
+- What users see: `lvpm add x` outside a project installs `x` into the destination (it used to fail "no lvpm.toml"); `lvpm remove x` outside a project, or with `--no-project`, uninstalls it directly; `lvpm add` and `lvpm remove` with no package are a bare `install` (a sync, in a project) and a bare `uninstall`; `add` takes `--no-project`, `--no-deps`, `--manifest`, `--allow-downgrade`; `add --group a --group b` says "a package goes into one group"; `remove` takes `--no-project`, `--keep-deps`, `--with-deps`, `--force`; `add` and `remove` now say what they do first ("adding x to lvpm.toml and syncing ...", "removing x from lvpm.toml ...", and the destination note); JSON streams carry the announce event and say `install`/`uninstall`.
+
 ### Slice 6: a write into LabVIEW itself needs --global
 
 **Depends-on:** 5
@@ -748,8 +759,8 @@ See each step.
   - [x] Step 3.1: Refuse the removal before anything is written
 - [x] Wave 4 / Slice 4: install saves into dev, a group or a source
   - [x] Step 4.1: --dev, --group and --index on a named install
-- [ ] Wave 5 / Slice 5: add and remove are aliases
-  - [ ] Step 5.1: Delete Cmd::Add and Cmd::Remove
+- [x] Wave 5 / Slice 5: add and remove are aliases
+  - [x] Step 5.1: Delete Cmd::Add and Cmd::Remove
 - [ ] Wave 6 / Slice 6: a write into LabVIEW itself needs --global
   - [ ] Step 6.1: --global decides a write into an installation
 - [ ] Wave 7 / Slice 7: docs and scenarios name install/uninstall

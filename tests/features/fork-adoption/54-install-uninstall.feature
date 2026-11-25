@@ -320,3 +320,38 @@ Feature: install and uninstall are the project commands
       | --group test         | --group           |
       | --index second       | --index           |
       | --dev --index second | --dev and --index |
+
+  # Slice 5: add and remove are the same commands as install and uninstall.
+  # Where they reach a destination they name one, as above.
+  Scenario: add does what install does
+    When I run "lvpm add caraya --dev --prefix other", and "lvpm install caraya --dev --prefix other" in an identical world
+    Then both manifests, locks, destinations and outputs are identical
+
+  Scenario: remove does what uninstall does
+    Given dev dependency "caraya" ">=1.0", locked and synced
+    When I run "lvpm remove caraya --dev --prefix dest", and "lvpm uninstall caraya --dev --prefix dest" in an identical world
+    Then both manifests, locks, destinations and outputs are identical
+
+  Scenario: add outside a project installs directly, as install does
+    Given a directory without lvpm.toml
+    When I run "lvpm add caraya --prefix dest"
+    Then dest includes "caraya" 1.0
+    And the working directory has no lvpm.toml
+
+  Scenario: remove takes uninstall's direct flags
+    When I run "lvpm remove alpha --no-project --prefix dest"
+    Then "alpha" is uninstalled from dest
+    And lvpm.toml and lvpm.lock are byte-identical to before
+
+  Scenario Outline: the aliases report the command they stand for
+    When I run "lvpm --json <alias> <package> --prefix dest"
+    Then the JSON result is {"command": "<command>"}
+
+    Examples:
+      | alias  | package | command   |
+      | add    | caraya  | install   |
+      | remove | alpha   | uninstall |
+
+  Scenario: help lists the aliases
+    When I run "lvpm --help"
+    Then the install line names alias "add" and the uninstall line names alias "remove"

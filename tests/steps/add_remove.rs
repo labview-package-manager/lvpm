@@ -46,7 +46,24 @@ pub struct AddRemoveState {
     failure: Option<EditError>,
     /// What routing an install request gave.
     routed: Option<Result<InstallMode, RouteError>>,
+    /// What built this world, for the twin of a scenario that compares two.
+    setup: Vec<Setup>,
     twin: Option<Twin>,
+}
+
+/// One step of building a world, which its twin repeats.
+#[derive(Debug)]
+enum Setup {
+    /// The fixture packages in the sandbox's local folder.
+    Packages(&'static [FixturePackage]),
+    /// The project, locked and synced into `dest`.
+    Project { name: String, constraint: String },
+    /// A dependency added to a table afterwards, locked and synced.
+    Also {
+        table: DependencyTable,
+        name: String,
+        constraint: String,
+    },
 }
 
 #[derive(Debug)]
@@ -167,6 +184,7 @@ async fn fixture_packages(world: &mut CliWorld) {
         "the feature and the fixture table disagree"
     );
     world.publish(&ADD_PACKAGES.iter().collect::<Vec<_>>());
+    world.add_remove.setup.push(Setup::Packages(ADD_PACKAGES));
 }
 
 #[given(
@@ -180,6 +198,10 @@ async fn install_fixture_packages(world: &mut CliWorld) {
         "the feature and the fixture table disagree"
     );
     world.publish(&INSTALL_PACKAGES.iter().collect::<Vec<_>>());
+    world
+        .add_remove
+        .setup
+        .push(Setup::Packages(INSTALL_PACKAGES));
 }
 
 #[given(
@@ -187,6 +209,10 @@ async fn install_fixture_packages(world: &mut CliWorld) {
 )]
 async fn the_project(world: &mut CliWorld, name: String, constraint: String) {
     set_up_project(&world.sandbox, &name, &constraint);
+    world
+        .add_remove
+        .setup
+        .push(Setup::Project { name, constraint });
     world.note_state();
 }
 
@@ -221,10 +247,20 @@ async fn every_version_needs_a_newer_labview(world: &mut CliWorld, name: String,
 
 #[given(regex = r#"^the project also depends on "([^"]+)" "([^"]*)", locked and synced$"#)]
 async fn the_project_also_depends_on(world: &mut CliWorld, name: String, constraint: String) {
-    world.depend(DependencyTable::Dependencies, &name, &constraint);
+    also_depend_on(world, DependencyTable::Dependencies, name, constraint);
+}
+
+/// The project depends on `name` in `table` too, locked and synced; a twin does the same.
+fn also_depend_on(world: &mut CliWorld, table: DependencyTable, name: String, constraint: String) {
+    world.depend(table.clone(), &name, &constraint);
     world.lock_the_project();
     world.sync_into_dest();
     world.note_state();
+    world.add_remove.setup.push(Setup::Also {
+        table,
+        name,
+        constraint,
+    });
 }
 
 #[given(regex = r#"^the project is also synced into scratch destination "([^"]+)"$"#)]
@@ -254,10 +290,7 @@ async fn a_dev_dependency_locked_and_synced(
     name: String,
     constraint: String,
 ) {
-    world.depend(DependencyTable::DevDependencies, &name, &constraint);
-    world.lock_the_project();
-    world.sync_into_dest();
-    world.note_state();
+    also_depend_on(world, DependencyTable::DevDependencies, name, constraint);
 }
 
 #[given(regex = r#"^dev dependency "([^"]+)" "([^"]*)"$"#)]
@@ -356,13 +389,28 @@ async fn run_inside_the_project(world: &mut CliWorld, command_line: String) {
 #[when(regex = r#"^I run "([^"]+)", and "([^"]+)" in an identical world$"#)]
 async fn run_in_two_worlds(world: &mut CliWorld, first: String, second: String) {
     let twin = Sandbox::new();
-    for package in ADD_PACKAGES {
-        twin.put_local_package(package);
+    for step in &world.add_remove.setup {
+        match step {
+            Setup::Packages(packages) => packages
+                .iter()
+                .for_each(|package| twin.put_local_package(package)),
+            Setup::Project { name, constraint } => set_up_project(&twin, name, constraint),
+            Setup::Also {
+                table,
+                name,
+                constraint,
+            } => {
+                crate::steps::lock::add_dependency(&twin, table.clone(), name, constraint);
+                twin.setup_lvpm(&["lock"]);
+                twin.setup_lvpm(&["sync", "--prefix", DEST_DIR]);
+            }
+        }
     }
-    set_up_project(&twin, "beta", ">=1.0");
-    twin.detect_labview();
-    twin.use_loopback_project_for_labview(LABVIEW_YEAR);
-    twin.setup_lvpm(&["venv", "create", "--labview-version", LABVIEW_YEAR]);
+    if world.sandbox.work_dir().join(VENV_DIR).exists() {
+        twin.detect_labview();
+        twin.use_loopback_project_for_labview(LABVIEW_YEAR);
+        twin.setup_lvpm(&["venv", "create", "--labview-version", LABVIEW_YEAR]);
+    }
     world.run(&first, None);
     let mut words = second.split_whitespace();
     assert_eq!(words.next(), Some("lvpm"), "{second}");
@@ -1004,20 +1052,13 @@ async fn the_output_says_it_is_an_add(world: &mut CliWorld, name: String) {
     );
 }
 
-/// `install` says it is an add, once the lock is made; what else it prints is
-/// `add`'s own output.
-#[then("both manifests, locks and destinations are identical")]
+/// `add` is `install` and `remove` is `uninstall`, so what each prints is the same.
+#[then("both manifests, locks, destinations and outputs are identical")]
 async fn both_worlds_are_identical(world: &mut CliWorld) {
     let twin = world.add_remove.twin.as_ref().expect("a second world");
     let (one, two) = (world.output(), &twin.output);
     assert_eq!(one.exit_code, two.exit_code, "{one:?}\n{two:?}");
-    let not_its_own =
-        |line: &&str| !(line.starts_with("adding ") || line.starts_with("note: in a project,"));
-    assert_eq!(
-        one.stdout.lines().filter(not_its_own).collect::<Vec<_>>(),
-        two.stdout.lines().collect::<Vec<_>>(),
-        "what they print besides install's own lines"
-    );
+    assert_eq!(one.stdout, two.stdout);
     assert_eq!(one.stderr, two.stderr);
     // Each world has a feed of its own, so its address is in both files.
     let text_of = |sandbox: &Sandbox, file: &str| {
@@ -1031,11 +1072,41 @@ async fn both_worlds_are_identical(world: &mut CliWorld) {
             "{file}"
         );
     }
-    assert_eq!(
-        world.sandbox.list_files(VENV_DIR),
-        twin.sandbox.list_files(VENV_DIR),
-        "the venvs"
-    );
+    for folder in [VENV_DIR, DEST_DIR, "other"] {
+        assert_eq!(
+            world.sandbox.list_files(folder),
+            twin.sandbox.list_files(folder),
+            "{folder}"
+        );
+    }
+}
+
+/// The help item of `command`: its line and the ones that continue it.
+fn help_item(help: &str, command: &str) -> String {
+    let mut lines = help.lines().skip_while(|line| {
+        line.strip_prefix("  ")
+            .and_then(|rest| rest.split_whitespace().next())
+            != Some(command)
+    });
+    let first = lines.next().unwrap_or_default();
+    let rest = lines.take_while(|line| line.starts_with("    "));
+    std::iter::once(first)
+        .chain(rest)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[then(
+    regex = r#"^the install line names alias "([^"]+)" and the uninstall line names alias "([^"]+)"$"#
+)]
+async fn help_names_the_aliases(world: &mut CliWorld, install: String, uninstall: String) {
+    world.assert_succeeded();
+    let help = world.output().stdout.clone();
+    for (command, alias) in [("install", install), ("uninstall", uninstall)] {
+        let item = help_item(&help, command);
+        let said = format!("[alias: {alias}]");
+        assert!(item.contains(&said), "{said} is not in {item:?}\n{help}");
+    }
 }
 
 // ---- dependency groups ----
