@@ -316,6 +316,7 @@ Modules are in `crates/lvpm-core/src/`, except `main.rs` and `render/` (in
 | `viserver.rs`                  | The VI Server TCP protocol: connection, methods, flattened data                                                         |
 | `version.rs`                   | Package version ordering: OGPT `version-release`, VIPM's four-part form; not semver                                     |
 | `crates/lvpm-core/src/lv-src/relink-package.vi` | The relink VI, shipped beside the executable (LabVIEW 2020)                                                            |
+| `crates/lvpm-core/src/lv-src/build-app.vi` | The `build --app` wrapper VI, shipped beside the executable (LabVIEW 2026)                                           |
 | `scripts/install.ps1`          | Download, verify and install the latest release                                                                         |
 
 Thank you for helping improve lvpm.

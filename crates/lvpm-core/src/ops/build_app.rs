@@ -254,11 +254,11 @@ pub fn build_ready(
     })
 }
 
-/// The wrapper VI, `build-app.vi`, shipped beside the executable as the relink
-/// VI is. It calls NI's `BuildTargetBuildSpecification.vi`, whose error
-/// cluster lvpm cannot read over VI Server, and flattens its answer into the
-/// controls and indicators below. Saved in LabVIEW 2026.
-const BUILD_VI_FILE: &str = "build-app.vi";
+// The wrapper VI, `build-app.vi` (relink::BUILD_APP_VI_FILE), shipped beside
+// the executable as the relink VI is. It calls NI's
+// `BuildTargetBuildSpecification.vi`, whose error cluster lvpm cannot read over
+// VI Server, and flattens its answer into the controls and indicators below.
+// Saved in LabVIEW 2026.
 
 /// The oldest LabVIEW that opens the wrapper VI: the one it was saved in.
 pub const MIN_LABVIEW_YEAR: u32 = 2026;
@@ -303,10 +303,7 @@ impl AppLauncher for VenvAppLauncher {
 
 /// Copy the shipped wrapper VI into `dir`, as the relink VI is.
 fn materialize(dir: &Path) -> anyhow::Result<PathBuf> {
-    let bytes = relink::shipped_vi(
-        &relink::shipped_vi_candidates(BUILD_VI_FILE),
-        env!("LVPM_BUILD_APP_VI_MD5"),
-    )?;
+    let bytes = relink::shipped_vi(relink::BUILD_APP_VI_FILE)?;
     relink::materialize_vi(dir, "lvpm-build-app", &bytes)
 }
 

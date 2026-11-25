@@ -8,7 +8,7 @@ LabVIEW Linux images (see
 
 [scripts/install.ps1](https://github.com/ThatsTheEnd/lvpm/blob/main/scripts/install.ps1) fetches the latest release,
 verifies the zip's SHA-256 against the digest GitHub records for it (and
-against a `SHA256SUMS` file when a release ships one), extracts `lvpm.exe`
+against a `SHA256SUMS` file when a release ships one), extracts `lvpm.exe` and the VIs it ships beside it
 to `%LOCALAPPDATA%\lvpm\bin`, removes Windows' mark-of-the-web from the
 files and adds the folder to your user `PATH`. It runs nothing it downloaded
 except `lvpm --version` at the end. Read it first; it is short.
@@ -56,7 +56,9 @@ tar -xzf lvpm-x86_64-unknown-linux-gnu.tar.gz
 Releases up to v0.27.0 name it `lvpm-<version>-linux-x64.tar.gz`, with the
 checksum in `SHA256SUMS` and `lvpm` at the archive's top level.
 
-Move `lvpm` to a folder on your `PATH`, for example `~/.local/bin`.
+Keep `lvpm`, `relink-package.vi` and `build-app.vi` together: relink and
+`build --app` look for the VIs beside `lvpm`. Move all three to a folder on
+your `PATH`, for example `~/.local/bin`, or symlink `lvpm` there.
 
 ## From source
 

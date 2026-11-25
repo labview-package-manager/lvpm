@@ -131,6 +131,7 @@ pub(super) fn relink_in_destination(
 /// VI Server on `port` — the target's own, or one started on a venv. Making it
 /// answer is the caller's job; this only talks to it.
 ///
+/// `vi` is the relink VI `relink::locate_vi` copied into the work folder.
 /// One LabVIEW session for the whole run: the relink VI is loaded once, and
 /// each folder is a fresh call into it. A folder that fails is reported and the
 /// rest still run — the alternative is that one bad package leaves the others
