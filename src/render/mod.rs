@@ -92,6 +92,7 @@ impl Renderer {
             | Event::NothingToRelink { .. } => relink::render(self, event),
             Event::ManifestInUse { .. }
             | Event::LabviewBareYear { .. }
+            | Event::OldFormGroup { .. }
             | Event::PalettesMerged { .. }
             | Event::VipmManifestConverted { .. }
             | Event::InstallTarget { .. }

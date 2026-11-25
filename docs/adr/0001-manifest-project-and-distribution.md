@@ -17,6 +17,13 @@ Amended on 2026-11-23 (labview-package-manager/lvpm#44): a bare
 names that form, instead of being an error, so a 0.3 manifest keeps working.
 `package.toml` in a `.lvpkg` still refuses it.
 
+Amended on 2026-11-24 (labview-package-manager/lvpm#45): decision 7 still
+writes groups as `[dependency-groups.<name>]`, but lvpm 0.3's
+`[dependencies.<name>]` (a table with none of a line's keys) is read as that
+group, and `[dependencies.dev]` as `[dev-dependencies]`, with a warning that
+names the header to write. An edit to a group in the old form is refused
+until the header is renamed.
+
 ## Context
 
 S1 adds `lvpm build`, so `lvpm.toml` needs keys that describe a package. The

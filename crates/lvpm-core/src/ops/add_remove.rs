@@ -48,6 +48,7 @@ pub fn add(
 ) -> Result<(), EditError> {
     let request = Request::parse(spec, source_pin)?;
     let prepared = Prepared::of(env)?;
+    project::refuse_old_form_edit(&prepared.found.1, &table, &request.name)?;
     let dest = env.destination()?;
     announce_project(env, &prepared, &dest);
 
@@ -84,6 +85,7 @@ pub fn remove(
     options: &InstallOptions,
 ) -> Result<(), EditError> {
     let prepared = Prepared::of(env)?;
+    project::refuse_old_form_edit(&prepared.found.1, &table, name)?;
     if let DependencyTable::Group(group) = &table {
         refuse_unknown_groups(&prepared.found.1, std::slice::from_ref(group))?;
     }

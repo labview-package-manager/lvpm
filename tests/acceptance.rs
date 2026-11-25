@@ -88,6 +88,7 @@ const FEATURE_FILES: &[&str] = &[
     "tests/features/lvpm-min-release-age/slice-1-versions-younger-than-the-limit-are-held-back.feature",
     "tests/features/lvpm-min-release-age/slice-2-report-held-back-versions-and-the-docs.feature",
     "tests/features/fork-adoption/44-bare-labview-year.feature",
+    "tests/features/fork-adoption/45-old-dependency-groups.feature",
     "tests/features/fork-adoption/47-sync-into-a-folder.feature",
 ];
 const TEST_LABVIEW_ENV_VAR: &str = "LVPM_TEST_LABVIEW";

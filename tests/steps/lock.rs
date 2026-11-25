@@ -548,6 +548,36 @@ async fn no_warning_names_labview(world: &mut CliWorld) {
     assert_eq!(labview_warnings(world), Vec::<String>::new());
 }
 
+/// The warning lines of stderr that name a group table.
+fn group_warnings(world: &CliWorld) -> Vec<String> {
+    let stderr = &world.output().stderr;
+    let warnings = stderr.lines().filter(|l| l.starts_with("warning:"));
+    warnings
+        .filter(|l| l.contains("[dependencies.") || l.contains("[dependency-groups."))
+        .map(String::from)
+        .collect()
+}
+
+#[then(
+    regex = r"^one warning names (\[dev-dependencies\]|\[dependency-groups\.[\w-]+\]) as the form to write$"
+)]
+async fn one_warning_names_the_group_form(world: &mut CliWorld, form: String) {
+    let tail = format!("write {form}");
+    let naming = group_warnings(world)
+        .into_iter()
+        .filter(|w| w.ends_with(&tail));
+    assert!(
+        naming.count() == 1,
+        "{form:?} not in exactly one warning of:\n{}",
+        world.printed()
+    );
+}
+
+#[then("no warning names a group")]
+async fn no_warning_names_a_group(world: &mut CliWorld) {
+    assert_eq!(group_warnings(world), Vec::<String>::new());
+}
+
 #[then(regex = r"^the command fails with: (.+)$")]
 async fn the_command_fails_with(world: &mut CliWorld, text: String) {
     world.assert_failed();
