@@ -554,7 +554,9 @@ mod tests {
     fn a_version_that_is_no_year_is_not_reported_and_the_packages_still_read() {
         let package = chosen("demo_lib-1.0.0.1");
         let no_version = config_xml("", &package).replace("<Version></Version>", "");
+        assert!(!no_version.contains("<Version>"));
         let versions = [
+            "",
             "thirteen",
             "13.0.1",
             "v13.0",
@@ -573,6 +575,7 @@ mod tests {
             let vipc = read_xml("no-year", &xml).unwrap();
             assert_eq!(vipc.labview_year, None, "for {xml}");
             assert_eq!(vipc.packages[0].name, "demo_lib", "for {xml}");
+            assert_eq!(vipc.seed().source_labview, None, "for {xml}");
         }
     }
 
