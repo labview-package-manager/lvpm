@@ -873,7 +873,8 @@ linkfix alone prepares the files and no LabVIEW starts. Ask for the resave when
 a VI saved in an older LabVIEW loads broken from an add-on folder after
 linkfix. Every venv install unpacks each package into `.lv-venv.staging/`
 beside the venv and then moves it into place; with `--resave` the package is
-resaved there first. Linkfix still runs afterwards.
+resaved there first. Linkfix still runs afterwards, unless `--relink` replaces
+it.
 
 ```console
 starting the venv's LabVIEW for the resave (about a minute per package)
@@ -887,7 +888,7 @@ resave (2/2) oglib_string ... already saved in LabVIEW 2026, skipped
 - `--resave` and `--relink` are separate: the relink pass is off unless
   `--relink` is given. `--dry-run --resave` lists the packages with VIs it
   may resave, including ones the version check will skip, and starts no
-  LabVIEW. `sync` and `add` take `--resave` too; the TUI never resaves.
+  LabVIEW. `sync`, `add` and `remove` take `--resave` too; the TUI never resaves.
 - A failed resave is a warning, not an error: the package is still
   installed and the exit code stays 0. The warning names the package and its
   folder. Reinstall the package; if it fails again, run `lvpm launch` and

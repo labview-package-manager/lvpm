@@ -295,7 +295,7 @@ pub enum Event {
         total: usize,
     },
     /// A dry run's packages with LabVIEW files, which a venv install with
-    /// `--resave` resaves.
+    /// `--resave` may resave. The version check can still skip some.
     ResavePlanned { packages: Vec<String> },
 
     // ---- ops::linkfix ----

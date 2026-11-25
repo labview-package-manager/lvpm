@@ -134,7 +134,8 @@ struct ApplyArgs {
     force_relink: bool,
     /// Venv installs: open and save each package in the venv's LabVIEW
     /// before it lands, for packages with files saved in an older LabVIEW.
-    /// Takes about a minute per package. Linkfix still runs.
+    /// Takes about a minute per package. Linkfix still runs, unless
+    /// --relink replaces it.
     #[arg(long)]
     resave: bool,
     /// Run every package's install hooks for this command. They are package
@@ -2167,9 +2168,11 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(resave(&["lvpm", "install", "x", "--resave"]));
-        assert!(resave(&["lvpm", "sync", "--resave", "--relink"]));
+        assert!(resave(&["lvpm", "sync", "--resave"]));
         assert!(resave(&["lvpm", "add", "x", "--resave"]));
         assert!(!resave(&["lvpm", "install", "x"]));
+        assert!(!resave(&["lvpm", "sync"]));
+        assert!(!resave(&["lvpm", "add", "x"]));
     }
 
     #[test]
