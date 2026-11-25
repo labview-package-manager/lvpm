@@ -24,6 +24,9 @@ toml = { version = "1.1.5", features = ["preserve_order"] }
 toml_edit = "0.25.17"
 zip = "9.5.1"
 
+[build-dependencies]
+md-5 = "0.11.0"
+
 [target."cfg(windows)".dependencies]
 mslnk = "0.1.8"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }

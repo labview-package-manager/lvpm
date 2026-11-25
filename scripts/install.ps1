@@ -5,7 +5,8 @@
 
 .DESCRIPTION
     Resolves the latest release of lvpm on GitHub, downloads the Windows x64
-    zip over HTTPS, verifies its SHA-256, and installs lvpm.exe.
+    zip over HTTPS, verifies its SHA-256, and installs lvpm.exe with the VIs it ships beside
+    it (relink-package.vi, build-app.vi).
 
     The download is verified against every reference available before
     anything is extracted:
@@ -29,7 +30,7 @@
     pre-releases count, because lvpm is still in alpha.
 
 .PARAMETER InstallDir
-    Where lvpm.exe goes. Default: %LOCALAPPDATA%\lvpm\bin
+    Where lvpm.exe and its VIs go. Default: %LOCALAPPDATA%\lvpm\bin
 
 .PARAMETER Sha256
     Expected SHA-256 of the zip, obtained out of band (release notes, the
@@ -109,6 +110,10 @@ if ($BuildLocal) {
         $payload = Join-Path $bundle 'payload'
         New-Item -ItemType Directory -Path $payload | Out-Null
         Copy-Item -LiteralPath $binary -Destination $payload
+        $viDir = Join-Path (Split-Path $manifest -Parent) 'crates\lvpm-core\src\lv-src'
+        foreach ($vi in @('relink-package.vi', 'build-app.vi')) {
+            Copy-Item -LiteralPath (Join-Path $viDir $vi) -Destination $payload
+        }
         foreach ($name in @('README.md', 'LICENSE-MIT', 'LICENSE-APACHE')) {
             Copy-Item -LiteralPath (Join-Path (Split-Path $manifest -Parent) $name) -Destination $payload
         }

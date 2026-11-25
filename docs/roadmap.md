@@ -243,7 +243,7 @@ Run a project's LabVIEW build specifications (EXE, packed library, LLB,
 source distribution, zip, installer) the way `install` runs a relink: through
 VI Server, headless where wanted, against the project's own dependencies.
 
-- **A standard or custom `Build.vi`.** The standard one is embedded in the
+- **A standard or custom `Build.vi`.** The standard one ships beside the
   binary, like the relink VI: it opens the `.lvproj`, runs the named build
   specs and reports each step. A project can name its own `Build.vi`
   instead. No LabVIEWCLI: lvpm drives LabVIEW over its own VI Server client.
@@ -322,7 +322,7 @@ workflow is the work.
   relinked, `lvpm list` shows every package `relinked`. This is the test of
   the VI Server client against a headless LabVIEW: the handshake retry
   (error 63 for the first ~8 s after the port opens), `Relink Package.vi`
-  materialising from the binary, load/save over the wire — and, with an
+  copied from beside the binary, load/save over the wire — and, with an
   explicit `lvpm refresh --labview-version 2026` afterwards, the palette
   and menu rebuild that headless mode otherwise skips. About ten minutes; the slow
   step is Caraya's 358 s folder, so a smaller package set would do for a

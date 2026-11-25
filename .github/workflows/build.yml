@@ -52,6 +52,11 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --locked
         shell: bash
+      # lvpm looks for its VIs beside itself, so they travel together, as in a
+      # release (dist-workspace.toml).
+      - name: Put the VIs beside the executable
+        run: cp crates/lvpm-core/src/lv-src/relink-package.vi crates/lvpm-core/src/lv-src/build-app.vi target/release/
+        shell: bash
       - name: Check the binary runs and reports the workspace version
         run: |
           want=$(bash ci/version-check.sh --print-version)
@@ -64,13 +69,16 @@ jobs:
         shell: pwsh
         run: |
           $zip = Join-Path $env:RUNNER_TEMP 'lvpm-x86_64-pc-windows-msvc.zip'
-          Compress-Archive target/release/lvpm.exe $zip
+          Compress-Archive target/release/lvpm.exe, target/release/relink-package.vi, target/release/build-app.vi $zip
           $prefix = Join-Path $env:RUNNER_TEMP 'lvpm-install'
           ./scripts/install.ps1 -Archive $zip -Sha256 (Get-FileHash $zip).Hash -InstallDir $prefix -NoPath
       - uses: actions/upload-artifact@v4
         with:
           name: lvpm-${{ matrix.os }}
-          path: target/release/${{ matrix.bin }}
+          path: |
+            target/release/${{ matrix.bin }}
+            target/release/relink-package.vi
+            target/release/build-app.vi
           if-no-files-found: error
           retention-days: 7
           overwrite: true
@@ -99,6 +107,7 @@ jobs:
             C:/src/lvpm/target/debug/lvpm.exe
             C:/src/lvpm/target/acceptance.exe
             C:/src/lvpm/tests
+            C:/src/lvpm/crates/lvpm-core/src/lv-src
           if-no-files-found: error
           retention-days: 7
           overwrite: true

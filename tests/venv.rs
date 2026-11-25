@@ -164,8 +164,13 @@ impl Lab {
 
     /// `run_in`, with `LVPM_FAKE_LABVIEW` set to `fake`.
     fn run_with_fake(&self, dir: &Path, fake: &str, args: &[&str]) -> Run {
+        self.run_program(Path::new(env!("CARGO_BIN_EXE_lvpm")), dir, fake, args)
+    }
+
+    /// `run_with_fake`, with the lvpm executable at `program`.
+    fn run_program(&self, program: &Path, dir: &Path, fake: &str, args: &[&str]) -> Run {
         let home = self.root.join("home");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_lvpm"));
+        let mut cmd = Command::new(program);
         // The developer's own lvpm settings stay out of the test.
         for (key, _) in std::env::vars_os() {
             // Config reads LVPM_CONFIG_<KEY>, else lvpm_config_<key>.
@@ -742,6 +747,45 @@ fn an_unreadable_record_of_another_package_does_not_stop_an_install() {
     has(&lab.fails(&["list"]), "dependency list required");
 }
 
+/// #49: with a relink-package.vi from another build beside lvpm, `relink --all`
+/// fails naming that VI's path and the build lvpm expects, before any LabVIEW
+/// starts (the fake one cannot).
+#[test]
+fn relink_refuses_a_relink_vi_from_another_build_beside_lvpm() {
+    use md5::{Digest, Md5};
+    let lab = Lab::new("stale-relink-vi");
+    lab.package_with(
+        "lib",
+        "1.0.0.1",
+        "",
+        "[File Group 1]\nTarget Dir=\"<vi.lib>/lib\"\nReplace Mode=\"Always\"\nNum Files=1\nFile 0=\"lib.vi\"\n",
+        &[("File Group 1/lib.vi", b"not really a vi")],
+    );
+    lab.write_manifest("[dependencies]\nlib = \"1.0.0.1\"\n");
+    lab.ok(&["venv", "create"]);
+    lab.ok(&["install"]);
+
+    // A release layout: lvpm with its VI beside it, here one from another build.
+    let bin = lab.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let lvpm = bin.join(Path::new(env!("CARGO_BIN_EXE_lvpm")).file_name().unwrap());
+    std::fs::copy(env!("CARGO_BIN_EXE_lvpm"), &lvpm).unwrap();
+    let stale = bin.join("relink-package.vi");
+    std::fs::write(&stale, b"a relink VI from another build").unwrap();
+
+    let fake = format!("99.0,64,{}", lab.root.join("labview").display());
+    let r = lab.run_program(&lvpm, &lab.project(), &fake, &["relink", "--all"]);
+    assert!(!r.ok, "relink --all succeeded:\n{}", r.text);
+    let expected: String =
+        Md5::digest(std::fs::read("crates/lvpm-core/src/lv-src/relink-package.vi").unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+    has(&r.stderr, &stale.display().to_string());
+    has(&r.stderr, "is from another lvpm build");
+    has(&r.stderr, &format!("needs the one with md5 {expected}"));
+}
+
 #[test]
 #[ignore = "#50"]
 fn launch_checks_the_venv_against_the_manifest_before_starting_anything() {
@@ -914,14 +958,15 @@ fn import_writes_vipm_files_into_the_manifest_and_adopts_an_old_venv() {
 }
 
 #[test]
-#[ignore = "#48"]
+// Upstream's test, on the fork's rules: a group here is
+// `[dependency-groups.<name>]`, so a group named like a package is no failure,
+// and a name with no version refuses the file instead of being set aside.
 fn a_vipc_carries_its_packages_into_the_cache_and_a_failed_import_writes_nothing() {
     let lab = Lab::new("vipc");
-    lab.write_manifest("[dependencies]\nbundled = \"*\"\n");
+    lab.write_manifest("[dependencies]\n");
     lab.ok(&["venv", "create"]);
 
-    // A .vipc carrying one package the local folder does not have, and
-    // naming one with no version.
+    // A package the local folder does not have, for a .vipc to carry.
     let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default();
     inner.start_file("spec", options).unwrap();
@@ -936,35 +981,45 @@ fn a_vipc_carries_its_packages_into_the_cache_and_a_failed_import_writes_nothing
         .unwrap();
     inner.write_all(b"carried 3.0.0.1\n").unwrap();
     let carried = inner.finish().unwrap().into_inner();
-    let config = "<VI_Package_Configuration File_Type=\"xml\" Version=\"0.6\" Creator=\"x\">\r\n  <Target>\r\n    \
-                  <Name>LabVIEW</Name>\r\n    <Version>99.0 (64-bit)</Version>\r\n    \
-                  <Package>\r\n      <Name>carried-3.0.0.1</Name>\r\n      <Included>true</Included>\r\n    </Package>\r\n    \
-                  <Package>\r\n      <Name>mystery</Name>\r\n      <Included>false</Included>\r\n    </Package>\r\n  \
-                  </Target>\r\n</VI_Package_Configuration>";
-    let vipc = lab.root.join("deps.vipc");
-    let mut z = zip::ZipWriter::new(std::fs::File::create(&vipc).unwrap());
-    z.start_file("config.xml", options).unwrap();
-    z.write_all(config.as_bytes()).unwrap();
-    z.start_file("carried-3.0.0.1.vip", options).unwrap();
-    z.write_all(&carried).unwrap();
-    z.finish().unwrap();
-    let vipc = vipc.display().to_string();
+    let package_xml = |name: &str, included: bool| {
+        format!(
+            "    <Package>\r\n      <Name>{name}</Name>\r\n      <Included>{included}</Included>\r\n      \
+             <Dependency>false</Dependency>\r\n      <Pinned>false</Pinned>\r\n    </Package>\r\n"
+        )
+    };
+    // The target as VIPM writes it, with the bitness.
+    let write_vipc = |file: &str, packages: &str| {
+        let config = format!(
+            "<VI_Package_Configuration File_Type=\"xml\" Version=\"0.6\" Creator=\"x\">\r\n  <Target>\r\n    \
+             <Name>LabVIEW</Name>\r\n    <Version>99.0 (64-bit)</Version>\r\n{packages}  \
+             </Target>\r\n</VI_Package_Configuration>"
+        );
+        let vipc = lab.root.join(file);
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&vipc).unwrap());
+        z.start_file("config.xml", options).unwrap();
+        z.write_all(config.as_bytes()).unwrap();
+        z.start_file("carried-3.0.0.1.vip", options).unwrap();
+        z.write_all(&carried).unwrap();
+        z.finish().unwrap();
+        vipc.display().to_string()
+    };
 
-    // `bundled` is a package already, so it cannot also be a group: the
-    // import fails, and the manifest is as it was.
+    // A name with no version fails the import, and the manifest is as it was.
+    let bad_vipc = write_vipc(
+        "bad.vipc",
+        &(package_xml("carried-3.0.0.1", true) + &package_xml("mystery", false)),
+    );
     let before = lab.manifest();
     has(
-        &lab.fails(&["import", &vipc, "--group", "bundled"]),
-        "cannot also be a group",
+        &lab.fails(&["import", &bad_vipc]),
+        "package mystery: no version (expected name-version)",
     );
     assert_eq!(lab.manifest(), before);
 
-    let imported = lab.ok(&["import", &vipc]);
-    has(
-        &imported,
-        "\"mystery\" in config.xml has no version in its name; not imported",
-    );
-    has(&imported, "saved carried = \"3.0.0.1\"");
+    let good_vipc = write_vipc("deps.vipc", &package_xml("carried-3.0.0.1", true));
+    let imported = lab.ok(&["import", &good_vipc]);
+    has(&imported, "imported carried 3.0.0.1");
+    has(&imported, "saved carried = \">=3.0.0.1\"");
     // Installed from the cache: no index has it.
     has(&lab.ok(&["install", "carried"]), "+ carried 3.0.0.1");
     has(

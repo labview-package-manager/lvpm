@@ -47,8 +47,9 @@ A package whose VIs only LabVIEW can repair can be marked `relink = true` in
 the manifest; it is then relinked after linkfix
 ([manifest](https://github.com/ThatsTheEnd/lvpm/blob/main/docs/manifest.md#relinking-a-package-in-labview)).
 
-With `--relink`, a small relink VI, embedded in `lvpm.exe` and written to
-`%TEMP%` when needed, is driven over every installed package folder through
+With `--relink`, a small relink VI, shipped beside `lvpm.exe` as
+`relink-package.vi` and copied to lvpm's work folder (`%TEMP%` on Windows, the
+cache on Linux) when needed, is driven over every installed package folder through
 VI Server. It loads each VI, lets LabVIEW resolve the links, saves, and
 reports the files it actually rewrote. The VI is saved for LabVIEW 2020, so
 any LabVIEW from 2020 on can load it.

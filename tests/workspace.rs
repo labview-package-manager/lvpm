@@ -246,3 +246,32 @@ fn both_binaries_report_one_version() {
         "{tui:?}"
     );
 }
+
+/// #49: the release archive and the MSI carry relink-package.vi and
+/// build-app.vi beside lvpm, and lvpm itself holds no copy of either: an exe
+/// that writes a blob out was what Microsoft Defender flagged.
+#[test]
+fn the_vis_ship_beside_lvpm_and_not_inside_it() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap();
+    let (dist, wix) = (read("dist-workspace.toml"), read("wix/main.wxs"));
+    let lvpm = std::fs::read(env!("CARGO_BIN_EXE_lvpm")).unwrap();
+    for vi in ["relink-package.vi", "build-app.vi"] {
+        let source = format!("crates/lvpm-core/src/lv-src/{vi}");
+        assert!(
+            dist.contains(&format!("\"{source}\"")),
+            "dist include lacks {vi}"
+        );
+        assert!(
+            wix.contains(&format!("Name='{vi}'"))
+                && wix.contains(&format!("Source='{}'", source.replace('/', "\\"))),
+            "wix/main.wxs lacks {vi}"
+        );
+        let bytes = std::fs::read(root.join(&source)).unwrap();
+        let window = &bytes[bytes.len() / 2..bytes.len() / 2 + 64];
+        assert!(
+            !lvpm.windows(window.len()).any(|w| w == window),
+            "lvpm holds a copy of {vi}"
+        );
+    }
+}
