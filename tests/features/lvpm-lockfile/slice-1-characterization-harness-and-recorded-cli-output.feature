@@ -30,7 +30,7 @@ Feature: The current CLI's output is recorded so later changes can be compared a
       | a project using only the loopback feed           | lvpm install hooked --no-project --prefix dest         | dest  | install-hooked           |
       | beta installed in dest                           | lvpm list --prefix dest                                | -     | list-beta                |
       | an empty dest                                    | lvpm list --prefix dest                                | -     | list-empty               |
-      | beta installed in dest                           | lvpm uninstall beta --keep-deps --prefix dest          | dest  | uninstall-beta           |
+      | beta installed in dest                           | lvpm uninstall beta --no-project --keep-deps --prefix dest | dest  | uninstall-beta           |
       | an empty dest                                    | lvpm uninstall beta --prefix dest                      | dest  | uninstall-missing        |
       | a project using only the loopback feed           | lvpm install does_not_exist --no-project --prefix dest | dest  | install-missing          |
       | no project                                       | lvpm list --labview-version 2026 --prefix dest         | -     | flags-conflict           |

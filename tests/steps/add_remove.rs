@@ -227,6 +227,27 @@ async fn the_project_also_depends_on(world: &mut CliWorld, name: String, constra
     world.note_state();
 }
 
+#[given(regex = r#"^the project is also synced into scratch destination "([^"]+)"$"#)]
+async fn the_project_is_also_synced_into(world: &mut CliWorld, folder: String) {
+    world.sandbox.setup_lvpm(&["sync", "--prefix", &folder]);
+    world.note_state();
+}
+
+/// `"caraya" 1.0 is installed in dest with "lvpm install caraya --no-project --prefix dest"`
+#[given(regex = r#"^"([^"]+)" (\S+) is installed in dest with "lvpm ([^"]+)"$"#)]
+async fn installed_in_dest_with(
+    world: &mut CliWorld,
+    name: String,
+    version: String,
+    arguments: String,
+) {
+    let arguments: Vec<&str> = arguments.split_whitespace().collect();
+    world.sandbox.setup_lvpm(&arguments);
+    let pair = (name, version);
+    assert!(world.installed().contains(&pair), "{pair:?} is not in dest");
+    world.note_state();
+}
+
 #[given(regex = r#"^dev dependency "([^"]+)" "([^"]*)", locked and synced$"#)]
 async fn a_dev_dependency_locked_and_synced(
     world: &mut CliWorld,
@@ -505,6 +526,16 @@ async fn dest_does_not_include(world: &mut CliWorld, name: String) {
     assert!(!world.is_installed(&name), "{name} is installed in dest");
 }
 
+#[then(regex = r#"^(dest|"[^"]+") still includes "([^"]+)" (\S+)$"#)]
+async fn a_folder_still_includes(
+    world: &mut CliWorld,
+    folder: String,
+    name: String,
+    version: String,
+) {
+    a_folder_includes(world, folder, name, version).await;
+}
+
 #[then(regex = r#"^the output says "([^"]+)" and names "([^"]+)"$"#)]
 async fn the_output_says_and_names(world: &mut CliWorld, said: String, named: String) {
     world.assert_succeeded();
@@ -657,6 +688,38 @@ async fn gone_from_everywhere(world: &mut CliWorld, name: String) {
     assert!(!world.is_installed(&name), "{name} is still installed");
 }
 
+#[then(regex = r#"^"([^"]+)" is gone from lvpm\.toml, lvpm\.lock and ("[^"]+")$"#)]
+async fn gone_from_the_manifest_the_lock_and_a_folder(
+    world: &mut CliWorld,
+    name: String,
+    folder: String,
+) {
+    gone_from_the_manifest(world, name.clone()).await;
+    assert!(!world.is_locked(&name), "{name} is still locked");
+    let installed = world.installed_at(&folder_named(world, &folder));
+    assert!(
+        installed.iter().all(|(entry, _)| *entry != name),
+        "{name} is still in {folder}: {installed:?}"
+    );
+}
+
+#[then(regex = r#"^"([^"]+)" is gone from lvpm\.lock and dest$"#)]
+async fn gone_from_the_lock_and_dest(world: &mut CliWorld, name: String) {
+    world.assert_succeeded();
+    assert!(!world.is_locked(&name), "{name} is still locked");
+    assert!(!world.is_installed(&name), "{name} is still installed");
+}
+
+#[then(regex = r#"^"([^"]+)" is gone from \[dev-dependencies\]$"#)]
+async fn gone_from_the_dev_table(world: &mut CliWorld, name: String) {
+    world.assert_succeeded();
+    let entries = entries_of(&world.manifest_text(), "dev-dependencies");
+    assert!(
+        entries.iter().all(|(entry, _)| *entry != name),
+        "{entries:?}"
+    );
+}
+
 #[then(regex = r#"^"([^"]+)" is gone from \[dev-dependencies\], lvpm\.lock and dest$"#)]
 async fn gone_from_the_dev_table_the_lock_and_dest(world: &mut CliWorld, name: String) {
     world.assert_succeeded();
@@ -782,15 +845,12 @@ async fn fails_pointing_to_dev(world: &mut CliWorld, name: String) {
     assert!(printed.contains("use --dev"), "{printed}");
 }
 
-#[then(regex = r#"^the command fails saying "([^"]+)" is not in lvpm\.toml$"#)]
-async fn fails_saying_it_is_not_a_dependency(world: &mut CliWorld, name: String) {
+#[then(regex = r#"^the command fails saying "([^"]+)" is in (\[[^\]]+\])$"#)]
+async fn fails_saying_it_is_in_another_table(world: &mut CliWorld, name: String, table: String) {
     world.assert_failed();
-    let said = format!("{name} is not in lvpm.toml");
-    assert!(
-        world.printed().contains(&said),
-        "{said:?} is not in:\n{}",
-        world.printed()
-    );
+    let said = format!("{name} is in {table}");
+    let printed = printed_plain(world);
+    assert!(printed.contains(&said), "{said:?} is not in:\n{printed}");
 }
 
 /// `flag` is the option's name: what follows it on the command line (the
@@ -819,6 +879,26 @@ async fn the_next_line_names(world: &mut CliWorld, flag: String) {
         .collect();
     assert_eq!(next.len(), 1, "one next line in:\n{printed}");
     assert!(next[0].contains(&flag), "{flag:?} is not in: {}", next[0]);
+}
+
+#[then("the error's next line says to check the name")]
+async fn the_next_line_says_to_check_the_name(world: &mut CliWorld) {
+    world.assert_failed();
+    let printed = printed_plain(world);
+    let next: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.starts_with("next: "))
+        .collect();
+    assert_eq!(next.len(), 1, "one next line in:\n{printed}");
+    assert!(next[0].contains("check the name"), "{}", next[0]);
+}
+
+#[then(regex = r#"^the error does not mention "([^"]+)"$"#)]
+async fn the_error_does_not_mention(world: &mut CliWorld, said: String) {
+    world.assert_failed();
+    // Stderr only: a destination flag makes stdout say what --no-project is for.
+    let error = world.output().stderr.clone();
+    assert!(!error.contains(&said), "{said:?} is in:\n{error}");
 }
 
 #[then(regex = r#"^the command fails saying "([^"]+)" is in no configured source$"#)]
@@ -853,6 +933,11 @@ async fn installed_where_it_was_sent(world: &mut CliWorld, name: String) {
 async fn uninstalled(world: &mut CliWorld, name: String) {
     world.assert_succeeded();
     assert!(!world.is_installed(&name), "{name} is still installed");
+}
+
+#[then(regex = r#"^"([^"]+)" is uninstalled from dest$"#)]
+async fn uninstalled_from_dest(world: &mut CliWorld, name: String) {
+    uninstalled(world, name).await;
 }
 
 #[then(

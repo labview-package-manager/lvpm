@@ -424,9 +424,10 @@ pub enum EditError {
     /// A package was written `name@` with nothing after the `@`.
     #[error("a constraint is expected after \"@\" in \"{name}@\"")]
     EmptyConstraint { name: String },
-    /// `remove` names a package that is in no dependency table.
-    #[error("{name} is not in lvpm.toml")]
-    NotADependency { name: String },
+    /// `remove` names a package that is in no dependency table. `installed`:
+    /// it is installed in the target all the same.
+    #[error("{name} is not a dependency of this project")]
+    NotADependency { name: String, installed: bool },
     /// `remove` names a package that is not in the table asked for, `[dependency-groups.<group>]`.
     #[error("{name} is not in [dependency-groups.{group}]")]
     NotInGroup { name: String, group: String },
@@ -487,7 +488,7 @@ pub enum CheckError {
     Other(#[from] anyhow::Error),
 }
 
-/// Why an install request could not be routed to a mode.
+/// Why an install or uninstall request could not be routed to a mode.
 #[derive(Debug, thiserror::Error)]
 pub enum RouteError {
     /// There is no project to sync, and no package to install: no `lvpm.toml`
@@ -502,6 +503,15 @@ pub enum RouteError {
         option: LockIncompatible,
         adding: bool,
     },
+    /// In a project a named uninstall takes the package out of `lvpm.toml` and
+    /// the lock decides what stays, so `flag` (`--keep-deps`, `--force`) asks for
+    /// what the sync would undo.
+    #[error("{flag} cannot be used in a project, because lvpm.lock decides what stays")]
+    UninstallNotWithLock { flag: &'static str },
+    /// A direct uninstall was given `flag`, which only an uninstall in a project
+    /// takes: `--dev`, `--group`, `--dry-run`, `--no-linkfix`, `--relink`, `--hooks`.
+    #[error("{flag} can only be used when uninstalling a package from a project")]
+    OnlyInAProject { flag: &'static str },
     /// Anything else that went wrong: its own text.
     #[error(transparent)]
     Other(#[from] anyhow::Error),

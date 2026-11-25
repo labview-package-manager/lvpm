@@ -82,6 +82,69 @@ pub fn install_mode(env: &OpEnv, request: &InstallRequest) -> Result<InstallMode
     }
 }
 
+/// What an uninstall request means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UninstallMode {
+    /// Take the named package out of `lvpm.toml`, lock and sync, as `remove`
+    /// does: a named uninstall in a project, unless `--no-project`.
+    Project,
+    /// Take the named package, or everything, out of the destination and leave
+    /// the project's files alone.
+    Direct,
+}
+
+/// What an uninstall request asks, before any flag is read as anything else.
+/// The `*_flag` fields hold the flag as typed, for the error that names it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UninstallRequest<'a> {
+    pub package: Option<&'a str>,
+    /// `--all`.
+    pub all: bool,
+    /// `--no-project`: uninstall directly, leaving the project's files alone.
+    pub no_project: bool,
+    /// `--keep-deps`.
+    pub keep_deps: bool,
+    /// `--force`.
+    pub force: bool,
+    /// `--dev` or `--group`: the table a project uninstall takes it out of.
+    pub table_flag: Option<&'static str>,
+    /// One of `--dry-run`, `--no-linkfix`, `--relink`, `--hooks`: how a project
+    /// uninstall syncs.
+    pub apply_flag: Option<&'static str>,
+}
+
+/// The mode of `request`, in the project `env` runs in, if any.
+///
+/// A named package is [`UninstallMode::Project`] in a project, whatever the
+/// destination flags say about where the project syncs, unless `--no-project`
+/// or `--all`; everything else is direct, as it always was. A project uninstall
+/// takes `--with-deps` (what happens anyway) but refuses `--keep-deps` and
+/// `--force`: the lock decides what stays, and a sync would undo either. A
+/// direct one refuses the flags only a project uninstall has.
+pub fn uninstall_mode(
+    env: &OpEnv,
+    request: &UninstallRequest,
+) -> Result<UninstallMode, RouteError> {
+    let in_a_project = request.package.is_some()
+        && !request.all
+        && !request.no_project
+        && env.manifest_for(None, None)?.is_some();
+    if in_a_project {
+        let refused = [
+            (request.keep_deps, "--keep-deps"),
+            (request.force, "--force"),
+        ];
+        return match refused.into_iter().find(|(given, _)| *given) {
+            Some((_, flag)) => Err(RouteError::UninstallNotWithLock { flag }),
+            None => Ok(UninstallMode::Project),
+        };
+    }
+    match request.table_flag.or(request.apply_flag) {
+        Some(flag) => Err(RouteError::OnlyInAProject { flag }),
+        None => Ok(UninstallMode::Direct),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +390,163 @@ mod tests {
             mode(&in_a_project, opted_out).unwrap(),
             InstallMode::Additive
         );
+    }
+
+    const ALPHA: UninstallRequest = UninstallRequest {
+        package: Some("alpha"),
+        all: false,
+        no_project: false,
+        keep_deps: false,
+        force: false,
+        table_flag: None,
+        apply_flag: None,
+    };
+
+    fn uninstall(dir: &Dir, request: UninstallRequest) -> Result<UninstallMode, RouteError> {
+        uninstall_mode(&dir.env(&NullSink), &request)
+    }
+
+    #[test]
+    fn a_named_uninstall_in_a_project_is_project_with_or_without_a_destination_flag() {
+        let dir = Dir::new("uninstall-named", Some(PROJECT));
+        assert_eq!(uninstall(&dir, ALPHA).unwrap(), UninstallMode::Project);
+        let sink = NullSink;
+        let flagged: [fn(&mut OpEnv); 3] = [
+            |env| env.flags.global = true,
+            |env| env.flags.prefix = Some(PathBuf::from("dest")),
+            |env| env.flags.labview_version = Some("2026".into()),
+        ];
+        for set in flagged {
+            let mut env = dir.env(&sink);
+            set(&mut env);
+            assert_eq!(
+                uninstall_mode(&env, &ALPHA).unwrap(),
+                UninstallMode::Project,
+                "{:?}",
+                env.flags
+            );
+        }
+    }
+
+    #[test]
+    fn no_project_all_bare_and_no_project_at_all_are_direct() {
+        let in_a_project = Dir::new("uninstall-direct", Some(PROJECT));
+        let outside = Dir::new("uninstall-direct-out", None);
+        let direct = [
+            UninstallRequest {
+                no_project: true,
+                ..ALPHA
+            },
+            UninstallRequest {
+                package: None,
+                all: true,
+                ..ALPHA
+            },
+            UninstallRequest {
+                package: None,
+                ..ALPHA
+            },
+        ];
+        for request in direct {
+            assert_eq!(
+                uninstall(&in_a_project, request).unwrap(),
+                UninstallMode::Direct
+            );
+            assert_eq!(uninstall(&outside, request).unwrap(), UninstallMode::Direct);
+        }
+        assert_eq!(uninstall(&outside, ALPHA).unwrap(), UninstallMode::Direct);
+    }
+
+    #[test]
+    fn keep_deps_and_force_are_refused_in_a_project_and_fine_for_a_direct_uninstall() {
+        let in_a_project = Dir::new("uninstall-lock", Some(PROJECT));
+        for (request, flag) in [
+            (
+                UninstallRequest {
+                    keep_deps: true,
+                    ..ALPHA
+                },
+                "--keep-deps",
+            ),
+            (
+                UninstallRequest {
+                    force: true,
+                    ..ALPHA
+                },
+                "--force",
+            ),
+        ] {
+            let why = uninstall(&in_a_project, request).unwrap_err();
+            assert!(
+                matches!(why, RouteError::UninstallNotWithLock { flag: refused } if refused == flag),
+                "{why:?}"
+            );
+            let opted_out = UninstallRequest {
+                no_project: true,
+                ..request
+            };
+            assert_eq!(
+                uninstall(&in_a_project, opted_out).unwrap(),
+                UninstallMode::Direct
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_only_flag_is_refused_on_a_direct_uninstall_and_taken_in_a_project() {
+        let in_a_project = Dir::new("uninstall-project-flag", Some(PROJECT));
+        let outside = Dir::new("uninstall-project-flag-out", None);
+        for flag in [
+            "--dev",
+            "--group",
+            "--dry-run",
+            "--no-linkfix",
+            "--relink",
+            "--hooks",
+        ] {
+            let table = flag == "--dev" || flag == "--group";
+            let request = UninstallRequest {
+                table_flag: table.then_some(flag),
+                apply_flag: (!table).then_some(flag),
+                ..ALPHA
+            };
+            assert_eq!(
+                uninstall(&in_a_project, request).unwrap(),
+                UninstallMode::Project,
+                "{flag}"
+            );
+            let direct = [
+                (
+                    &in_a_project,
+                    UninstallRequest {
+                        no_project: true,
+                        ..request
+                    },
+                ),
+                (
+                    &in_a_project,
+                    UninstallRequest {
+                        package: None,
+                        all: true,
+                        ..request
+                    },
+                ),
+                (
+                    &in_a_project,
+                    UninstallRequest {
+                        package: None,
+                        ..request
+                    },
+                ),
+                (&outside, request),
+            ];
+            for (dir, request) in direct {
+                let why = uninstall(dir, request).unwrap_err();
+                assert!(
+                    matches!(why, RouteError::OnlyInAProject { flag: refused } if refused == flag),
+                    "{flag}: {why:?}"
+                );
+            }
+        }
     }
 }

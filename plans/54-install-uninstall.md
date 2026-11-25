@@ -684,10 +684,10 @@ See each step.
 
 ## Build Progress
 
-- [ ] Wave 1 / Slice 1: one rule for a named install
-  - [ ] Step 1.1: Route a named install by --no-project, not by destination flag
-- [ ] Wave 2 / Slice 2: uninstall in a project edits the project
-  - [ ] Step 2.1: Route a named uninstall in a project to remove
+- [x] Wave 1 / Slice 1: one rule for a named install
+  - [x] Step 1.1: Route a named install by --no-project, not by destination flag
+- [x] Wave 2 / Slice 2: uninstall in a project edits the project
+  - [x] Step 2.1: Route a named uninstall in a project to remove
 - [ ] Wave 3 / Slice 3: a package another one requires cannot be removed
   - [ ] Step 3.1: Refuse the removal before anything is written
 - [ ] Wave 4 / Slice 4: install saves into dev, a group or a source

@@ -499,7 +499,7 @@ fn venv_installs_merge_palette_trees_and_rebuild_them_after_uninstall() {
     lab.ok(&["install", "--no-linkfix"]);
     assert!(!unexpected.exists());
 
-    lab.ok(&["uninstall", "alpha"]);
+    lab.ok(&["uninstall", "alpha", "--no-project"]);
     assert!(!menus.join("Root.mnu").exists());
     assert_eq!(
         std::fs::read(menus.join("Categories/Programming/Shared/dir.mnu")).unwrap(),
@@ -732,7 +732,7 @@ fn launch_checks_the_venv_against_the_manifest_before_starting_anything() {
     // In line again: the check passes, and only starting the fake LabVIEW fails.
     // fork: upstream kept app in the manifest with a flag the fork lacks;
     // write it back, so this holds whether or not uninstall edits it.
-    lab.ok(&["uninstall", "app", "--keep-deps"]);
+    lab.ok(&["uninstall", "app", "--no-project", "--keep-deps"]);
     lab.write_manifest(
         "[dependencies]
 app = \"2.0.0.1\"
@@ -808,7 +808,7 @@ fn hooks_and_machine_locations_stay_out_of_a_venv() {
     has(&lab.ok(&["list"]), "hooks skipped: PostInstall");
 
     // --no-linkfix leaves the files as copied, and says so.
-    lab.ok(&["uninstall", "tool"]);
+    lab.ok(&["uninstall", "tool", "--no-project"]);
     has(
         &lab.ok(&["install", "tool", "--no-linkfix"]),
         "linkfix: skipped (--no-linkfix)",
@@ -933,7 +933,7 @@ fn every_command_on_the_venv_is_in_the_venvs_log() {
     lab.write_manifest("[dependencies]\n");
     lab.ok(&["venv", "create"]);
     lab.ok(&["install", "app"]);
-    lab.fails(&["uninstall", "not_there", "--keep-deps"]);
+    lab.fails(&["uninstall", "not_there", "--no-project", "--keep-deps"]);
 
     let logs: Vec<PathBuf> = std::fs::read_dir(lab.root.join("logs"))
         .unwrap()

@@ -487,6 +487,15 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
     },
+    /// `uninstall` with a package name, inside a project and without
+    /// `--no-project`, is a `remove`. `package` is as it was typed;
+    /// `destination` is the destination flag that picked the target, if any,
+    /// which only says where the project syncs. The first thing it says.
+    UninstallRemovesFromProject {
+        package: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
+    },
     /// An `uninstall` took out a package that `lvpm.toml` still lists, in
     /// `[dev-dependencies]` when `dev`, `[dependency-groups.<group>]` when
     /// `group`: the next sync would put it back.

@@ -95,11 +95,11 @@ fn install_records_and_uninstall_protects_shared_dependencies() {
         serde_json::json!(["shared"])
     );
 
-    let output = f.run(&["uninstall", "root"]);
+    let output = f.run(&["uninstall", "root", "--no-project"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--with-deps or --keep-deps"));
     assert!(f.record("root").exists());
-    let output = f.run(&["uninstall", "root", "--with-deps"]);
+    let output = f.run(&["uninstall", "root", "--no-project", "--with-deps"]);
     success(&output);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("keeping shared: still required by other")
@@ -108,7 +108,7 @@ fn install_records_and_uninstall_protects_shared_dependencies() {
     assert!(!f.record("private").exists());
     assert!(f.record("shared").exists());
     // Still required by `other`: refused, and nothing is removed.
-    let output = f.run(&["uninstall", "shared", "--keep-deps"]);
+    let output = f.run(&["uninstall", "shared", "--no-project", "--keep-deps"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -118,7 +118,13 @@ fn install_records_and_uninstall_protects_shared_dependencies() {
     assert!(stderr.contains("--force"), "{stderr}");
     assert!(f.record("shared").exists());
     // --force removes it anyway, with the warning.
-    let output = f.run(&["uninstall", "shared", "--keep-deps", "--force"]);
+    let output = f.run(&[
+        "uninstall",
+        "shared",
+        "--no-project",
+        "--keep-deps",
+        "--force",
+    ]);
     success(&output);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("required by installed packages: other")
@@ -140,13 +146,13 @@ fn old_records_refuse_a_dependency_removal_instead_of_guessing() {
     std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
     // Deviation from upstream: only a plan that removes dependencies refuses;
     // `list` and `--keep-deps` still work on a target installed by an older lvpm.
-    let output = f.run(&["uninstall", "root", "--with-deps"]);
+    let output = f.run(&["uninstall", "root", "--no-project", "--with-deps"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("dependency list required"));
     assert!(f.record("root").exists());
     assert!(f.record("child").exists());
     success(&f.run(&["list"]));
-    success(&f.run(&["uninstall", "root", "--keep-deps"]));
+    success(&f.run(&["uninstall", "root", "--no-project", "--keep-deps"]));
     assert!(!f.record("root").exists());
     assert!(f.record("child").exists());
 }

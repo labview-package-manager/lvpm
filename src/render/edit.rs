@@ -44,13 +44,21 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 &format!("adding {package} to lvpm.toml and syncing the project to lvpm.lock"),
             );
             if let Some(flag) = destination {
-                r.line(
-                    Stream::Out,
-                    &format!(
-                        "note: in a project, {flag} picks where the project syncs; lvpm.toml gets \
-                         {package}. Pass --no-project to install without changing the project."
-                    ),
-                );
+                let note = destination_note(flag, &format!("gets {package}"), "install");
+                r.line(Stream::Out, &note);
+            }
+        }
+        Event::UninstallRemovesFromProject {
+            package,
+            destination,
+        } => {
+            r.line(
+                Stream::Out,
+                &format!("removing {package} from lvpm.toml and syncing the project to lvpm.lock"),
+            );
+            if let Some(flag) = destination {
+                let note = destination_note(flag, &format!("loses {package}"), "uninstall");
+                r.line(Stream::Out, &note);
             }
         }
         Event::UninstalledStillListed { name, dev, group } => {
@@ -60,12 +68,22 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 &format!(
                     "note: {name} is still in lvpm.toml; `{}` removes it for good (a sync \
                      would install it again)",
-                    remove_command(name, &table)
+                    command_for("uninstall", name, &table)
                 ),
             )
         }
         _ => unreachable!("routed here by Renderer::render: {event:?}"),
     }
+}
+
+/// What a named `install` or `uninstall` tells a user who gave a destination
+/// flag: it only picks where the project syncs. `change` is what `lvpm.toml`
+/// undergoes ("gets x"); `verb` is the command, which `--no-project` makes direct.
+fn destination_note(flag: &str, change: &str, verb: &str) -> String {
+    format!(
+        "note: in a project, {flag} picks where the project syncs; lvpm.toml {change}. \
+         Pass --no-project to {verb} without changing the project."
+    )
 }
 
 /// The flag that names `table` to `add` and `remove`: none for `[dependencies]`.
@@ -77,11 +95,11 @@ fn flag_for(table: &DependencyTable) -> String {
     }
 }
 
-/// The `lvpm remove` that takes `name` out of `table`.
-fn remove_command(name: &str, table: &DependencyTable) -> String {
+/// The `lvpm <verb>` (`remove` or `uninstall`) that takes `name` out of `table`.
+fn command_for(verb: &str, name: &str, table: &DependencyTable) -> String {
     match flag_for(table).as_str() {
-        "" => format!("lvpm remove {name}"),
-        flag => format!("lvpm remove {name} {flag}"),
+        "" => format!("lvpm {verb} {name}"),
+        flag => format!("lvpm {verb} {name} {flag}"),
     }
 }
 
@@ -162,10 +180,17 @@ pub fn error(error: &EditError, rerun: &str) -> String {
              next: run `lvpm add \"{name}@>=0.5\"` with the constraint you mean, or \
              `lvpm add {name}` for the newest version"
         ),
-        EditError::NotADependency { name } => format!(
+        EditError::NotADependency {
+            name,
+            installed: true,
+        } => format!(
             "{error}\n\
-             next: name a package that lvpm.toml lists, or add it with `lvpm add {name}`"
+             next: `lvpm uninstall {name} --no-project` uninstalls it from the target without \
+             changing the project"
         ),
+        EditError::NotADependency {
+            installed: false, ..
+        } => format!("{error}\nnext: check the name"),
         EditError::NotInGroup { name, group } => format!(
             "{error}\n\
              next: name a package that [dependency-groups.{group}] lists, or add it with \
@@ -183,7 +208,7 @@ pub fn error(error: &EditError, rerun: &str) -> String {
 fn other_table_hints(name: &str, found_in: &[DependencyTable]) -> String {
     match found_in {
         [only] => {
-            let command = remove_command(name, only);
+            let command = command_for("remove", name, only);
             match flag_for(only).as_str() {
                 "" => format!("next: `{command}` removes it from [dependencies]"),
                 flag => format!("next: use {flag}: `{command}`"),
@@ -193,7 +218,7 @@ fn other_table_hints(name: &str, found_in: &[DependencyTable]) -> String {
             .map(|table| {
                 format!(
                     "next: `{}` removes it from [{}]",
-                    remove_command(name, table),
+                    command_for("remove", name, table),
                     table.key()
                 )
             })
@@ -349,6 +374,46 @@ mod tests {
     }
 
     #[test]
+    fn a_named_uninstall_in_a_project_says_it_edits_the_project_and_a_destination_flag_only_picks_where_it_syncs()
+     {
+        let (mut renderer, out, _) = renderer();
+        for destination in [None, Some("--prefix".to_string())] {
+            renderer.render(&Event::UninstallRemovesFromProject {
+                package: "gamma".into(),
+                destination,
+            });
+        }
+        assert_eq!(
+            out.text(),
+            "removing gamma from lvpm.toml and syncing the project to lvpm.lock\n\
+             removing gamma from lvpm.toml and syncing the project to lvpm.lock\n\
+             note: in a project, --prefix picks where the project syncs; lvpm.toml loses gamma. \
+             Pass --no-project to uninstall without changing the project.\n"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_dependency_says_to_uninstall_it_directly_only_when_the_target_holds_it()
+    {
+        let said = |installed| {
+            written(&EditError::NotADependency {
+                name: "gamma".into(),
+                installed,
+            })
+        };
+        assert_eq!(
+            said(true),
+            "gamma is not a dependency of this project\n\
+             next: `lvpm uninstall gamma --no-project` uninstalls it from the target without \
+             changing the project"
+        );
+        assert_eq!(
+            said(false),
+            "gamma is not a dependency of this project\nnext: check the name"
+        );
+    }
+
+    #[test]
     fn an_uninstalled_package_that_the_manifest_still_lists_says_how_to_remove_it_for_good() {
         let (mut renderer, out, err) = renderer();
         for dev in [false, true] {
@@ -360,9 +425,9 @@ mod tests {
         }
         assert_eq!(
             out.text(),
-            "note: caraya is still in lvpm.toml; `lvpm remove caraya` removes it for good (a sync \
+            "note: caraya is still in lvpm.toml; `lvpm uninstall caraya` removes it for good (a sync \
              would install it again)\n\
-             note: caraya is still in lvpm.toml; `lvpm remove caraya --dev` removes it for good \
+             note: caraya is still in lvpm.toml; `lvpm uninstall caraya --dev` removes it for good \
              (a sync would install it again)\n"
         );
         assert_eq!(err.text(), "");
@@ -416,7 +481,7 @@ mod tests {
         });
         assert_eq!(
             out.text(),
-            "note: ci_tools is still in lvpm.toml; `lvpm remove ci_tools --group ci` removes it \
+            "note: ci_tools is still in lvpm.toml; `lvpm uninstall ci_tools --group ci` removes it \
              for good (a sync would install it again)\n"
         );
     }
@@ -527,7 +592,14 @@ mod tests {
      {
         for error in [
             EditError::EmptyConstraint { name: "g".into() },
-            EditError::NotADependency { name: "g".into() },
+            EditError::NotADependency {
+                name: "g".into(),
+                installed: false,
+            },
+            EditError::NotADependency {
+                name: "g".into(),
+                installed: true,
+            },
             EditError::NotInGroup {
                 name: "g".into(),
                 group: "ci".into(),

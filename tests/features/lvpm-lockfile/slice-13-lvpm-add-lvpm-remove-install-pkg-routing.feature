@@ -96,7 +96,7 @@ Feature: add and remove edit the manifest, then lock and sync
 
   Scenario: removing a name that is not a dependency fails
     When I run "lvpm remove zeta --prefix dest"
-    Then the command fails saying "zeta" is not in lvpm.toml
+    Then the command fails with: zeta is not a dependency of this project
     And nothing changed
 
   @core
@@ -151,9 +151,9 @@ Feature: add and remove edit the manifest, then lock and sync
     Then the command fails saying --no-deps cannot be used in a project, because lvpm.lock decides the dependencies
 
   Scenario: uninstall inside a project hints at remove
-    When I run "lvpm uninstall beta --keep-deps --prefix dest"
+    When I run "lvpm uninstall beta --no-project --keep-deps --prefix dest"
     Then "beta" is uninstalled
-    And the output says "beta" is still in lvpm.toml and "lvpm remove beta" removes it for good
+    And the output says "beta" is still in lvpm.toml and "lvpm uninstall beta" removes it for good
 
   Scenario Outline: lock-editing commands outside a project are refused
     Given a directory without lvpm.toml

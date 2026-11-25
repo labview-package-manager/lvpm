@@ -167,6 +167,7 @@ impl Renderer {
             Event::ManifestEdited { .. }
             | Event::PackageStillRequired { .. }
             | Event::InstallAddsToProject { .. }
+            | Event::UninstallRemovesFromProject { .. }
             | Event::UninstalledStillListed { .. } => edit::render(self, event),
             Event::SyncLockMissing { .. }
             | Event::SyncUnresolved { .. }

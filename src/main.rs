@@ -13,7 +13,7 @@ use lvpm_core::ops::install::InstallOptions;
 use lvpm_core::ops::lock::{Upgrade, UpgradeTarget};
 use lvpm_core::ops::publish::PublishTarget;
 use lvpm_core::ops::relink::RelinkOptions;
-use lvpm_core::ops::route::{self, InstallMode, InstallRequest};
+use lvpm_core::ops::route::{self, InstallMode, InstallRequest, UninstallMode, UninstallRequest};
 use lvpm_core::ops::sync::{LockFlags, SyncOptions, strictness};
 use lvpm_core::ops::{self, Destination, DestinationFlags, OpEnv};
 use lvpm_core::{config, git, launch, target, venv, viserver};
@@ -146,6 +146,19 @@ struct ApplyArgs {
 }
 
 impl ApplyArgs {
+    /// The first of the flags that only matter to a project's sync, as typed.
+    fn flag_given(&self) -> Option<&'static str> {
+        let typed = [
+            (self.dry_run, "--dry-run"),
+            (self.no_linkfix, "--no-linkfix"),
+            (self.force_relink, "--relink"),
+            (self.run_hooks, "--hooks"),
+        ];
+        typed
+            .into_iter()
+            .find_map(|(given, name)| given.then_some(name))
+    }
+
     fn options(&self, no_deps: bool, allow_downgrade: bool) -> InstallOptions {
         InstallOptions {
             dry_run: self.dry_run,
@@ -381,23 +394,42 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         timeout: u64,
     },
-    /// Remove a previously installed package.
+    /// Remove a previously installed package. In a project, a named uninstall
+    /// is `lvpm remove`: it takes the package out of lvpm.toml, locks and
+    /// syncs, whatever --global, --prefix or --labview-version say: they only
+    /// pick where the project syncs. --no-project uninstalls the package
+    /// alone, leaving the project's files as they are.
     Uninstall {
         /// Package to remove. Omit when using --all.
         package: Option<String>,
         /// Remove every package installed in this target.
         #[arg(long, conflicts_with = "package")]
         all: bool,
+        /// Uninstall the package alone, as outside a project: lvpm.toml and
+        /// lvpm.lock are left as they are.
+        #[arg(long, requires = "package", conflicts_with = "project")]
+        no_project: bool,
         /// Remove dependencies nothing else needs too, without prompting.
         #[arg(long, conflicts_with_all = ["all", "keep_deps"])]
         with_deps: bool,
-        /// Keep dependencies, without prompting.
+        /// Keep dependencies, without prompting. Not in a project: lvpm.lock
+        /// decides what stays.
         #[arg(long, conflicts_with_all = ["all", "with_deps"])]
         keep_deps: bool,
         /// Remove the package even though other installed packages require
-        /// it, leaving them without it. Without this, that is refused.
+        /// it, leaving them without it. Without this, that is refused. Not in
+        /// a project: lvpm.lock decides what stays.
         #[arg(long, conflicts_with = "all")]
         force: bool,
+        /// It is in [dev-dependencies]. Only an uninstall in a project takes it.
+        #[arg(long, conflicts_with = "all")]
+        dev: bool,
+        /// It is in [dependency-groups.<NAME>]. Only an uninstall in a project
+        /// takes it.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["all", "dev"])]
+        group: Option<String>,
+        #[command(flatten)]
+        apply: ApplyArgs,
     },
     /// Invoke parameterless Application-class methods by raw id, and report
     /// what LabVIEW says. Re-establishes method ids on a new LabVIEW: 1036
@@ -1051,11 +1083,9 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 (InstallMode::Sync, _) => cmd_sync(&env, &sync.options(apply, env.headless)),
                 // A named install in a project is an add, and always names one.
                 (InstallMode::Add, Some(spec)) => {
-                    // A lookup that fails fails the sync after it with the same error.
-                    let venv_wins = env.find_venv().is_ok_and(|venv| venv.is_some());
                     env.sink.emit(Event::InstallAddsToProject {
                         package: spec.to_string(),
-                        destination: destination_flag(&env.flags, venv_wins),
+                        destination: picked_destination(&env),
                     });
                     cmd_add(&env, spec, DependencyTable::Dependencies, None, apply)
                 }
@@ -1089,6 +1119,7 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
             package,
             dependency_table(*dev, group.as_deref())?,
             apply,
+            "`lvpm remove`",
         )
         .map(|()| Report::done("remove")),
         Cmd::Sync { apply, sync } => {
@@ -1139,35 +1170,32 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
         Cmd::Uninstall {
             package,
             all,
+            no_project,
             with_deps,
             keep_deps,
             force,
+            dev,
+            group,
+            apply,
         } => {
-            use ops::uninstall::Dependencies;
-            let ask = |names: &[String]| {
-                use std::io::IsTerminal;
-                // Under --json stdin is no place for an answer.
-                ensure!(
-                    !cli.json,
-                    "dependencies can be removed: {}. Pass --with-deps, --keep-deps or --yes under --json",
-                    names.join(", ")
-                );
-                let stdin = std::io::stdin();
-                confirm_dependencies(
-                    names,
-                    stdin.is_terminal(),
-                    &mut stdin.lock(),
-                    &mut std::io::stderr(),
-                )
+            let request = UninstallRequest {
+                package: package.as_deref(),
+                all: *all,
+                no_project: *no_project,
+                keep_deps: *keep_deps,
+                force: *force,
+                table_flag: table_flag(*dev, group.as_deref()),
+                apply_flag: apply.flag_given(),
             };
-            let deps = match (with_deps, keep_deps) {
-                (true, _) => Dependencies::Remove,
-                (_, true) => Dependencies::Keep,
-                _ if cli.yes => Dependencies::Remove,
-                _ => Dependencies::Ask(&ask),
-            };
-            ops::uninstall::uninstall(&env, package.as_deref(), *all, deps, *force)
-                .map(|()| Report::done("uninstall"))
+            let mode = route::uninstall_mode(&env, &request)
+                .map_err(|why| anyhow!(render::sync::route_error(&why)))?;
+            match (mode, package.as_deref()) {
+                (UninstallMode::Project, Some(name)) => {
+                    cmd_uninstall_project(&env, name, *dev, group.as_deref(), apply)
+                }
+                _ => cmd_uninstall(&env, cli, &request, *with_deps),
+            }
+            .map(|()| Report::done("uninstall"))
         }
         Cmd::AppProbe { ids } => cmd_app_probe(&env, ids).map(|()| Report::done("app-probe")),
         Cmd::ViProbe { vi, timeout } => {
@@ -1337,6 +1365,13 @@ fn dependency_table(dev: bool, group: Option<&str>) -> Result<DependencyTable> {
     Ok(table)
 }
 
+/// The destination flag that picked the project's target, as typed, if any.
+fn picked_destination(env: &OpEnv) -> Option<String> {
+    // A lookup that fails fails the sync after it with the same error.
+    let venv_wins = env.find_venv().is_ok_and(|venv| venv.is_some());
+    destination_flag(&env.flags, venv_wins)
+}
+
 /// The destination flag that picked the target, as typed: the one a named
 /// install in a project tells the user only picks where the project syncs.
 /// `--labview-version` picks nothing when a venv wins (see `OpEnv::destination`).
@@ -1352,6 +1387,67 @@ fn destination_flag(flags: &DestinationFlags, venv_wins: bool) -> Option<String>
     typed
         .into_iter()
         .find_map(|(given, name)| given.then(|| name.to_string()))
+}
+
+/// `--dev` or `--group`, as typed: the table a project uninstall takes a
+/// package out of.
+fn table_flag(dev: bool, group: Option<&str>) -> Option<&'static str> {
+    match (dev, group) {
+        (true, _) => Some("--dev"),
+        (_, Some(_)) => Some("--group"),
+        _ => None,
+    }
+}
+
+/// A named `uninstall` in a project is a `remove`: it says so, then takes the
+/// package out of the project's `lvpm.toml`.
+fn cmd_uninstall_project(
+    env: &OpEnv,
+    package: &str,
+    dev: bool,
+    group: Option<&str>,
+    apply: &ApplyArgs,
+) -> Result<()> {
+    let table = dependency_table(dev, group)?;
+    env.sink.emit(Event::UninstallRemovesFromProject {
+        package: package.to_string(),
+        destination: picked_destination(env),
+    });
+    cmd_remove(env, package, table, apply, "`lvpm uninstall`")
+}
+
+/// `uninstall` that leaves the project alone: the named package, or `--all`, out
+/// of the destination.
+fn cmd_uninstall(
+    env: &OpEnv,
+    cli: &Cli,
+    request: &UninstallRequest,
+    with_deps: bool,
+) -> Result<()> {
+    use ops::uninstall::Dependencies;
+    let ask = |names: &[String]| {
+        use std::io::IsTerminal;
+        // Under --json stdin is no place for an answer.
+        ensure!(
+            !cli.json,
+            "dependencies can be removed: {}. Pass --with-deps, --keep-deps or --yes under --json",
+            names.join(", ")
+        );
+        let stdin = std::io::stdin();
+        confirm_dependencies(
+            names,
+            stdin.is_terminal(),
+            &mut stdin.lock(),
+            &mut std::io::stderr(),
+        )
+    };
+    let deps = match (with_deps, request.keep_deps) {
+        (true, _) => Dependencies::Remove,
+        (_, true) => Dependencies::Keep,
+        _ if cli.yes => Dependencies::Remove,
+        _ => Dependencies::Ask(&ask),
+    };
+    ops::uninstall::uninstall(env, request.package, request.all, deps, request.force)
 }
 
 fn cmd_add(
@@ -1371,9 +1467,16 @@ fn cmd_add(
     .map_err(|why| anyhow!(render::edit::error(&why, "`lvpm add`")))
 }
 
-fn cmd_remove(env: &OpEnv, package: &str, table: DependencyTable, apply: &ApplyArgs) -> Result<()> {
+/// `rerun` is the command a failure says to run again.
+fn cmd_remove(
+    env: &OpEnv,
+    package: &str,
+    table: DependencyTable,
+    apply: &ApplyArgs,
+    rerun: &str,
+) -> Result<()> {
     ops::add_remove::remove(env, package, table, &apply.options(false, false))
-        .map_err(|why| anyhow!(render::edit::error(&why, "`lvpm remove`")))
+        .map_err(|why| anyhow!(render::edit::error(&why, rerun)))
 }
 
 /// A refused build is a result, not an error: its stdout and `--json` are

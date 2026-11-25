@@ -247,6 +247,16 @@ pub fn route_error(error: &RouteError) -> String {
                  next: {next}"
             )
         }
+        RouteError::UninstallNotWithLock { flag } => format!(
+            "{error}\n\
+             next: drop {flag}, or uninstall the package without changing the project: \
+             `lvpm uninstall <package> {flag} --no-project`"
+        ),
+        RouteError::OnlyInAProject { flag } => format!(
+            "{error}\n\
+             next: drop {flag}, or run this in a project, where uninstalling a package takes it \
+             out of lvpm.toml"
+        ),
         RouteError::Other(cause) => format!("{cause:#}"),
     }
 }
@@ -557,6 +567,28 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn an_uninstall_flag_the_lock_overrules_names_no_project_as_the_way_out() {
+        let text = route_error(&RouteError::UninstallNotWithLock { flag: "--force" });
+        assert_eq!(
+            text,
+            "--force cannot be used in a project, because lvpm.lock decides what stays\n\
+             next: drop --force, or uninstall the package without changing the project: \
+             `lvpm uninstall <package> --force --no-project`"
+        );
+    }
+
+    #[test]
+    fn a_project_only_flag_on_a_direct_uninstall_is_named_and_the_way_out_is_a_project() {
+        let text = route_error(&RouteError::OnlyInAProject { flag: "--dev" });
+        assert!(
+            text.starts_with(
+                "--dev can only be used when uninstalling a package from a project\nnext: drop --dev, "
+            ),
+            "{text}"
+        );
     }
 
     #[test]

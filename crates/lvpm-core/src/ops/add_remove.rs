@@ -89,7 +89,13 @@ pub fn remove(
     if let DependencyTable::Group(group) = &table {
         refuse_unknown_groups(&prepared.found.1, std::slice::from_ref(group))?;
     }
-    let edit = prepared.take_out(&table, name)?;
+    let edit = prepared.take_out(&table, name).map_err(|why| match why {
+        EditError::NotADependency { name, .. } => {
+            let installed = installed_in_the_target(env, &name);
+            EditError::NotADependency { name, installed }
+        }
+        other => other,
+    })?;
     let dest = env.destination()?;
     announce_project(env, &prepared, &dest);
 
@@ -101,6 +107,16 @@ pub fn remove(
         &Moving::Nothing,
     )?;
     commit(env, prepared, edit, &index, dest, options)
+}
+
+/// `name` is installed in the target, as far as it can be told: a target that
+/// cannot be resolved or read holds nothing.
+fn installed_in_the_target(env: &OpEnv, name: &str) -> bool {
+    let Ok(dest) = env.destination() else {
+        return false;
+    };
+    install::list_installed(&dest.store())
+        .is_ok_and(|all| all.iter().any(|m| project::same_name(&m.name, name)))
 }
 
 /// What `add` was asked for: a package, the constraint if one was written, and
@@ -246,7 +262,11 @@ impl Prepared {
                 name,
                 group: group.clone(),
             },
-            _ => EditError::NotADependency { name },
+            // `remove` says whether it is installed; this cannot tell.
+            _ => EditError::NotADependency {
+                name,
+                installed: false,
+            },
         }
     }
 }
@@ -767,7 +787,7 @@ alpha = \"1.0\"
         let refused = |table, name: &str| project.take_out(table, name).err().unwrap();
         assert!(matches!(
             refused(&DependencyTable::Dependencies, "zeta"),
-            EditError::NotADependency { name } if name == "zeta"
+            EditError::NotADependency { name, .. } if name == "zeta"
         ));
         let in_dev = refused(&DependencyTable::Dependencies, "caraya");
         assert!(matches!(
@@ -1466,9 +1486,64 @@ alpha = \"1.0\"
             &InstallOptions::default(),
         )
         .unwrap_err();
-        assert!(matches!(why, EditError::NotADependency { .. }), "{why:?}");
+        assert!(
+            matches!(
+                why,
+                EditError::NotADependency {
+                    installed: false,
+                    ..
+                }
+            ),
+            "{why:?}"
+        );
         assert!(sink.events().is_empty(), "{:?}", sink.events());
         assert_eq!(world.manifest(), PROJECT);
         assert_eq!(world.lock(), None);
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_dependency_says_whether_the_target_holds_it() {
+        let world = World::new("not-a-dependency-installed", PROJECT);
+        let sink = Recorder::default();
+        let env = world.env(&sink);
+        add(
+            &env,
+            "gamma",
+            DependencyTable::Dependencies,
+            None,
+            &InstallOptions::default(),
+        )
+        .unwrap();
+        // gamma stays installed, but the manifest no longer lists it.
+        std::fs::write(world.root.join(project::FILE_NAME), PROJECT).unwrap();
+        let asked = |name: &str| {
+            remove(
+                &env,
+                name,
+                DependencyTable::Dependencies,
+                &InstallOptions::default(),
+            )
+            .unwrap_err()
+        };
+        assert!(
+            matches!(
+                asked("gamma"),
+                EditError::NotADependency {
+                    installed: true,
+                    ..
+                }
+            ),
+            "installed"
+        );
+        assert!(
+            matches!(
+                asked("zeta"),
+                EditError::NotADependency {
+                    installed: false,
+                    ..
+                }
+            ),
+            "nowhere"
+        );
     }
 }
