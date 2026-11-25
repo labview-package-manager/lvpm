@@ -69,7 +69,7 @@ pub fn trials() -> Vec<Trial> {
             uninstall_shared_dependencies,
         ),
         (
-            "uninstall: warn before removing a required package",
+            "uninstall: refuse a required package unless forced",
             uninstall_required_package,
         ),
         (
@@ -449,8 +449,33 @@ fn uninstall_shared_dependencies() -> Check {
 }
 
 fn uninstall_required_package() -> Check {
-    let result = ok(&venv(), &["uninstall", "lvpm_e2e_shared", "--keep-deps"])?;
-    contains(&result, "required by installed packages: lvpm_e2e_other")?;
+    // A package another one requires is refused, naming how to force it; only
+    // --force removes it, and says it did.
+    let refused = lvpm(
+        &venv(),
+        &[
+            "uninstall",
+            "lvpm_e2e_shared",
+            "--keep-deps",
+            "--no-project",
+        ],
+    )
+    .try_failure()
+    .map_err(fail)?;
+    contains(&refused, "required by installed packages: lvpm_e2e_other")?;
+    contains(&refused, "--force")?;
+    exists(&record("lvpm_e2e_shared")?)?;
+    let forced = ok(
+        &venv(),
+        &[
+            "uninstall",
+            "lvpm_e2e_shared",
+            "--keep-deps",
+            "--no-project",
+            "--force",
+        ],
+    )?;
+    contains(&forced, "required by installed packages: lvpm_e2e_other")?;
     absent(&record("lvpm_e2e_shared")?)?;
     exists(&record("lvpm_e2e_other")?)
 }

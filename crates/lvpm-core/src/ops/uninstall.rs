@@ -234,7 +234,10 @@ fn with_dependencies(
                     .collect()
             };
             return Err(EditError::Required {
-                roots: dependency::roots_above(&plan.root, dependents_of),
+                roots: dependency::roots_above(&plan.root, dependents_of)
+                    .into_iter()
+                    .map(|root| (root, Vec::new()))
+                    .collect(),
                 name: plan.root,
                 required_by: plan.dependents,
             }
@@ -493,7 +496,8 @@ mod tests {
         // Typed, so that the front end words it as a project's refusal is.
         assert!(
             matches!(why.downcast_ref::<EditError>(), Some(EditError::Required { name, required_by, roots })
-                if name == "alpha" && required_by == &["beta"] && roots == &["beta"]),
+                if name == "alpha" && required_by == &["beta"]
+                    && roots.iter().map(|(root, tables)| (root.as_str(), tables.len())).eq([("beta", 0)])),
             "{why:?}"
         );
         assert!(file.exists(), "nothing was touched");

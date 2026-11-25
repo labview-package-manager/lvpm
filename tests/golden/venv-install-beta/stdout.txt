@@ -1,5 +1,5 @@
-adding beta to lvpm.toml and syncing the project to lvpm.lock (to install it without changing the project, pass --prefix, --global or --labview-version)
 no lvpm.lock found: writing one from lvpm.toml (commit lvpm.lock with the project)
+adding beta to lvpm.toml and syncing the project to lvpm.lock
 lvpm.toml: added beta = ">=1.0" to [dependencies]
 + alpha 2.0
 + beta 1.0

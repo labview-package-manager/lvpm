@@ -227,9 +227,22 @@ pub fn error(error: &EditError, rerun: &str, destination: Option<&str>) -> Strin
             on_the_target(format!("lvpm add {name} --group {group}"), destination)
         ),
         EditError::Required { roots, .. } => {
-            let uninstall =
-                |root: &String| on_the_target(format!("lvpm uninstall {root}"), destination);
-            required(error, roots.iter().map(uninstall).collect(), None)
+            // One command for each table that lists a root: `uninstall` takes
+            // a package out of the table its flag names, and refuses another.
+            let commands = (roots.iter())
+                .flat_map(|(root, tables)| match tables.as_slice() {
+                    [] => vec![command_for(
+                        "uninstall",
+                        root,
+                        &DependencyTable::Dependencies,
+                        destination,
+                    )],
+                    tables => (tables.iter())
+                        .map(|table| command_for("uninstall", root, table, destination))
+                        .collect(),
+                })
+                .collect();
+            required(error, commands, None)
         }
         EditError::InOtherTable { name, found_in } => {
             // The verb the user ran; `lvpm remove` stays `remove` until it is an alias.
@@ -254,7 +267,7 @@ pub fn direct_error(error: &EditError, destination: Option<&str>, no_project: bo
     };
     let flag = if no_project { " --no-project" } else { "" };
     let commands = (roots.iter())
-        .map(|root| on_the_target(format!("lvpm uninstall {root}{flag}"), destination))
+        .map(|(root, _)| on_the_target(format!("lvpm uninstall {root}{flag}"), destination))
         .collect();
     required(error, commands, Some(name))
 }
@@ -840,7 +853,10 @@ mod tests {
         EditError::Required {
             name: "lib".into(),
             required_by: vec!["mid".into(), "app2".into()],
-            roots: roots.iter().map(|root| root.to_string()).collect(),
+            roots: roots
+                .iter()
+                .map(|root| (root.to_string(), Vec::new()))
+                .collect(),
         }
     }
 
@@ -861,6 +877,35 @@ mod tests {
             "lib is required by installed packages: mid, app2\n\
              next: run `lvpm uninstall a --prefix dest`, `lvpm uninstall b --prefix dest` \
              and `lvpm uninstall c --prefix dest` first"
+        );
+    }
+
+    #[test]
+    fn a_root_is_named_with_the_flag_of_each_table_that_lists_it() {
+        let error = EditError::Required {
+            name: "lib".into(),
+            required_by: vec!["tool".into(), "tests".into(), "app".into()],
+            roots: vec![
+                ("app".into(), vec![DependencyTable::Dependencies]),
+                ("tool".into(), vec![DependencyTable::DevDependencies]),
+                ("tests".into(), vec![DependencyTable::Group("ci".into())]),
+                (
+                    "both".into(),
+                    vec![
+                        DependencyTable::DevDependencies,
+                        DependencyTable::Group("ci".into()),
+                    ],
+                ),
+            ],
+        };
+        assert_eq!(
+            written_on(&error, Some("--prefix dest")),
+            "lib is required by installed packages: tool, tests, app\n\
+             next: run `lvpm uninstall app --prefix dest`, \
+             `lvpm uninstall tool --dev --prefix dest`, \
+             `lvpm uninstall tests --group ci --prefix dest`, \
+             `lvpm uninstall both --dev --prefix dest` \
+             and `lvpm uninstall both --group ci --prefix dest` first"
         );
     }
 

@@ -243,6 +243,16 @@ Feature: install and uninstall are the project commands
     And I run "lvpm uninstall lib --prefix dest"
     Then "app" and "lib" are gone from lvpm.toml, lvpm.lock and dest
 
+  Scenario: a root in [dev-dependencies] is named with --dev, and following the next line works
+    Given dev dependency "app" "*", locked and synced
+    When I run "lvpm uninstall lib --prefix dest"
+    Then the command fails with: lib is required by installed packages: app
+    And the error's next line says to run "lvpm uninstall app --dev" first
+    And the error's next line names "--dev --prefix dest"
+    And nothing changed
+    When I run "lvpm uninstall app --dev --prefix dest"
+    Then "app" is gone from [dev-dependencies], lvpm.lock and dest
+
   Scenario: the direct route says it the same way
     Given the project also depends on "app" "*", locked and synced
     When I run "lvpm uninstall lib --no-project --prefix dest"

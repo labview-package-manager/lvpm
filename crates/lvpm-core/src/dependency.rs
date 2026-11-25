@@ -63,24 +63,28 @@ pub fn package_dependency_names(
 /// The packages that need `name`, walked up `dependents_of` to the top: those
 /// nothing requires, which are the ones to remove first. A package that is
 /// required and also listed is passed over for what requires it, since removing
-/// it would be refused too. A cycle with no top has its first dependents.
+/// it would be refused too. Each direct dependent is climbed on its own: one
+/// whose climb reaches no top, because it is in a cycle, is named itself.
 pub fn roots_above(name: &str, dependents_of: impl Fn(&str) -> Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::from([key(name)]);
-    let mut queue = dependents_of(name);
     let mut roots = Vec::new();
-    while let Some(package) = queue.pop() {
-        if !seen.insert(key(&package)) {
-            continue;
+    for dependent in dependents_of(name) {
+        let mut seen = HashSet::from([key(name), key(&dependent)]);
+        let mut queue = vec![dependent.clone()];
+        let mut tops = Vec::new();
+        while let Some(package) = queue.pop() {
+            match dependents_of(&package) {
+                above if above.is_empty() => tops.push(package),
+                above => queue.extend(above.into_iter().filter(|up| seen.insert(key(up)))),
+            }
         }
-        match dependents_of(&package) {
-            above if above.is_empty() => roots.push(package),
-            above => queue.extend(above),
-        }
-    }
-    if roots.is_empty() {
-        return dependents_of(name);
+        roots.extend(if tops.is_empty() {
+            vec![dependent]
+        } else {
+            tops
+        });
     }
     roots.sort_by_cached_key(|root| key(root));
+    roots.dedup_by(|a, b| key(a) == key(b));
     roots
 }
 
@@ -282,6 +286,18 @@ mod tests {
         assert_eq!(roots_above("lib", dependents_in(diamond)), ["app"]);
         let cycle: &[(&str, &[&str])] = &[("a", &["b"]), ("b", &["a"])];
         assert_eq!(roots_above("a", dependents_in(cycle)), ["b"]);
+    }
+
+    #[test]
+    fn a_dependent_whose_climb_ends_in_a_cycle_is_named_beside_the_roots_other_climbs_find() {
+        // The project lists app and x; x and y require each other.
+        let edges: &[(&str, &[&str])] = &[
+            ("app", &["lib"]),
+            ("x", &["lib", "y"]),
+            ("y", &["x"]),
+            ("lib", &[]),
+        ];
+        assert_eq!(roots_above("lib", dependents_in(edges)), ["app", "x"]);
     }
 
     #[test]

@@ -430,13 +430,15 @@ pub enum EditError {
     NotADependency { name: String, installed: bool },
     /// `remove` names a package that locked packages require, so it cannot go:
     /// `required_by` requires it directly, and `roots` are the packages the
-    /// project lists that need it, which are to go first. Nothing was changed.
-    /// A direct `uninstall` says the same when its installed records do.
+    /// project lists that need it, which are to go first, each with every table
+    /// of `lvpm.toml` that lists it (none for a direct `uninstall`, which has
+    /// no project). Nothing was changed. A direct `uninstall` says the same
+    /// when its installed records do.
     #[error("{name} is required by installed packages: {}", .required_by.join(", "))]
     Required {
         name: String,
         required_by: Vec<String>,
-        roots: Vec<String>,
+        roots: Vec<(String, Vec<DependencyTable>)>,
     },
     /// `remove` names a package that is not in the table asked for, `[dependency-groups.<group>]`.
     #[error("{name} is not in [dependency-groups.{group}]")]

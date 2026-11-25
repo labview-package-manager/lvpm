@@ -144,7 +144,7 @@ fn take_out_and_sync(
         EditError::NotADependency { name, .. } => prepared
             .previous
             .as_ref()
-            .and_then(|lock| required(lock, &name))
+            .and_then(|lock| required(lock, &prepared.found.1, &name))
             .unwrap_or_else(|| {
                 let installed = installed_in_the_target(env, &name);
                 EditError::NotADependency { name, installed }
@@ -165,12 +165,26 @@ fn take_out_and_sync(
 }
 
 /// `name` cannot go while `lock` holds packages that require it: they are
-/// named, and so are the ones the project lists that need it, to go first.
-fn required(lock: &Lockfile, name: &str) -> Option<EditError> {
+/// named, and so are the ones the project lists that need it, to go first, each
+/// with the tables of `project` that list it: `uninstall` needs the flag.
+fn required(lock: &Lockfile, project: &Project, name: &str) -> Option<EditError> {
     let required_by = lock.dependents_of(name);
     (!required_by.is_empty()).then(|| EditError::Required {
         name: name.to_string(),
-        roots: roots_above(name, |package| lock.dependents_of(package)),
+        roots: roots_above(name, |package| lock.dependents_of(package))
+            .into_iter()
+            .map(|root| {
+                let tables = (project.tables())
+                    .filter(|(_, entries)| {
+                        entries
+                            .iter()
+                            .any(|(entry, _)| project::same_name(entry, &root))
+                    })
+                    .map(|(table, _)| table)
+                    .collect();
+                (root, tables)
+            })
+            .collect(),
         required_by,
     })
 }
@@ -447,19 +461,20 @@ fn commit(
         lock_missing,
         text: before,
     } = prepared;
+    // Locking warns about the requirements no source lists.
+    let (lock, changes, after) =
+        locking::relock_with(env, &edit.project, index, previous.as_ref())?;
+    if let Some(ManifestEdit::Removed { name, .. }) = &edit.change
+        && let Some(refusal) = required(&lock, &edit.project, name)
+    {
+        return Err(refusal);
+    }
+    // After the refusal: a removal that goes nowhere writes no lock.
     if lock_missing {
         env.sink.emit(Event::SyncLockMissing {
             path: lock_path.clone(),
             dry_run: options.dry_run,
         });
-    }
-    // Locking warns about the requirements no source lists.
-    let (lock, changes, after) =
-        locking::relock_with(env, &edit.project, index, previous.as_ref())?;
-    if let Some(ManifestEdit::Removed { name, .. }) = &edit.change
-        && let Some(refusal) = required(&lock, name)
-    {
-        return Err(refusal);
     }
     if let Some(event) = announce {
         env.sink.emit(event);
@@ -1422,7 +1437,8 @@ alpha = \"1.0\"
             .unwrap_err();
             assert!(
                 matches!(&why, EditError::Required { name, required_by, roots }
-                    if name == "alpha" && required_by == &["beta"] && roots == &["beta"]),
+                    if name == "alpha" && required_by == &["beta"]
+                    && roots == &[("beta".to_string(), vec![DependencyTable::Dependencies])]),
                 "dry_run {dry_run}: {why:?}"
             );
             assert_eq!(world.manifest(), manifest);
@@ -1446,10 +1462,82 @@ alpha = \"1.0\"
         .unwrap_err();
         assert!(
             matches!(&why, EditError::Required { name, roots, .. }
-                if name == "alpha" && roots == &["beta"]),
+                if name == "alpha"
+                    && roots == &[("beta".to_string(), vec![DependencyTable::Dependencies])]),
             "{why:?}"
         );
         assert_eq!(world.lock(), lock);
+    }
+
+    /// The roots a refused `remove alpha` names, for a manifest that lists
+    /// alpha and the packages that need it.
+    fn roots_of_the_refusal(name: &str, manifest: &str) -> Vec<(String, Vec<DependencyTable>)> {
+        let world = World::new(name, manifest);
+        run_add(&world, "alpha@>=1.0", &InstallOptions::default()).unwrap();
+        let why = remove(
+            &world.env(&Recorder::default()),
+            "alpha",
+            DependencyTable::Dependencies,
+            &InstallOptions::default(),
+        )
+        .unwrap_err();
+        match why {
+            EditError::Required { roots, .. } => roots,
+            other => panic!("expected Required, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_root_is_named_with_the_tables_of_the_manifest_that_list_it() {
+        let head = "[project]\nlabview = \">=2024\"\n\n[sources]\ndefaults = false\n\n";
+        let alpha = "[dependencies]\nalpha = \">=1.0\"\n";
+        let beta = |table: &str| format!("\n[{table}]\nbeta = \">=1.0\"\n");
+        let cases = [
+            (
+                "roots-dev",
+                beta("dev-dependencies"),
+                vec![DependencyTable::DevDependencies],
+            ),
+            ("roots-group", beta("dependency-groups.ci"), vec![ci()]),
+            (
+                "roots-two",
+                format!(
+                    "{}{}",
+                    beta("dev-dependencies"),
+                    beta("dependency-groups.ci")
+                ),
+                vec![DependencyTable::DevDependencies, ci()],
+            ),
+        ];
+        for (name, listing, tables) in cases {
+            let roots = roots_of_the_refusal(name, &format!("{head}{alpha}{listing}"));
+            assert_eq!(roots, [("beta".to_string(), tables)], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_in_a_project_with_no_lock_yet_does_not_say_one_is_being_written() {
+        let manifest = format!("{PROJECT}alpha = \">=1.0\"\n");
+        let world = World::new("refuse-no-lock", &manifest);
+        let sink = Recorder::default();
+        let why = remove(
+            &world.env(&sink),
+            "alpha",
+            DependencyTable::Dependencies,
+            &InstallOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(why, EditError::Required { .. }), "{why:?}");
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::SyncLockMissing { .. })),
+            "{:?}",
+            sink.events()
+        );
+        assert_eq!(world.lock(), None);
+        assert_eq!(world.manifest(), manifest);
     }
 
     #[test]
@@ -1626,29 +1714,34 @@ alpha = \"1.0\"
         );
         let world = World::new("announce", &manifest);
         run_add(&world, "alpha@>=1.0", &InstallOptions::default()).unwrap();
-        let refused = |table, name: &str| {
+        let refused = |table, name: &str, dry_run| {
             let sink = Recorder::default();
             let why = remove_announcing(
                 &world.env(&sink),
                 name,
                 table,
-                &InstallOptions::default(),
+                &InstallOptions {
+                    dry_run,
+                    ..InstallOptions::default()
+                },
                 announced.clone(),
             )
             .unwrap_err();
             (why, sink.events())
         };
-        // Not a dependency, in another table, in no group, and required.
-        for (table, name) in [
-            (DependencyTable::Dependencies, "zeta"),
-            (DependencyTable::DevDependencies, "beta"),
-            (ci(), "beta"),
-            (DependencyTable::Dependencies, "alpha"),
+        // Not a dependency, in another table, in no group, and required: a
+        // dry run is refused just as a real one is.
+        for (table, name, dry_run) in [
+            (DependencyTable::Dependencies, "zeta", false),
+            (DependencyTable::DevDependencies, "beta", false),
+            (ci(), "beta", false),
+            (DependencyTable::Dependencies, "alpha", false),
+            (DependencyTable::Dependencies, "alpha", true),
         ] {
-            let (why, events) = refused(table, name);
+            let (why, events) = refused(table, name, dry_run);
             assert!(
                 !events.contains(&announced),
-                "{name}: {why:?} said {events:?}"
+                "{name} (dry run {dry_run}): {why:?} said {events:?}"
             );
         }
         let sink = Recorder::default();
@@ -1680,22 +1773,31 @@ alpha = \"1.0\"
             dry_run: false,
         };
         let world = World::new("announce-add", PROJECT);
-        let add_announcing = |spec: &str, sink: &Recorder| {
+        let add_announcing = |spec: &str, sink: &Recorder, dry_run| {
             add_announcing(
                 &world.env(sink),
                 spec,
                 DependencyTable::Dependencies,
                 None,
-                &InstallOptions::default(),
+                &InstallOptions {
+                    dry_run,
+                    ..InstallOptions::default()
+                },
                 announced.clone(),
             )
         };
-        let sink = Recorder::default();
-        add_announcing("zeta", &sink).unwrap_err();
-        assert!(!sink.events().contains(&announced), "{:?}", sink.events());
+        for dry_run in [false, true] {
+            let sink = Recorder::default();
+            add_announcing("zeta", &sink, dry_run).unwrap_err();
+            assert!(
+                !sink.events().contains(&announced),
+                "dry run {dry_run}: {:?}",
+                sink.events()
+            );
+        }
 
         let sink = Recorder::default();
-        add_announcing("gamma", &sink).unwrap();
+        add_announcing("gamma", &sink, false).unwrap();
         let events = sink.events();
         let said = events.iter().position(|event| *event == announced);
         let edited = events

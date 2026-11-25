@@ -1,5 +1,5 @@
-adding lvpm_vi_fixture to lvpm.toml and syncing the project to lvpm.lock (to install it without changing the project, pass --prefix, --global or --labview-version)
 no lvpm.lock found: writing one from lvpm.toml (commit lvpm.lock with the project)
+adding lvpm_vi_fixture to lvpm.toml and syncing the project to lvpm.lock
 lvpm.toml: added lvpm_vi_fixture = ">=1.0" to [dependencies]
 + lvpm_vi_fixture 1.0
 wrote <SANDBOX>/work/lvpm.lock (1 package); commit it with lvpm.toml

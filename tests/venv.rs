@@ -695,6 +695,8 @@ fn an_uninstall_whose_sync_stops_puts_lvpm_toml_and_lvpm_lock_back() {
     lab.ok(&["venv", "create"]);
     lab.ok(&["install", "app"]);
     let manifest = lab.manifest();
+    let lock_path = lab.project().join("lvpm.lock");
+    let lock = std::fs::read(&lock_path).unwrap();
     // A folder where lib recorded a file: removing it fails on any OS.
     let blocked = lab.file("lib", "lib.txt");
     std::fs::remove_file(&blocked).unwrap();
@@ -707,6 +709,7 @@ fn an_uninstall_whose_sync_stops_puts_lvpm_toml_and_lvpm_lock_back() {
         "lvpm.toml and lvpm.lock were put back as they were",
     );
     assert_eq!(lab.manifest(), manifest);
+    assert_eq!(std::fs::read(&lock_path).unwrap(), lock);
     has(&lab.manifest(), "app =");
     assert!(
         lab.record("lib").is_file(),

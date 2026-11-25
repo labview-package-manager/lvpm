@@ -365,8 +365,10 @@ $ lvpm remove gamma                 # --dev or --group ci if it is in another ta
 
 `add` and `remove` edit `lvpm.toml` (comments and layout stay), then lock and
 sync. If the lock or the sync fails, `lvpm.toml` and `lvpm.lock` are put back
-as they were. A package that another one still requires stays in the lock
-after `remove`, and the output says so. They install `[dependencies]`, dev and
+as they were. A package that another one requires is refused before anything is
+written: the error names who requires it, and one `next:` line names the
+`lvpm uninstall` of each package of yours to remove first, with its `--dev` or
+`--group` flag. They install `[dependencies]`, dev and
 the group they edit, and never uninstall a package the new lock still lists, so
 what `lvpm sync --group ci` installed stays; plain `lvpm sync` is the exact one.
 `--dev` is `--group dev`. A misspelt `--group` on `add` makes a new group, and
