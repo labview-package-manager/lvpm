@@ -76,7 +76,14 @@ fn read_config(path: &Path) -> Result<String, String> {
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err("config.xml: larger than 1 MiB".to_string());
     }
-    String::from_utf8(bytes).map_err(|_| "config.xml: not UTF-8 text".to_string())
+    Ok(decode(bytes))
+}
+
+/// `config.xml` as text. VIPM writes UTF-8, but older versions wrote the
+/// creator's name in the Windows code page, so bytes that are not UTF-8 are
+/// read as Latin-1, which agrees with Windows-1252 outside 0x80-0x9F.
+fn decode(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| e.into_bytes().iter().map(|&b| b as char).collect())
 }
 
 /// The text of `config.xml` read as a `Vipc`; the error is what is wrong with it.
@@ -137,14 +144,23 @@ fn package(block: &str) -> Result<Package, String> {
     })
 }
 
-/// `13.0` is 2013: a two-digit major, a dot, one or more digits, nothing else.
+/// `13.0` is 2013 and `9.0` is 2009: a major of 9 to 99, a dot, one or more
+/// digits, and then only the ` (32-bit)` or ` (64-bit)` VIPM writes.
 fn year(value: &str) -> Result<u32, String> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    match value.split_once('.') {
-        Some((major, minor)) if major.len() == 2 && digits(major) && digits(minor) => major
-            .parse::<u32>()
-            .map(|major| 2000 + major)
-            .map_err(|e| e.to_string()),
+    let number = [" (32-bit)", " (64-bit)"]
+        .iter()
+        .find_map(|bits| value.strip_suffix(bits))
+        .unwrap_or(value);
+    match number.split_once('.') {
+        Some((major, minor))
+            if (1..=2).contains(&major.len()) && digits(major) && digits(minor) =>
+        {
+            match major.parse::<u32>() {
+                Ok(major @ 9..=99) => Ok(2000 + major),
+                _ => Err(format!("<Version> {value} is before LabVIEW 2009")),
+            }
+        }
         _ => Err(format!("<Version> {value} is not N.N")),
     }
 }
@@ -439,6 +455,9 @@ mod tests {
             ("a_b-c_d", "1.2.3.4")
         );
         assert_eq!(one(config_xml("26.3", "")).labview_year, 2026);
+        assert_eq!(one(config_xml("26.1 (64-bit)", "")).labview_year, 2026);
+        assert_eq!(one(config_xml("24.3 (32-bit)", "")).labview_year, 2024);
+        assert_eq!(one(config_xml("9.0", "")).labview_year, 2009);
         assert_eq!(one(config_xml("13.10", "")).labview_year, 2013);
         let any_case = one(demo(&package_xml(
             "demo_lib-1.0.0.1",
@@ -515,7 +534,18 @@ mod tests {
                 "<Version> 2013.0 is not N.N".into(),
             ),
             (config_xml("13.", ""), "<Version> 13. is not N.N".into()),
-            (config_xml("1.0", ""), "<Version> 1.0 is not N.N".into()),
+            (
+                config_xml("8.6", ""),
+                "<Version> 8.6 is before LabVIEW 2009".into(),
+            ),
+            (
+                config_xml("13.0 (64-bit) ", ""),
+                "<Version> 13.0 (64-bit)  is not N.N".into(),
+            ),
+            (
+                config_xml("13.0 (16-bit)", ""),
+                "<Version> 13.0 (16-bit) is not N.N".into(),
+            ),
             (config_xml("+3.0", ""), "<Version> +3.0 is not N.N".into()),
             ("<Target></Target>".into(), "Version is missing".into()),
             (
@@ -593,12 +623,18 @@ mod tests {
             read(&path, &shown.to_string()).unwrap_err().to_string(),
             format!("{shown}: config.xml is missing")
         );
+    }
 
-        dir.vipc(&[("config.xml", &[0xff, 0xfe])]);
-        assert_eq!(
-            read(&path, &shown.to_string()).unwrap_err().to_string(),
-            format!("{shown}: config.xml: not UTF-8 text")
-        );
+    #[test]
+    fn a_config_in_the_windows_code_page_still_reads() {
+        let mut xml = demo(&chosen("demo_lib-1.0.0.1")).into_bytes();
+        let at = "<VI_Package_Configuration ".len();
+        xml.splice(at..at, b"Creator=\"J\xfcrgen\" ".iter().copied());
+        assert!(std::str::from_utf8(&xml).is_err());
+        let dir = Dir::new("code-page");
+        let path = dir.vipc(&[("config.xml", &xml)]);
+        let vipc = read(&path, "p.vipc").unwrap();
+        assert_eq!(vipc.packages[0].name, "demo_lib");
     }
 
     #[test]
