@@ -311,11 +311,12 @@ Modules are in `crates/lvpm-core/src/`, except `main.rs` and `render/` (in
 | `install.rs`                   | Plan, unpack, extract hook VIs, record a manifest, uninstall                                                            |
 | `venv.rs`                      | A project's `.lv-venv/` venv by default: binding, lookup from the working directory, `lvpm venv`                       |
 | `launch.rs`                    | Start LabVIEW on a venv: the `-pref` ini, readiness by handshake, detached spawning                                     |
-| `relink.rs`                    | Drive the embedded relink VI over installed folders; folder collapsing and retries                                      |
+| `relink.rs`                    | Drive the shipped relink VI over installed folders; folder collapsing and retries                                       |
 | `refresh.rs`                   | Rebuild palettes and menus through LabVIEW's own shipping VIs                                                           |
 | `viserver.rs`                  | The VI Server TCP protocol: connection, methods, flattened data                                                         |
 | `version.rs`                   | Package version ordering: OGPT `version-release`, VIPM's four-part form; not semver                                     |
-| `crates/lvpm-core/src/lv-src/relink-package.vi` | The relink VI embedded into the executable at build time (LabVIEW 2020)                                                 |
+| `crates/lvpm-core/src/lv-src/relink-package.vi` | The relink VI, shipped beside the executable (LabVIEW 2020)                                                            |
+| `crates/lvpm-core/src/lv-src/build-app.vi` | The `build --app` wrapper VI, shipped beside the executable (LabVIEW 2026)                                           |
 | `scripts/install.ps1`          | Download, verify and install the latest release                                                                         |
 
 Thank you for helping improve lvpm.

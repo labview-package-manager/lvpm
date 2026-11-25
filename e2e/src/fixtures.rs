@@ -1,6 +1,7 @@
-//! What each suite's work folder holds besides the two executables. The
-//! repo's own VIs are built into this executable, so it needs no checkout
-//! where it runs.
+//! What each suite's work folder holds besides the two executables and the
+//! VIs lvpm ships beside its executable (SHIPPED_VIS in main.rs). The repo's
+//! fixtures are built into this executable, so it needs no checkout where it
+//! runs.
 
 use std::io::Write;
 use std::path::Path;

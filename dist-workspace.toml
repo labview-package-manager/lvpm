@@ -13,8 +13,7 @@ cargo-dist-version = "0.34.0"
 ci = "github"
 # Where to host releases
 hosting = "github"
-# Windows x64 and Linux x64. The relink VI stays embedded in lvpm, so nothing
-# ships beside the executable.
+# Windows x64 and Linux x64.
 targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
 # A per-user MSI for Windows. The zip and tarball are published too, and
 # scripts/install.ps1 installs the zip.
@@ -32,7 +31,15 @@ pr-run-mode = "plan"
 # which their licenses ask a binary distribution to include; lvpm's own
 # LICENSE-* files dist adds by itself. It is not in git: release.yml generates
 # it with cargo-about before each build (.github/build-setup.yml, about.toml).
-include = ["THIRD-PARTY-LICENSES.txt"]
+#
+# The two VIs lvpm hands to LabVIEW ship beside the executable, not inside it:
+# Microsoft Defender flagged an unsigned exe that writes a blob out and hands
+# it to another process. build.rs records their hashes (crates/lvpm-core).
+include = [
+  "THIRD-PARTY-LICENSES.txt",
+  "crates/lvpm-core/src/lv-src/relink-package.vi",
+  "crates/lvpm-core/src/lv-src/build-app.vi",
+]
 github-build-setup = "../build-setup.yml"
 
 # NI's LabVIEW Linux images run Ubuntu 22.04; a binary built against a newer

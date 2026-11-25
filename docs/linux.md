@@ -95,7 +95,7 @@ project in the folder, the compile writes `<name>.aliases` and
 
 With `lvpm-e2e run --image nationalinstruments/labview:2026q3-linux --lvpm
 <static lvpm>`, all in one container (both executables built for
-`x86_64-unknown-linux-musl`):
+`x86_64-unknown-linux-musl`, the VIs beside the static lvpm):
 
 - `lvpm targets` reports `LabVIEW 2026 (64-bit) v26.3`.
 - A headless `lvpm install --relink --hooks` in a project with no venv starts

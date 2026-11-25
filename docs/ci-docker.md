@@ -21,7 +21,7 @@ same test without installing anything, for a cheap first step.
 ```dockerfile
 FROM nationalinstruments/labview:latest-windows
 ENV LV_RTE_HEADLESS=1
-COPY lvpm.exe C:/lvpm/
+COPY lvpm.exe relink-package.vi build-app.vi C:/lvpm/
 COPY . C:/src
 WORKDIR C:/src
 RUN C:\lvpm\lvpm.exe install
