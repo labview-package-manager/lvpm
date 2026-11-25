@@ -66,7 +66,9 @@ manifest a command uses is chosen in this order, first match wins:
 3. `--project <DIR>`: `<DIR>/lvpm.toml`, if it exists.
 4. The nearest `lvpm.toml` at or above the working directory.
 
-No manifest is fine: `lvpm install <name>` works without a project. When a
+No manifest is fine: `lvpm install <name> --prefix <DIR>` and
+`lvpm install <name> --global` work without a project. With no destination
+flag, `install` fails and names `--global`. When a
 manifest is found, its `[sources]` apply to every command that reads indexes
 (`search`, single-package `install`, full `install`), not only to a
 manifest-driven install. `min-age-days` is the exception: a single-package
@@ -213,8 +215,8 @@ offset without a sign, a feed quirk beyond RFC 2822, is read as positive.
   resolves again, and an up-to-date `lvpm.lock` is not resolved again.
   `lvpm sync --locked` and `--frozen` never resolve, so they never apply it.
 - A plain install never applies the limit: `lvpm install --global <name>`
-  outside a project, `lvpm install <name> --no-project` in one, or
-  `lvpm install <name>` outside a project. With `--no-project` it uses the
+  or `lvpm install <name> --prefix <DIR>` outside a project, or
+  `lvpm install <name> --no-project` in one. With `--no-project` it uses the
   project's `[sources]` but not its `min-age-days`; outside a project it reads
   the indexes alone. In a project, `lvpm install <name>` adds the package to
   `lvpm.toml` whatever destination flag it has, and that does apply the limit.

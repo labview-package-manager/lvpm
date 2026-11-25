@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// The flags that say where a command's packages live.
 #[derive(Debug, Clone, Default)]
 pub struct DestinationFlags {
-    /// Install into this LabVIEW version, e.g. 2026.
+    /// Pick this LabVIEW version, e.g. 2026. A write into the installation
+    /// itself needs `--global` as well.
     pub labview_version: Option<String>,
     /// Pick the 32- or 64-bit LabVIEW when both of a version are installed.
     pub labview_bitness: Option<u8>,
@@ -64,6 +65,15 @@ impl DestinationFlags {
         .into_iter()
         .flatten()
         .collect()
+    }
+}
+
+/// `word` as one word of a command line a user is told to run: in double quotes
+/// when it holds white space or a character a shell reads (`<>|&;()`).
+pub fn shell_word(word: &str) -> String {
+    match word.contains(|c: char| c.is_whitespace() || "<>|&;()".contains(c)) {
+        true => format!("\"{word}\""),
+        false => word.to_string(),
     }
 }
 
@@ -212,12 +222,22 @@ impl<'a> OpEnv<'a> {
     /// command-line fragment (`--prefix dest`): what a suggested command needs
     /// to act on the same target, and the `--project` that picked the project.
     pub fn destination_flags_as_typed(&self) -> Option<String> {
-        let project =
-            (self.flags.project.as_ref()).map(|p| ("--project", Some(p.display().to_string())));
+        self.flags_as_typed(true)
+    }
+
+    /// [`Self::destination_flags_as_typed`] without `--project`: for a command
+    /// that cannot take it, as `--no-project` cannot.
+    pub fn target_flags_as_typed(&self) -> Option<String> {
+        self.flags_as_typed(false)
+    }
+
+    fn flags_as_typed(&self, with_project: bool) -> Option<String> {
+        let project = (self.flags.project.as_ref())
+            .filter(|_| with_project)
+            .map(|p| ("--project", Some(p.display().to_string())));
         let typed: Vec<String> = (self.picked().into_iter().chain(project))
             .map(|(flag, value)| match value {
-                Some(v) if v.contains(char::is_whitespace) => format!("{flag} \"{v}\""),
-                Some(v) => format!("{flag} {v}"),
+                Some(v) => format!("{flag} {}", shell_word(&v)),
                 None => flag.to_string(),
             })
             .collect();
@@ -686,6 +706,33 @@ mod tests {
         assert_eq!(
             env.destination_flags_as_typed().as_deref(),
             Some("--prefix \"my dest\" --global --project \"my proj\"")
+        );
+        // The target alone, for a command that cannot take --project.
+        assert_eq!(
+            env.target_flags_as_typed().as_deref(),
+            Some("--prefix \"my dest\" --global")
+        );
+    }
+
+    #[test]
+    fn a_value_a_shell_reads_is_quoted_in_every_flag_a_hint_repeats() {
+        for (value, said) in [
+            ("a&b", "\"a&b\""),
+            ("a;b", "\"a;b\""),
+            ("a b", "\"a b\""),
+            ("a(b)", "\"a(b)\""),
+            ("a>b", "\"a>b\""),
+            ("a|b", "\"a|b\""),
+            ("plain", "plain"),
+        ] {
+            assert_eq!(shell_word(value), said);
+        }
+        let mut env = OpEnv::new(&NullSink, config(), Vec::new(), PathBuf::from("."));
+        env.flags.prefix = Some(PathBuf::from("a&b"));
+        env.flags.project = Some(PathBuf::from("p;q"));
+        assert_eq!(
+            env.destination_flags_as_typed().as_deref(),
+            Some("--prefix \"a&b\" --project \"p;q\"")
         );
     }
 

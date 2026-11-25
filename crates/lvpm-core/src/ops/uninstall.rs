@@ -234,7 +234,7 @@ fn with_dependencies(
                     .collect()
             };
             return Err(EditError::Required {
-                roots: dependency::roots_above(&plan.root, dependents_of)
+                roots: dependency::roots_above(&plan.root, dependents_of, |_| false)
                     .into_iter()
                     .map(|root| (root, Vec::new()))
                     .collect(),

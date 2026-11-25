@@ -440,6 +440,16 @@ pub enum EditError {
         required_by: Vec<String>,
         roots: Vec<(String, Vec<DependencyTable>)>,
     },
+    /// The project would sync into a LabVIEW installation itself, and the sync
+    /// would uninstall `packages` (name and version), which neither the old lock
+    /// nor the new one lists: other projects, or the user, put them there.
+    /// Nothing was changed.
+    // Temporary until #55 asks before a sync removes.
+    #[error(
+        "LabVIEW holds packages that lvpm.lock does not list, and the sync would uninstall them: {}",
+        names_and_versions(.packages)
+    )]
+    ForeignInInstallation { packages: Vec<(String, String)> },
     /// `remove` names a package that is not in the table asked for, `[dependency-groups.<group>]`.
     #[error("{name} is not in [dependency-groups.{group}]")]
     NotInGroup { name: String, group: String },
@@ -674,6 +684,14 @@ fn not_found(token_source: Option<TokenSource>) -> String {
         Some(source) => format!("not found, or the token from {source} cannot see it"),
         None => format!("not found. If it is private, {SIGN_IN}"),
     }
+}
+
+/// `name version`, comma-separated.
+fn names_and_versions(packages: &[(String, String)]) -> String {
+    (packages.iter())
+        .map(|(name, version)| format!("{name} {version}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The tables as their headers read, in a sentence: `[a]`, `[a] and [b]`,

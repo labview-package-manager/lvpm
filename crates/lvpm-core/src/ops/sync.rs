@@ -2785,8 +2785,8 @@ beta = \"*\"
     }
 
     #[test]
-    fn a_sync_in_a_project_with_no_venv_is_refused_at_a_labview_version_alone_and_changes_nothing()
-    {
+    fn a_sync_at_a_labview_version_alone_in_a_project_with_no_venv_is_refused_saying_no_venv_and_changes_nothing()
+     {
         use crate::ops::testing::{FakeInstallation, Recorded, env_on, scratch_dir, snapshot};
         let dir = scratch_dir("sync-needs-global");
         let fake = FakeInstallation::new(&dir);

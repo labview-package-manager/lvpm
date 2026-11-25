@@ -65,16 +65,30 @@ pub fn package_dependency_names(
 /// required and also listed is passed over for what requires it, since removing
 /// it would be refused too. Each direct dependent is climbed on its own: one
 /// whose climb reaches no top, because it is in a cycle, is named itself.
-pub fn roots_above(name: &str, dependents_of: impl Fn(&str) -> Vec<String>) -> Vec<String> {
+///
+/// A package passed over that `listed` says the project lists is named too: the
+/// user can remove it, and has to before `name` can go. The result is in the
+/// order to remove them: a package comes after everything that requires it.
+pub fn roots_above(
+    name: &str,
+    dependents_of: impl Fn(&str) -> Vec<String>,
+    listed: impl Fn(&str) -> bool,
+) -> Vec<String> {
     let mut roots = Vec::new();
     for dependent in dependents_of(name) {
         let mut seen = HashSet::from([key(name), key(&dependent)]);
         let mut queue = vec![dependent.clone()];
         let mut tops = Vec::new();
+        let mut passed_over = Vec::new();
         while let Some(package) = queue.pop() {
             match dependents_of(&package) {
                 above if above.is_empty() => tops.push(package),
-                above => queue.extend(above.into_iter().filter(|up| seen.insert(key(up)))),
+                above => {
+                    if listed(&package) {
+                        passed_over.push(package.clone());
+                    }
+                    queue.extend(above.into_iter().filter(|up| seen.insert(key(up))));
+                }
             }
         }
         roots.extend(if tops.is_empty() {
@@ -82,8 +96,23 @@ pub fn roots_above(name: &str, dependents_of: impl Fn(&str) -> Vec<String>) -> V
         } else {
             tops
         });
+        roots.extend(passed_over);
     }
-    roots.sort_by_cached_key(|root| key(root));
+    // What requires a package, and what requires that: more of them means
+    // nearer the bottom, so fewer first is top-down.
+    let above = |package: &str| {
+        let mut seen = HashSet::from([key(package)]);
+        let mut queue = vec![package.to_string()];
+        while let Some(next) = queue.pop() {
+            queue.extend(
+                dependents_of(&next)
+                    .into_iter()
+                    .filter(|up| seen.insert(key(up))),
+            );
+        }
+        seen.len()
+    };
+    roots.sort_by_cached_key(|root| (above(root), key(root)));
     roots.dedup_by(|a, b| key(a) == key(b));
     roots
 }
@@ -266,13 +295,28 @@ mod tests {
             ("lib", &[]),
         ];
         assert_eq!(
-            roots_above("lib", dependents_in(edges)),
+            roots_above("lib", dependents_in(edges), |_| false),
             ["app", "Other"],
             "a package that is required itself is passed over for its requirer"
         );
         assert_eq!(
-            roots_above("app", dependents_in(edges)),
+            roots_above("app", dependents_in(edges), |_| false),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_listed_package_that_is_passed_over_is_named_and_the_order_is_top_down() {
+        // zeta -> mid -> lib, and the project lists all three: both go first.
+        let edges: &[(&str, &[&str])] = &[("zeta", &["mid"]), ("mid", &["lib"]), ("lib", &[])];
+        assert_eq!(
+            roots_above("lib", dependents_in(edges), |_| true),
+            ["zeta", "mid"]
+        );
+        let unlisted_middle = |name: &str| name != "mid";
+        assert_eq!(
+            roots_above("lib", dependents_in(edges), unlisted_middle),
+            ["zeta"]
         );
     }
 
@@ -283,9 +327,12 @@ mod tests {
             ("left", &["lib"]),
             ("right", &["lib"]),
         ];
-        assert_eq!(roots_above("lib", dependents_in(diamond)), ["app"]);
+        assert_eq!(
+            roots_above("lib", dependents_in(diamond), |_| false),
+            ["app"]
+        );
         let cycle: &[(&str, &[&str])] = &[("a", &["b"]), ("b", &["a"])];
-        assert_eq!(roots_above("a", dependents_in(cycle)), ["b"]);
+        assert_eq!(roots_above("a", dependents_in(cycle), |_| false), ["b"]);
     }
 
     #[test]
@@ -297,7 +344,10 @@ mod tests {
             ("y", &["x"]),
             ("lib", &[]),
         ];
-        assert_eq!(roots_above("lib", dependents_in(edges)), ["app", "x"]);
+        assert_eq!(
+            roots_above("lib", dependents_in(edges), |_| false),
+            ["app", "x"]
+        );
     }
 
     #[test]

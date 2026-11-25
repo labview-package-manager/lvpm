@@ -922,8 +922,8 @@ async fn fails_saying_the_lock_decides(world: &mut CliWorld, flag: String) {
     );
 }
 
-#[then(regex = r#"^the error's next line names "([^"]+)"$"#)]
-async fn the_next_line_names(world: &mut CliWorld, flag: String) {
+/// The one `next: ` line the failed command printed.
+fn the_one_next_line(world: &CliWorld) -> String {
     world.assert_failed();
     let printed = printed_plain(world);
     let next: Vec<&str> = printed
@@ -931,54 +931,53 @@ async fn the_next_line_names(world: &mut CliWorld, flag: String) {
         .filter(|line| line.starts_with("next: "))
         .collect();
     assert_eq!(next.len(), 1, "one next line in:\n{printed}");
-    assert!(next[0].contains(&flag), "{flag:?} is not in: {}", next[0]);
+    next[0].to_string()
+}
+
+#[then(regex = r#"^the error's next line names "([^"]+)"$"#)]
+async fn the_next_line_names(world: &mut CliWorld, flag: String) {
+    let next = the_one_next_line(world);
+    assert!(next.contains(&flag), "{flag:?} is not in: {next}");
 }
 
 /// `commands` is every command the line names, in order, as `"a" and "b"`; the
 /// plain text of the line is `next: run a ... and b ... first`, each command
-/// followed by whatever flags it carries.
+/// followed by the delimiter or by space-separated flags, never by more of its
+/// own name (`lvpm uninstall app` is not `lvpm uninstall app2`).
 #[then(regex = r#"^the error's next line says to run ("[^"]+"(?: and "[^"]+")*) first$"#)]
 async fn the_next_line_says_to_run_first(world: &mut CliWorld, commands: String) {
-    world.assert_failed();
-    let printed = printed_plain(world);
-    let next: Vec<&str> = printed
-        .lines()
-        .filter(|line| line.starts_with("next: "))
-        .collect();
-    assert_eq!(next.len(), 1, "one next line in:\n{printed}");
+    let next = the_one_next_line(world);
     let wanted: Vec<&str> = commands
         .split(" and ")
         .map(|c| c.trim_matches('"'))
         .collect();
-    let mut rest = next[0]
+    let mut rest = next
         .strip_prefix("next: run ")
-        .unwrap_or_else(|| panic!("not a run line: {}", next[0]));
+        .unwrap_or_else(|| panic!("not a run line: {next}"));
     for (at, command) in wanted.iter().enumerate() {
         rest = rest
             .strip_prefix(command)
-            .unwrap_or_else(|| panic!("{command:?} is not next in: {}", next[0]));
+            .unwrap_or_else(|| panic!("{command:?} is not next in: {next}"));
         let end = if at + 1 < wanted.len() {
             " and "
         } else {
             " first"
         };
+        assert!(
+            rest.starts_with(end) || rest.starts_with(" -"),
+            "{command:?} is followed by more than flags in: {next}"
+        );
         let flags_end = rest
             .find(end)
-            .unwrap_or_else(|| panic!("{end:?} does not follow {command:?} in: {}", next[0]));
+            .unwrap_or_else(|| panic!("{end:?} does not follow {command:?} in: {next}"));
         rest = &rest[flags_end + end.len()..];
     }
 }
 
 #[then("the error's next line says to check the name")]
 async fn the_next_line_says_to_check_the_name(world: &mut CliWorld) {
-    world.assert_failed();
-    let printed = printed_plain(world);
-    let next: Vec<&str> = printed
-        .lines()
-        .filter(|line| line.starts_with("next: "))
-        .collect();
-    assert_eq!(next.len(), 1, "one next line in:\n{printed}");
-    assert!(next[0].contains("check the name"), "{}", next[0]);
+    let next = the_one_next_line(world);
+    assert!(next.contains("check the name"), "{next}");
 }
 
 #[then(regex = r#"^the error does not mention "([^"]+)"$"#)]

@@ -28,7 +28,7 @@ with the user 2026-11-25). Writing into a LabVIEW installation itself takes
 
 | Command | In a project | Outside a project |
 |---|---|---|
-| `install` | sync to lvpm.lock (into the destination flag's target, if any) | error: nothing to install |
+| `install` | sync to lvpm.lock (into the destination flag's target, if any) | error: "give a package name" |
 | `install <pkg>` | add to lvpm.toml, lock, sync (into the destination flag's target, if any) | direct install |
 | `install <pkg> --no-project` | direct install; lvpm.toml and lvpm.lock untouched | direct install |
 | `uninstall <pkg>` | take out of lvpm.toml, lock, sync (into the destination flag's target, if any) | direct uninstall |
@@ -54,7 +54,7 @@ write into the system Python, as lvpm's writes need `--global`. lvpm already has
 | Real LabVIEW (user's decision 2026-11-25) | `--global` is required for every write into an installation: install, uninstall, sync, relink, add, remove, run-hooks. `--labview-version` picks which one; alone it fails naming `--global`. `--global` without `--labview-version` takes the manifest's `labview` in a project, else the only installation. Reads (`list`, `vi-*`, linkfix, launch), `venv create`, `init`, `refresh` and `start` are unchanged. Headless counts as consent, with or without lvpm.toml. The TUI's no-venv install is refused. |
 | Destination flags | Pick the target only. A named `install`/`uninstall` in a project edits the project whatever the destination flag. |
 | Opt-out | `--no-project` on `install` and `uninstall`: `requires = "package"`, `conflicts_with = "project"`. Outside a project it is accepted and changes nothing. It conflicts with the saving flags (`--dev`, `--index`; `--group` with a package is refused in `install_mode`). |
-| Behaviour change (release note #58, PR body list) | (1) `install x --prefix/--global/--labview-version` inside a project now edits lvpm.toml. (2) `uninstall x` of a package the project lists now takes it out of lvpm.toml. (3) `uninstall x` of a package another locked one requires fails. (4) `uninstall x` in a project, x not listed, fails. (5) `--keep-deps`/`--force` need `--no-project` in a project. (6) `add`/`remove` outside a project install/uninstall directly instead of refusing. (7) `--json` names `add`/`remove` as `install`/`uninstall`. (8) `--labview-version YYYY` alone no longer writes into LabVIEW YYYY; add `--global` (the 0.3.1 README form `lvpm install x --labview-version 2026` fails with that hint). (9) `--global` alone picks the venv's, the manifest's or the only LabVIEW instead of failing. (10) The TUI no longer installs into the newest LabVIEW when there is no venv. (11) Outside a project `install x --manifest y` fails with "--manifest cannot be used with a package name" (exit 1; clap's `manifest conflicts_with = "package"` was removed, so it is no longer clap's exit 2). (12) `--allow-downgrade` is refused in a project, even for a bare sync: the lock decides. (13) `--dev`, `--group` and `--index` on a named install fail outside a project and with `--no-project`. (14) `--global` with `--prefix` is an error ("mutually exclusive"). |
+| Behaviour change (release note #58, PR body list) | (1) `install x --prefix/--global/--labview-version` inside a project now edits lvpm.toml. (2) `uninstall x` of a package the project lists now takes it out of lvpm.toml. (3) `uninstall x` of a package another locked one requires fails. (4) `uninstall x` in a project, x not listed, fails. (5) `--keep-deps`/`--force` need `--no-project` in a project. (6) `add`/`remove` outside a project install/uninstall directly instead of refusing. (7) `--json` names `add`/`remove` as `install`/`uninstall`. (8) `--labview-version YYYY` alone no longer writes into LabVIEW YYYY; add `--global` (the 0.3.1 README form `lvpm install x --labview-version 2026` fails with that hint). (9) `--global` alone picks the venv's, the manifest's or the only LabVIEW instead of failing. (10) The TUI no longer installs into the newest LabVIEW when there is no venv. (11) Outside a project `install x --manifest y` fails with "--manifest cannot be used with a package name" (exit 1; clap's `manifest conflicts_with = "package"` was removed, so it is no longer clap's exit 2). (12) `--allow-downgrade` is refused in a project, even for a bare sync: the lock decides. (13) `--dev`, `--group` and `--index` on a named install fail outside a project and with `--no-project`. (14) `--global` with `--prefix` is an error ("mutually exclusive"). (15) A bare `install` outside a project now says "give a package name" (install.rs:201), not "nothing to install". (16) A named `install` or `uninstall` in a project, into a LabVIEW installation itself, is refused before it writes anything if the sync would remove packages that neither the old nor the new lock lists (put there by other projects or the user). The error names them and suggests `--no-project`. A guard until #55 adds a question. |
 | Upgrader signal | When a named project install or uninstall was given a destination flag, it prints: "note: in a project, --prefix picks where the project syncs; lvpm.toml gets x. Pass --no-project to install without changing the project." (flag named as typed; present tense, as it is printed before the add runs, which can still fail, and `--dry-run` writes nothing). `--labview-version` is named only when no venv wins: `OpEnv::destination` lets a venv at or above the cwd beat it. A plain `install x` prints the existing "adding x to lvpm.toml" line without the opt-out. |
 | `uninstall` flags in a project | `--with-deps` is what happens anyway, so it is accepted. `--keep-deps` and `--force` are refused, naming `--no-project`: the lock decides what stays, and a sync would undo either. uv has neither on `uv remove`. |
 | `uninstall` gains `remove`'s flags | `--dev`, `--group` and flattened `ApplyArgs`. On a direct route `--dev`, `--group` and the `ApplyArgs` bools (`--dry-run`, `--no-linkfix`, `--relink`, `--hooks`) are refused ("only a project uninstall takes it"); the `RelinkArgs` values are ignored there, as they cannot be told from their defaults. Direct uninstall takes none of these today, so nothing that works breaks. |
@@ -76,7 +76,7 @@ write into the system Python, as lvpm's writes need `--global`. lvpm already has
 - [ ] Every existing scenario and step that ran a named install/uninstall with a destination flag inside a project, to install directly, passes `--no-project`, and its recorded output is unchanged apart from the command line. The panic run of Step 1.1 lists none left.
 - [ ] Outside a venv, a write with `--labview-version` alone fails naming `--global` and changes nothing; with `--global` it writes into that LabVIEW; `--global` alone takes the manifest's `labview`, else the only installation, else asks "which LabVIEW?"; `list --labview-version` still reads without `--global`; headless writes need no `--global`; `run-hooks` follows the same rule; the TUI's no-venv install fails naming `lvpm install <name> --global`.
 - [ ] `grep -rnE "lvpm (install|uninstall|sync|relink|run-hooks)\b.*--labview-version" README.md docs/*.md docs/tutorial` matches only lines that also contain `--global`, or the docs/ci-docker.md headless lines, which the PR lists by name.
-- [ ] Outside plans/, docs/specs/ and docs/vision/, `grep -rnE --exclude-dir=specs --exclude-dir=vision "lvpm (add|remove)\b"` over docs/ and src/ matches only the alias sentence in docs/usage.md; in tests/ only the alias scenarios and slice-13's kept alias scenarios.
+- [ ] Outside plans/, docs/specs/, docs/vision/, docs/adr/ (a decision record) and docs/map/ (a generated snapshot), `grep -rnE --exclude-dir=specs --exclude-dir=vision --exclude-dir=adr --exclude-dir=map "lvpm (add|remove)\b"` over docs/ and src/ matches only the alias sentence in docs/usage.md; in tests/ only the alias scenarios and slice-13's kept alias scenarios.
 
 "Nothing changed" in the scenarios below is the existing step: lvpm.toml and lvpm.lock bytes and the installed set are as before (tests/steps/add_remove.rs).
 
@@ -322,7 +322,7 @@ Between Slice 2 and Slice 3, a project uninstall of a required package still kee
   - `--keep-deps` and `--force` in a project: "{flag} cannot be used in a project, because lvpm.lock decides what stays", next line names `--no-project`.
   - A project-only flag on a direct uninstall (`OnlyInAProject`) says why the uninstall is direct: no package ("drop F, or name a package"), `--no-project` ("drop F, or drop --no-project"), or no lvpm.toml found (the "run this in a project" text).
   - `NotADependency` for an installed name has the next line `lvpm uninstall x --no-project` plus the destination flags as typed, with values (`--prefix dest`, `--global`, `--labview-version 2026`); so do the `UninstalledStillListed` note and the other-table hints. They are listed in the order that decides the target: `--prefix`, `--labview-version` (not when a venv wins and `--global` is absent), `--global`. The `NotInGroup` hint (`lvpm add x --group g`) did not carry them until Step 3.1.
-- The other-table hints use the verb the user ran: `lvpm uninstall x --dev` for `uninstall`, and `lvpm remove` stays `lvpm remove` for `lvpm remove` until Slice 5.
+- The other-table hints use the verb the user ran: `lvpm uninstall x --dev` for `uninstall`.
 - `--no-relink` (hidden, a no-op on every command) is not refused on a direct uninstall. `--relink-timeout` is not either: it has a default, so a typed one cannot be told from none without carrying clap's `value_source` to `flag_given`; `--keep-open` and `--relink-progress` are refused. Both are marked with a `shortcut:` comment on `ApplyArgs::flag_given`.
 - Slice-1 characterization rows 34 and 147 need no migration: they run in a directory with no project. `tests/support/sandbox.rs` (`restore_labview_installation`) gets `--no-project`, since the work directory can hold a scenario's project.
 - `remove`'s not-a-dependency probe (`installed_in_the_target`) finds the venv and the roots without `destination()`, so it adds no `VenvSelected` event. A headless, venv-less project is not probed there, and reads as holding nothing.
@@ -592,7 +592,7 @@ In `s7c-pinned-sources.feature`, on its Background (`a project with labview "202
 ### Slice 6: a write into LabVIEW itself needs --global
 
 **Depends-on:** 5
-**Files:** `crates/lvpm-core/src/ops/env.rs`, `crates/lvpm-core/src/ops/query.rs`, `crates/lvpm-core/src/ops/hooks.rs`, `crates/lvpm-core/src/ops/launch_cmd.rs`, `crates/lvpm-core/src/ops/linkfix.rs`, `crates/lvpm-tui/src/destination.rs`, `crates/lvpm-tui/src/worker.rs`, `src/main.rs`, `tests/features/lvpm-lockfile/slice-6-openv-and-query-operations-in-core.feature`, `tests/steps/destination.rs`, `tests/features/hooks/s12-install-hooks.feature`, `tests/features/lvpm-lockfile/slice-1-characterization-harness-and-recorded-cli-output.feature`, `tests/features/lvpm-venv-resave/slice-2-staged-install-with-resave.feature`, `tests/support/sandbox.rs`, `tests/golden/**`
+**Files:** `crates/lvpm-core/src/ops/env.rs`, `crates/lvpm-core/src/ops/query.rs`, `crates/lvpm-core/src/ops/hooks.rs`, `crates/lvpm-core/src/ops/launch_cmd.rs`, `crates/lvpm-core/src/ops/linkfix.rs`, `crates/lvpm-tui/src/destination.rs`, `crates/lvpm-tui/src/worker.rs`, `src/main.rs`, `tests/features/lvpm-lockfile/slice-6-openv-and-query-operations-in-core.feature`, `tests/steps/destination.rs`, `tests/features/hooks/s12-install-hooks.feature`, `tests/features/lvpm-lockfile/slice-1-characterization-harness-and-recorded-cli-output.feature`, `tests/support/sandbox.rs`, `tests/golden/**`
 
 The user's decision of 2026-11-25: installing into a LabVIEW installation changes every project that uses it, so lvpm does it only when `--global` is given. `--labview-version` picks which LabVIEW; on its own it no longer means "the installation itself". uv: `uv pip install` refuses the system Python without `--system`, and `uv pip list` reads it without.
 
@@ -603,11 +603,11 @@ Callers of `OpEnv::destination()`, by what they do:
 | write | add_remove.rs:52/93, install.rs:190, relink.rs:44, sync.rs:170, uninstall.rs:41, staging.rs:298 | `destination()`: strict, needs `--global` for an installation |
 | read | query.rs:224 (`list`), launch_cmd.rs:47 (only takes a venv), linkfix.rs:58 (bails on anything but a venv), main.rs:1560 `vi_server_for` (`vi-*`), lvpm-tui destination.rs:70 (header, Load) | `read_destination()`: as today |
 | guard | tests/support/sandbox.rs:223 `real_installation_risk` | `read_destination()`, so it stays a superset of lvpm's rule |
-| roots() only | hooks.rs:34 (`run-hooks`, writes), refresh.rs:14, start.rs:21 | `roots()` stays flag-only; `run_hooks` adds the `--global` check itself |
+| roots() only | hooks.rs:34 (`run-hooks`, writes), refresh.rs:14, start.rs:21 | `refresh` and `start` use `flagged_roots()` (no `--global` needed, and `--global` alone settles); `run_hooks` uses `write_roots()`, which adds the `--global` check |
 
 Strict by default: a new caller of `destination()` is safe.
 
-Unchanged: `venv create`, `init`, `refresh`, `start`, `targets`; a venv wins over `--labview-version`; `--prefix` needs no `--global`.
+Unchanged: `venv create`, `init`, `targets`; `refresh` and `start` need no `--global`, but `--global` alone now settles for them (through `flagged_roots()`); a venv wins over `--labview-version`; `--prefix` needs no `--global`.
 
 Headless counts as consent (stance, flagged to the user): on a headless machine, `--labview-version` alone still writes into that LabVIEW. This holds both in a manifest-only project (today's exception) and with no lvpm.toml at all. docs/ci-docker.md: a container's LabVIEW is the sandbox, and nobody is there to type the flag.
 
@@ -625,20 +625,21 @@ These run in core against two fake installations (2026 newer, 2025 the manifest'
     Then the result is <result>
 
     Examples:
-      | flags                               | cwd                                   | headless | result                                        |
-      | --labview-version 2025              | anywhere                              | false    | error naming --global, with a next line       |
-      | --global --labview-version 2026     | anywhere                              | false    | LabVIEW 2026 itself                           |
-      | --global --labview-version 2026     | a project with a venv                 | false    | LabVIEW 2026 itself                           |
-      | --global --labview-version 1999     | anywhere                              | false    | error naming the installed LabVIEWs           |
-      | --global --prefix x                 | anywhere                              | false    | error "mutually exclusive"                    |
-      | --global                            | anywhere                              | false    | error "which LabVIEW?" naming both            |
-      | --global                            | a project without a venv              | false    | LabVIEW 2025 itself, no venv announced        |
-      | --global                            | a project with a venv                 | false    | the venv's LabVIEW itself, no venv announced  |
-      | --global                            | a project whose labview is not installed | false | error naming the manifest's labview           |
-      | --labview-version 2025              | a project with a venv                 | false    | the venv                                      |
-      | none                                | anywhere                              | false    | error "pick a destination" naming --global    |
-      | --labview-version 2026              | a project without a venv              | true     | LabVIEW 2026, chosen headless                 |
-      | --labview-version 2026              | anywhere                              | true     | LabVIEW 2026 itself                           |
+      | flags                           | cwd                                      | headless | result                                       |
+      | --labview-version 2025          | anywhere                                 | false    | error naming --global, with a next line      |
+      | --labview-version 2026          | a project without a venv                 | false    | error naming lvpm venv create and --global   |
+      | --global --labview-version 2026 | anywhere                                 | false    | LabVIEW 2026 itself                          |
+      | --global --labview-version 2025 | a project with a venv                    | false    | LabVIEW 2025 itself                          |
+      | --global --labview-version 1999 | anywhere                                 | false    | error naming the installed LabVIEWs          |
+      | --global --prefix x             | anywhere                                 | false    | error "mutually exclusive"                   |
+      | --global                        | anywhere                                 | false    | error "which LabVIEW?" naming both           |
+      | --global                        | a project without a venv                 | false    | LabVIEW 2025 itself, no venv announced       |
+      | --global                        | a project with a venv                    | false    | the venv's LabVIEW itself, no venv announced |
+      | --global                        | a project whose labview is not installed | false    | error naming the manifest's labview          |
+      | --labview-version 2025          | a project with a venv                    | false    | the venv                                     |
+      | none                            | anywhere                                 | false    | error "pick a destination" naming --global   |
+      | --labview-version 2026          | a project without a venv                 | true     | LabVIEW 2026, chosen headless                |
+      | --labview-version 2026          | anywhere                                 | true     | LabVIEW 2026 itself                          |
 
   @core
   Scenario Outline: reading needs no --global
@@ -647,8 +648,8 @@ These run in core against two fake installations (2026 newer, 2025 the manifest'
     Then the result is <result>
 
     Examples:
-      | flags                  | result              |
-      | --labview-version 2025 | LabVIEW 2025 itself |
+      | flags                  | result                                     |
+      | --labview-version 2025 | LabVIEW 2025 itself                        |
       | none                   | error "pick a destination" naming --global |
 ```
 
@@ -681,10 +682,10 @@ Unit tests, not scenarios:
 - New result phrases go in the `the result is` regex and arms (tests/steps/destination.rs:134). Add the "for reading" When step and a cwd "a project whose labview is not installed" (manifest labview 2030).
 - The unit tests listed above.
 - Sandbox guard: switch it to `read_destination()`. Add unit tests that it refuses `--labview-version 2026` alone, `--global` alone and `--global --labview-version 2026` (sandbox.rs:1236-1270). The existing four stay.
-- Migrate: s12:97, slice-1:134/138/145/147 and slice-2-resave:11 get `--global`. Golden outputs change only in the recorded command line.
+- Migrate: s12:97 and slice-1:134/138/145/147 get `--global`. Golden outputs change only in the recorded command line.
 - Full suite green.
 **REFACTOR**: One function builds the "needs --global" error for `resolve` and `run_hooks`.
-**Files**: `crates/lvpm-core/src/ops/env.rs`, `crates/lvpm-core/src/ops/query.rs`, `crates/lvpm-core/src/ops/hooks.rs`, `crates/lvpm-core/src/ops/launch_cmd.rs`, `crates/lvpm-core/src/ops/linkfix.rs`, `crates/lvpm-tui/src/destination.rs`, `crates/lvpm-tui/src/worker.rs`, `src/main.rs`, `tests/features/lvpm-lockfile/slice-6-openv-and-query-operations-in-core.feature`, `tests/steps/destination.rs`, `tests/features/hooks/s12-install-hooks.feature`, `tests/features/lvpm-lockfile/slice-1-characterization-harness-and-recorded-cli-output.feature`, `tests/features/lvpm-venv-resave/slice-2-staged-install-with-resave.feature`, `tests/support/sandbox.rs`, `tests/golden/**`
+**Files**: `crates/lvpm-core/src/ops/env.rs`, `crates/lvpm-core/src/ops/query.rs`, `crates/lvpm-core/src/ops/hooks.rs`, `crates/lvpm-core/src/ops/launch_cmd.rs`, `crates/lvpm-core/src/ops/linkfix.rs`, `crates/lvpm-tui/src/destination.rs`, `crates/lvpm-tui/src/worker.rs`, `src/main.rs`, `tests/features/lvpm-lockfile/slice-6-openv-and-query-operations-in-core.feature`, `tests/steps/destination.rs`, `tests/features/hooks/s12-install-hooks.feature`, `tests/features/lvpm-lockfile/slice-1-characterization-harness-and-recorded-cli-output.feature`, `tests/support/sandbox.rs`, `tests/golden/**`
 **Commit**: `feat(destination): a write into LabVIEW itself needs --global (#54)`
 
 **Built differently in Step 6.1** (decided while building; the scenarios and tests are the record):
@@ -702,7 +703,7 @@ Unit tests, not scenarios:
   - `restore_labview_installation` ran `uninstall lvpm_test_fixture --no-project --labview-version 2026` with no `--global`, which `lvpm` now refuses; its exit code was ignored, so cleanup fell back to deleting files. The command is the constant `FIXTURE_UNINSTALL` and names `--global`; a guard unit test pins both that and that the guard lets it through once armed.
   - `refresh`, `start` and `app-probe` stay without the `--global` requirement, as approved ("refresh, start unchanged"): a palette rebuild, a launch and a probe install nothing, so `--labview-version` alone names the LabVIEW for them. They did bail "pick a destination: --global [...]" for `--global` alone, telling the user to type what they typed; they now settle through `flagged_roots()`, so `--global` alone resolves as it does for a write (the project's LabVIEW, the venv's, the only installation, or "which LabVIEW?"). Unit tests: refresh.rs and start.rs.
   - TUI: the no-venv install refusal names the LabVIEW it would write into: `run lvpm install <package> --global --labview-version <YYYY>`, plus `--labview-bitness <BITS>` when another detected installation has the same year (`global_flags` in worker.rs; there was no shared helper).
-  - Help: `--labview-version` says "Which LabVIEW version, e.g. 2026; a write into LabVIEW itself also needs --global. See `lvpm targets`."; `--global` says "Write into LabVIEW itself, even from a project with a venv; alone, it picks the project's LabVIEW, the venv's, or the only installation." No test or doc quotes the old wording (docs/cli.md:103 is a proposal that quotes the old help of a past version and is left alone).
+  - Help: `--labview-version` says "Which LabVIEW version, e.g. 2026; a write into LabVIEW itself also needs --global. See `lvpm targets`."; `--global` says "Write into LabVIEW itself, even from a project with a venv; alone, it picks the project's LabVIEW, the venv's, or the only installation." No test or doc quotes the old wording (docs/cli.md item 3 quoted the old help and now quotes the new one).
   - The outline `a write into LabVIEW itself needs --global`: "a project with a venv" is now bound to LabVIEW 2026 while its manifest says 2025, so the `--global` row can tell the venv's LabVIEW from the manifest's (the row "the venv's LabVIEW itself" failed when `global_roots` was made to prefer the manifest). New row: `--labview-version 2026 | a project without a venv | false | error naming lvpm venv create and --global`. Differently from the review's wording: a manifest with no venv fails in `find_venv` ("has a lvpm.toml but no venv", with `lvpm venv create` and "--global installs into the LabVIEW installation itself") before `resolve` reaches the `--global` refusal, and that error has no `next:` line; the row pins what the user sees.
   - Slice 7 sweep: README.md:91 (`lvpm install oglib_error --labview-version 2026`, no `--global`) is on the list below; README is not edited in Slice 6.
 - What users see: `lvpm install x --labview-version 2026` outside a venv fails with "--labview-version 2026 alone does not write into LabVIEW 2026 itself: that changes every project that uses it" and "next: add --global, or --prefix <DIR> for a scratch tree" (the same for `run-hooks`); `--global` alone works (the manifest's LabVIEW, the venv's, or the only installation; several: "which LabVIEW? pass --labview-version <YYYY> (installed: ...)"); `--global --prefix` is refused; headless machines are unchanged; `list`, `launch`, `linkfix`, `vi-*` and the TUI's header read as before; `--help` of `--labview-version` and `--global` say the rule.

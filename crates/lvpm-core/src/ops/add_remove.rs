@@ -14,12 +14,12 @@ use super::lock::{self as locking, Moving, announce_written, write_manifest_and_
 use super::session::InstallSession;
 use super::snapshot::restoring_on_failure;
 use super::sync::{
-    Selection, SyncOptions, announce_migration, apply_sync, fetch_locked, plan_sync,
+    Selection, SyncOptions, SyncPlan, announce_migration, apply_sync, fetch_locked, plan_sync,
     refuse_unknown_groups,
 };
 use crate::dependency::roots_above;
 use crate::errors::{EditError, LockError, SyncError};
-use crate::events::{Event, ManifestEdit, Phase};
+use crate::events::{Event, ManifestEdit, Phase, RemoveReason, SyncStep};
 use crate::index::Index;
 use crate::install;
 use crate::lockfile::{self, Lockfile, constraint_text};
@@ -167,27 +167,41 @@ fn take_out_and_sync(
     commit(env, prepared, edit, &index, dest, options, announce)
 }
 
+/// Some table of `project` lists `name`.
+fn listed(project: &Project, name: &str) -> bool {
+    (project.tables()).any(|(_, entries)| {
+        entries
+            .iter()
+            .any(|(entry, _)| project::same_name(entry, name))
+    })
+}
+
 /// `name` cannot go while `lock` holds packages that require it: they are
-/// named, and so are the ones the project lists that need it, to go first, each
-/// with the tables of `project` that list it: `uninstall` needs the flag.
+/// named, and so are the ones the project lists that need it (the top ones and
+/// any it lists in between), to go first and top-down, each with the tables of
+/// `project` that list it: `uninstall` needs the flag.
 fn required(lock: &Lockfile, project: &Project, name: &str) -> Option<EditError> {
     let required_by = lock.dependents_of(name);
     (!required_by.is_empty()).then(|| EditError::Required {
         name: name.to_string(),
-        roots: roots_above(name, |package| lock.dependents_of(package))
-            .into_iter()
-            .map(|root| {
-                let tables = (project.tables())
-                    .filter(|(_, entries)| {
-                        entries
-                            .iter()
-                            .any(|(entry, _)| project::same_name(entry, &root))
-                    })
-                    .map(|(table, _)| table)
-                    .collect();
-                (root, tables)
-            })
-            .collect(),
+        roots: roots_above(
+            name,
+            |package| lock.dependents_of(package),
+            |package| listed(project, package),
+        )
+        .into_iter()
+        .map(|root| {
+            let tables = (project.tables())
+                .filter(|(_, entries)| {
+                    entries
+                        .iter()
+                        .any(|(entry, _)| project::same_name(entry, &root))
+                })
+                .map(|(table, _)| table)
+                .collect();
+            (root, tables)
+        })
+        .collect(),
         required_by,
     })
 }
@@ -432,6 +446,42 @@ fn floor(
     Ok(resolved.map_or_else(|| "*".to_string(), |version| format!(">={version}")))
 }
 
+/// A sync into LabVIEW itself that would uninstall what neither the old lock nor
+/// the new one lists is refused: that is what other projects, or the user, put
+/// into the installation, and nobody asked for it to go.
+// shortcut: a flat refusal, until #55 asks before a sync removes; then ask here.
+fn refuse_foreign_packages(
+    dest: &Destination,
+    plan: &SyncPlan,
+    previous: Option<&Lockfile>,
+) -> Result<(), EditError> {
+    if !matches!(dest, Destination::Global(_)) {
+        return Ok(());
+    }
+    let packages: Vec<(String, String)> = (plan.steps.iter())
+        .filter_map(|step| match step {
+            SyncStep::Remove {
+                name,
+                version,
+                reason: RemoveReason::NotInLock,
+                ..
+            } if !previous.is_some_and(|lock| {
+                lock.packages
+                    .iter()
+                    .any(|package| project::same_name(&package.name, name))
+            }) =>
+            {
+                Some((name.clone(), version.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    match packages.is_empty() {
+        true => Ok(()),
+        false => Err(EditError::ForeignInInstallation { packages }),
+    }
+}
+
 /// What the edit reads and where it goes, as `sync` says it first.
 fn announce_project(env: &OpEnv, prepared: &Prepared, dest: &Destination) {
     let (path, project) = &prepared.found;
@@ -470,20 +520,12 @@ fn commit(
     // Locking warns about the requirements no source lists.
     let (lock, changes, after) =
         locking::relock_with(env, &edit.project, index, previous.as_ref())?;
+    // Still listed in another table, a package leaves this one and stays.
     if let Some(ManifestEdit::Removed { name, .. }) = &edit.change
+        && !listed(&edit.project, name)
         && let Some(refusal) = required(&lock, &edit.project, name)
     {
         return Err(refusal);
-    }
-    // After the refusal: a removal that goes nowhere writes no lock.
-    if lock_missing {
-        env.sink.emit(Event::SyncLockMissing {
-            path: lock_path.clone(),
-            dry_run: options.dry_run,
-        });
-    }
-    if let Some(event) = announce {
-        env.sink.emit(event);
     }
     // The edited group is installed with the default selection. A package the
     // lock lists stays where it is: only what the lock drops goes.
@@ -493,6 +535,17 @@ fn commit(
         ..Selection::default()
     };
     let plan = plan_sync(&lock, &install::list_installed(&dest.store())?, &selection);
+    refuse_foreign_packages(&dest, &plan, previous.as_ref())?;
+    // After the refusals: an edit that goes nowhere writes no lock.
+    if lock_missing {
+        env.sink.emit(Event::SyncLockMissing {
+            path: lock_path.clone(),
+            dry_run: options.dry_run,
+        });
+    }
+    if let Some(event) = announce {
+        env.sink.emit(event);
+    }
     if lock_missing {
         announce_migration(env, &plan);
     }
@@ -1454,6 +1507,63 @@ alpha = \"1.0\"
     }
 
     #[test]
+    fn a_listed_package_in_the_middle_is_named_with_the_top_and_the_top_comes_first() {
+        // zeta -> beta -> alpha, all three listed: alpha cannot go until zeta
+        // and then beta have. "zeta" sorts after "beta", so a name sort is wrong.
+        let manifest = format!("{PROJECT}alpha = \">=1.0\"\nzeta = \">=1.0\"\n");
+        let world = World::new("middle-listed", &manifest);
+        write_vip(
+            &world.root.join("packages").join("zeta-1.0.vip"),
+            ("zeta", "1.0", "beta>=1.0"),
+        );
+        run_add(&world, "alpha@>=1.0", &InstallOptions::default()).unwrap();
+        run_add(&world, "zeta@>=1.0", &InstallOptions::default()).unwrap();
+        let lock = world.lock();
+        let why = remove(
+            &world.env(&Recorder::default()),
+            "alpha",
+            DependencyTable::Dependencies,
+            &InstallOptions::default(),
+        )
+        .unwrap_err();
+        let EditError::Required { roots, .. } = &why else {
+            panic!("expected Required, got {why:?}");
+        };
+        let named: Vec<&str> = roots.iter().map(|(root, _)| root.as_str()).collect();
+        assert_eq!(named, ["zeta", "beta"], "{why:?}");
+        assert_eq!(world.lock(), lock);
+    }
+
+    #[test]
+    fn a_package_that_is_listed_in_another_table_too_is_taken_out_of_this_one_only() {
+        // beta requires alpha, and [dependencies] lists alpha: leaving
+        // [dev-dependencies] is not leaving the project.
+        let manifest =
+            format!("{PROJECT}alpha = \">=1.0\"\n\n[dev-dependencies]\nalpha = \">=1.0\"\n");
+        let world = World::new("listed-twice", &manifest);
+        run_add(&world, "alpha@>=1.0", &InstallOptions::default()).unwrap();
+        remove(
+            &world.env(&Recorder::default()),
+            "alpha",
+            DependencyTable::DevDependencies,
+            &InstallOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            !world.manifest().contains("[dev-dependencies]\nalpha"),
+            "{}",
+            world.manifest()
+        );
+        assert!(world.manifest().contains("alpha = \">=1.0\""));
+        assert!(
+            world.locked().contains(&"alpha 2.0".to_string()),
+            "{:?}",
+            world.locked()
+        );
+        assert!(world.installed().contains(&"alpha 2.0".to_string()));
+    }
+
+    #[test]
     fn a_package_the_manifest_does_not_list_but_another_requires_is_required_not_a_non_dependency()
     {
         let world = World::new("unlisted-required", PROJECT);
@@ -1913,5 +2023,72 @@ alpha = \"1.0\"
             ),
             "{why:?}"
         );
+    }
+
+    #[test]
+    fn a_global_edit_that_would_uninstall_what_no_lock_lists_is_refused_and_changes_nothing() {
+        let world = World::new("foreign-global", PROJECT);
+        let fake = testing::FakeInstallation::new(&world.root);
+        let options = InstallOptions {
+            no_relink: true,
+            ..InstallOptions::default()
+        };
+        let sink = Recorder::default();
+        let mut env = world.env(&sink);
+        env.flags.prefix = None;
+        env.flags.global = true;
+        fake.place(&mut env);
+        let held = || -> Vec<String> {
+            let mut held: Vec<String> = install::list_installed(&fake.roots())
+                .unwrap()
+                .iter()
+                .map(|package| package.name.clone())
+                .collect();
+            held.sort();
+            held
+        };
+        let table = || DependencyTable::Dependencies;
+
+        // Nothing foreign: an add goes ahead, and a removal of what the old
+        // lock listed is no foreign removal.
+        add(&env, "gamma", table(), None, &options).unwrap();
+        assert_eq!(held(), ["alpha", "beta", "gamma"]);
+        remove(&env, "gamma", table(), &options).unwrap();
+        assert_eq!(held(), ["alpha", "beta"]);
+
+        // Somebody else put delta there: no lock lists it.
+        fake.with_package("delta");
+        let before = (
+            world.manifest(),
+            world.lock(),
+            testing::snapshot(&fake.target.path),
+            testing::snapshot(&world.root.join("machine")),
+        );
+        for dry_run in [false, true] {
+            let options = InstallOptions {
+                dry_run,
+                ..options.clone()
+            };
+            let refused = [
+                add(&env, "gamma", table(), None, &options),
+                remove(&env, "beta", table(), &options),
+            ];
+            for why in refused {
+                let why = why.unwrap_err();
+                assert!(
+                    matches!(&why, EditError::ForeignInInstallation { packages }
+                        if packages == &[("delta".to_string(), "1.0".to_string())]),
+                    "dry run {dry_run}: {why:?}"
+                );
+            }
+            let after = (
+                world.manifest(),
+                world.lock(),
+                testing::snapshot(&fake.target.path),
+                testing::snapshot(&world.root.join("machine")),
+            );
+            assert!(before == after, "dry run {dry_run}: something was written");
+        }
+        assert_eq!(held(), ["alpha", "beta", "delta"]);
     }
 }

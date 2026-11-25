@@ -88,6 +88,7 @@ only says which LabVIEW. This holds for every command that writes there:
 | `--global --labview-version 2026`         | Writes into LabVIEW 2026 itself                                                          |
 | `--global`                                | Picks the project's LabVIEW (the venv's, or the manifest's `labview` with no venv), else the only installation. With several it asks "which LabVIEW?": add `--labview-version` |
 | `--labview-version 2026` alone, no venv   | Fails and changes nothing: "does not write into LabVIEW 2026 itself", `next: add --global, or --prefix <DIR> for a scratch tree` |
+| nothing, outside a project, no venv       | Fails and changes nothing: "pick a destination", naming `--global [--labview-version YYYY]`, `--prefix <DIR>` or a project with a venv |
 | `--labview-version 2026` in a project with a venv | Writes into the venv, as before: the venv wins                                    |
 | `--global --prefix <DIR>`                 | Fails: they are mutually exclusive                                                        |
 | `--prefix <DIR>`                          | Writes into that scratch tree; no `--global`                                              |
@@ -341,8 +342,8 @@ with the reason on one line. It reads no source, so it is cheap.
 Before groups, a dev-only package was marked
 `dev = true`. Such a lock, format 1, is out of date: `lvpm lock --check`,
 `lvpm sync --locked` (the default on a headless machine) and `lvpm sync --frozen`
-refuse it and name `lvpm lock`. `lvpm lock`, a plain `lvpm sync`, `add` and
-`remove` write it again as format 2; commit the result.
+refuse it and name `lvpm lock`. `lvpm lock`, a plain `lvpm sync`, and a named
+`install` and `uninstall` write it again as format 2; commit the result.
 
 **Syncing.** `lvpm sync` installs what is missing, replaces what is at another
 version, and uninstalls the lvpm-installed packages the lock does not list. It
@@ -381,7 +382,7 @@ refuse that instead:
 
 In a project, `lvpm install <name>` and `lvpm uninstall <name>` are the
 commands that change the project: both edit `lvpm.toml`, lock and sync. A
-direct install that leaves the project alone takes `--no-project`, as in uv.
+direct install that leaves the project alone takes `--no-project`.
 `lvpm add` and `lvpm remove` are aliases of `lvpm install` and `lvpm uninstall`: the same flags and the same result, in a project and outside one.
 
 ```console
@@ -395,10 +396,10 @@ $ lvpm uninstall gamma                  # --dev or --group ci if it is in anothe
 
 | Command | In a project | Outside a project |
 | ------- | ------------ | ----------------- |
-| `install` | sync to `lvpm.lock` | error: nothing to install |
-| `install <pkg>` | add to `lvpm.toml`, lock, sync | direct install |
+| `install` | sync to `lvpm.lock` | error: "give a package name" |
+| `install <pkg>` | add to `lvpm.toml`, lock, sync | direct install, with `--global` or `--prefix <DIR>` |
 | `install <pkg> --no-project` | direct install; `lvpm.toml` and `lvpm.lock` untouched | direct install |
-| `uninstall <pkg>` | take out of `lvpm.toml`, lock, sync; refused when another package requires it | direct uninstall |
+| `uninstall <pkg>` | take out of `lvpm.toml`, lock, sync; refused when another package requires it | direct uninstall, with `--global` or `--prefix <DIR>` |
 | `uninstall <pkg> --no-project` | direct uninstall; `lvpm.toml` and `lvpm.lock` untouched | direct uninstall |
 | `uninstall --all`, bare `uninstall` | direct, as outside a project | direct |
 | `add ...`, `remove ...` | exactly `install ...` and `uninstall ...` | exactly `install ...` and `uninstall ...` (direct) |
@@ -406,9 +407,15 @@ $ lvpm uninstall gamma                  # --dev or --group ci if it is in anothe
 The destination flags (`--prefix`, `--global`, `--labview-version`) only pick
 where the project syncs, as on `sync`: a named `install` or `uninstall` edits
 `lvpm.toml` whichever of them is given, and says so in one note
-(`in a project, --prefix picks where the project syncs; lvpm.toml gets x. Pass --no-project to install without changing the project`).
+(`note: in a project, --prefix picks where the project syncs; lvpm.toml gets x. Pass --no-project to install without changing the project.`;
+for `uninstall`, `lvpm.toml loses x` and `to uninstall without changing the project`).
 Writing into LabVIEW itself still needs `--global`
 ([Writing into LabVIEW itself](#writing-into-labview-itself)).
+A named `install` or `uninstall` into LabVIEW itself is refused, before it
+writes anything, if the sync would remove packages that neither the old nor the
+new lock lists: packages that other projects or you put there. The error names
+them and suggests `--no-project`. This is a guard until a question replaces it
+([#55](https://github.com/labview-package-manager/lvpm/issues/55)).
 
 `install` and `uninstall` edit `lvpm.toml` (comments and layout stay), then lock and
 sync. If the lock or the sync fails, `lvpm.toml` and `lvpm.lock` are put back
@@ -416,9 +423,9 @@ as they were. A package that another one requires is refused before anything is
 written, with `lvpm.toml` listing it or not: the error says `x is required by
 installed packages: a, b`, and one `next:` line names the `lvpm uninstall` of
 each package of yours to remove first, with its `--dev` or `--group` flag.
-`--force` is only for the direct route (`--no-project`). They install `[dependencies]`, dev and
-the group they edit, and never uninstall a package the new lock still lists, so
-what `lvpm sync --group ci` installed stays; plain `lvpm sync` is the exact one.
+A project install installs `[dependencies]`, dev and the group it edits, and
+never uninstalls a package the new lock still lists, so what
+`lvpm sync --group ci` installed stays; plain `lvpm sync` is the exact one.
 `--dev` is `--group dev`. A misspelt `--group` on `install` makes a new group, and
 says `created [dependency-groups.<name>], a new group`. With `--json` the events
 keep `dev` and add `group`, and `created_table`, when they apply. An `added` or
@@ -428,7 +435,7 @@ keep `dev` and add `group`, and `created_table`, when they apply. An `added` or
 **What a project refuses.** A lock decides the dependencies, so in a project
 `install <name> --no-deps`, `--manifest` and `--allow-downgrade`, and
 `uninstall <name> --keep-deps` and `--force`, fail and name `--no-project`,
-which takes them. `--with-deps` is accepted: it is what a project uninstall does
+which takes them. `--force` is only for the direct route. `--with-deps` is accepted: it is what a project uninstall does
 anyway. Outside a project, and with `--no-project`, the saving flags `--dev`,
 `--group` and `--index` fail, since there is no `lvpm.toml` to save in; so do
 `uninstall`'s `--dev`, `--group`, `--dry-run`, `--no-linkfix`, `--relink`,
@@ -798,7 +805,7 @@ the venv started another way than `lvpm launch` gets none of this.
 
 ### Linkfix
 
-`install`, `sync` and `add` run linkfix after the files are copied and
+`install` and `sync` run linkfix after the files are copied and
 before the PostInstall hooks. It edits only the LabVIEW files that install
 wrote into the LabVIEW tree, and needs no LabVIEW:
 
@@ -831,7 +838,9 @@ method changes.
 ### Uninstalling
 
 This is the direct uninstall, which outside a project is `lvpm uninstall <name>`
-and in a project `lvpm uninstall <name> --no-project` (`--all` is direct too).
+with `--prefix <DIR>` or `--global`, and in a project `lvpm uninstall <name> --no-project`
+(`--all` is direct too). With no destination flag, outside a project and a
+venv, it fails and names `--global`.
 `lvpm.toml` and `lvpm.lock` stay as they are; a named uninstall in a project
 edits them instead ([Adding and removing dependencies](#adding-and-removing-dependencies)).
 It removes the package's files. When it has

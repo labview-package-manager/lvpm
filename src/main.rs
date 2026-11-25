@@ -388,13 +388,14 @@ enum Cmd {
         /// Remove dependencies nothing else needs too, without prompting.
         #[arg(long, conflicts_with_all = ["all", "keep_deps"])]
         with_deps: bool,
-        /// Keep dependencies, without prompting. Not in a project: lvpm.lock
-        /// decides what stays.
+        /// Keep dependencies, without prompting. In a project it is refused and
+        /// needs --no-project: lvpm.lock decides what stays.
         #[arg(long, conflicts_with_all = ["all", "with_deps"])]
         keep_deps: bool,
         /// Remove the package even though other installed packages require
-        /// it, leaving them without it. Without this, that is refused. Not in
-        /// a project: lvpm.lock decides what stays.
+        /// it, leaving them without it. Without this, that is refused. In a
+        /// project it is refused too and needs --no-project: lvpm.lock decides
+        /// what stays.
         #[arg(long, conflicts_with = "all")]
         force: bool,
         /// It is in [dev-dependencies]. Only an uninstall in a project takes it.
@@ -1444,6 +1445,7 @@ fn edit_error(
             table,
             index,
             destination: env.destination_flags_as_typed().as_deref(),
+            target: env.target_flags_as_typed().as_deref(),
         },
     ))
 }
@@ -1989,6 +1991,9 @@ mod tests {
             }
         };
         assert_eq!(given(&[]), None);
+        assert_eq!(given(&["--relink"]), Some("--relink"));
+        assert_eq!(given(&["--hooks"]), Some("--hooks"));
+        assert_eq!(given(&["--hooks", "--keep-open"]), Some("--hooks"));
         assert_eq!(given(&["--keep-open"]), Some("--keep-open"));
         assert_eq!(
             given(&["--relink-progress", "bar"]),

@@ -25,13 +25,14 @@ Feature: install and uninstall are the project commands
 
   Scenario Outline: --dry-run says what it would do and changes nothing
     When I run "lvpm <args>"
-    Then the output says "would"
+    Then the command succeeds
+    And the output says "<announce>"
     And nothing changed
 
     Examples:
-      | args                                    |
-      | install caraya --dry-run --prefix dest  |
-      | uninstall alpha --dry-run --prefix dest |
+      | args                                    | announce                          |
+      | install caraya --dry-run --prefix dest  | would add caraya to lvpm.toml     |
+      | uninstall alpha --dry-run --prefix dest | would remove alpha from lvpm.toml |
 
   Scenario: --no-project installs without touching the project
     When I run "lvpm install caraya --no-project --prefix dest"
@@ -205,7 +206,10 @@ Feature: install and uninstall are the project commands
       | alpha --group test --no-project --prefix dest | --group      |
       | alpha --dry-run --no-project --prefix dest    | --dry-run    |
       | alpha --no-linkfix --no-project --prefix dest | --no-linkfix |
+      | alpha --relink --no-project --prefix dest     | --relink     |
+      | alpha --hooks --no-project --prefix dest      | --hooks      |
       | --all --dry-run --prefix dest                 | --dry-run    |
+      | --all --dev --prefix dest                     | --dev        |
 
   Scenario: a direct uninstall of a listed package says it is still listed
     When I run "lvpm uninstall alpha --no-project --prefix dest"
