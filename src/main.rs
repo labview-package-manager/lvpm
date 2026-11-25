@@ -1097,7 +1097,7 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 manifest: manifest.as_deref(),
                 no_deps: *no_deps,
                 no_project: *no_project,
-                saving_flag: saving_flag(*dev, &sync.group, source_pin.as_deref()),
+                saving_flags: &saving_flags(*dev, &sync.group, source_pin.as_deref()),
             };
             let mode = route::install_mode(&env, &request)
                 .map_err(|why| anyhow!(render::sync::route_error(&why)))?;
@@ -1127,6 +1127,7 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
             source_pin.as_deref(),
             apply,
             None,
+            "`lvpm add`",
         )
         .map(|()| Report::done("add")),
         Cmd::Remove {
@@ -1392,14 +1393,16 @@ fn saved_into(dev: bool, groups: &[String]) -> Result<DependencyTable> {
     dependency_table(dev, groups.first().map(String::as_str))
 }
 
-/// The flag, as typed, that says where a named install saves the package.
-fn saving_flag(dev: bool, groups: &[String], index: Option<&str>) -> Option<&'static str> {
-    match (dev, groups.is_empty(), index) {
-        (true, ..) => Some("--dev"),
-        (_, false, _) => Some("--group"),
-        (_, _, Some(_)) => Some("--index"),
-        _ => None,
-    }
+/// Each flag, as typed, that says where a named install saves the package.
+fn saving_flags(dev: bool, groups: &[String], index: Option<&str>) -> Vec<&'static str> {
+    [
+        (dev, "--dev"),
+        (!groups.is_empty(), "--group"),
+        (index.is_some(), "--index"),
+    ]
+    .into_iter()
+    .filter_map(|(given, flag)| given.then_some(flag))
+    .collect()
 }
 
 /// `--dev` or `--group`, as typed: the table a project uninstall takes a
@@ -1428,8 +1431,8 @@ fn cmd_uninstall_project(
         dry_run: apply.dry_run,
     };
     let options = apply.options(false, false);
-    ops::add_remove::remove_announcing(env, package, table, &options, announce)
-        .map_err(|why| edit_error(env, &why, "`lvpm uninstall`"))
+    ops::add_remove::remove_announcing(env, package, table.clone(), &options, announce)
+        .map_err(|why| edit_error(env, &why, "`lvpm uninstall`", &table, None))
 }
 
 /// `uninstall` that leaves the project alone: the named package, or `--all`, out
@@ -1488,10 +1491,19 @@ fn cmd_install_adds(
         destination: env.destination_flag().map(str::to_string),
         dry_run: apply.dry_run,
     };
-    cmd_add(env, package, table, source_pin, apply, Some(announce))
+    cmd_add(
+        env,
+        package,
+        table,
+        source_pin,
+        apply,
+        Some(announce),
+        "`lvpm install`",
+    )
 }
 
 /// `announce` is what the command says once the lock is made, if it says one.
+/// `rerun` is the command a failure says to run again.
 fn cmd_add(
     env: &OpEnv,
     package: &str,
@@ -1499,15 +1511,21 @@ fn cmd_add(
     source_pin: Option<&str>,
     apply: &ApplyArgs,
     announce: Option<Event>,
+    rerun: &str,
 ) -> Result<()> {
     let options = apply.options(false, false);
     match announce {
-        Some(event) => {
-            ops::add_remove::add_announcing(env, package, table, source_pin, &options, event)
-        }
-        None => ops::add_remove::add(env, package, table, source_pin, &options),
+        Some(event) => ops::add_remove::add_announcing(
+            env,
+            package,
+            table.clone(),
+            source_pin,
+            &options,
+            event,
+        ),
+        None => ops::add_remove::add(env, package, table.clone(), source_pin, &options),
     }
-    .map_err(|why| edit_error(env, &why, "`lvpm add`"))
+    .map_err(|why| edit_error(env, &why, rerun, &table, source_pin))
 }
 
 /// `rerun` is the command a failure says to run again.
@@ -1518,18 +1536,26 @@ fn cmd_remove(
     apply: &ApplyArgs,
     rerun: &str,
 ) -> Result<()> {
-    ops::add_remove::remove(env, package, table, &apply.options(false, false))
-        .map_err(|why| edit_error(env, &why, rerun))
+    ops::add_remove::remove(env, package, table.clone(), &apply.options(false, false))
+        .map_err(|why| edit_error(env, &why, rerun, &table, None))
 }
 
 /// What an `add`, `remove` or project `uninstall` that failed prints: its next
 /// step names the destination flags it was given, so a command it suggests acts
-/// on the same target.
-fn edit_error(env: &OpEnv, why: &EditError, rerun: &str) -> anyhow::Error {
+/// on the same target, and the table and source pin it saved into.
+fn edit_error(
+    env: &OpEnv,
+    why: &EditError,
+    rerun: &str,
+    table: &DependencyTable,
+    index: Option<&str>,
+) -> anyhow::Error {
     anyhow!(render::edit::error(
         why,
         rerun,
-        env.destination_flags_as_typed().as_deref()
+        env.destination_flags_as_typed().as_deref(),
+        table,
+        index,
     ))
 }
 
@@ -2083,6 +2109,62 @@ mod tests {
         // Not told apart from its default, and hidden: the plan records both.
         assert_eq!(given(&["--relink-timeout", "5"]), None);
         assert_eq!(given(&["--no-relink"]), None);
+    }
+
+    #[test]
+    fn every_saving_flag_given_is_named_in_the_order_dev_group_index() {
+        let given = |flags: &[&str]| {
+            let args = ["lvpm", "install", "caraya"]
+                .into_iter()
+                .chain(flags.iter().copied());
+            match Cli::try_parse_from(args).unwrap().cmd {
+                Cmd::Install {
+                    dev,
+                    source_pin,
+                    sync,
+                    ..
+                } => saving_flags(dev, &sync.group, source_pin.as_deref()),
+                _ => unreachable!("an install"),
+            }
+        };
+        assert!(given(&[]).is_empty());
+        assert_eq!(given(&["--dev"]), ["--dev"]);
+        assert_eq!(given(&["--group", "ci"]), ["--group"]);
+        assert_eq!(given(&["--index", "second"]), ["--index"]);
+        assert_eq!(given(&["--dev", "--index", "second"]), ["--dev", "--index"]);
+        assert_eq!(
+            given(&["--index", "second", "--group", "ci"]),
+            ["--group", "--index"]
+        );
+    }
+
+    #[test]
+    fn a_named_install_saves_into_dev_the_one_group_or_dependencies() {
+        let groups = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            saved_into(false, &groups(&[])).unwrap(),
+            DependencyTable::Dependencies
+        );
+        assert_eq!(
+            saved_into(true, &groups(&[])).unwrap(),
+            DependencyTable::DevDependencies
+        );
+        assert_eq!(
+            saved_into(false, &groups(&["ci"])).unwrap(),
+            DependencyTable::Group("ci".into())
+        );
+        // `--group dev` is `--dev`, as for `add`.
+        assert_eq!(
+            saved_into(false, &groups(&["dev"])).unwrap(),
+            DependencyTable::DevDependencies
+        );
+        let two = saved_into(false, &groups(&["ci", "test"])).unwrap_err();
+        assert_eq!(two.to_string(), "a package goes into one group");
     }
 
     #[test]

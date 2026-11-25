@@ -315,7 +315,8 @@ Feature: install and uninstall are the project commands
     And the working directory has no lvpm.toml
 
     Examples:
-      | flag               | names          |
-      | --dev              | --dev          |
-      | --group test       | --group        |
-      | --index second     | --index        |
+      | flag                 | names             |
+      | --dev                | --dev             |
+      | --group test         | --group           |
+      | --index second       | --index           |
+      | --dev --index second | --dev and --index |

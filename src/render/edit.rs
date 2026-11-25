@@ -176,16 +176,35 @@ fn edit_line(edit: &ManifestEdit, table: &DependencyTable, dry_run: bool) -> Str
 /// What `lvpm add` and `lvpm remove` print when they fail: what happened, then
 /// the next thing to do. `rerun` is the command to run again, as "run {rerun}
 /// again" reads. `destination` is the destination flags the user gave, as typed
-/// with their values, for a suggested command that acts on the target.
-pub fn error(error: &EditError, rerun: &str, destination: Option<&str>) -> String {
+/// with their values, for a suggested command that acts on the target. `table`
+/// and `index` are where the command saved the package and the source it pinned,
+/// for a suggested command that saves it the same way.
+pub fn error(
+    error: &EditError,
+    rerun: &str,
+    destination: Option<&str>,
+    table: &DependencyTable,
+    index: Option<&str>,
+) -> String {
     match error {
         EditError::Lock(LockError::NeedsNewerLabview {
             name, project_year, ..
-        }) => format!(
-            "{error}\n\
-             next: pick a version that runs on LabVIEW {project_year} with \
-             `lvpm add {name}@<version>`, or raise labview in lvpm.toml"
-        ),
+        }) => {
+            // The verb the user ran; `lvpm remove` and `lvpm uninstall` pick no version.
+            let verb = if rerun.contains("add") {
+                "add"
+            } else {
+                "install"
+            };
+            let pin = index.map_or_else(String::new, |source| format!(" --index {source}"));
+            let pick = command_for(verb, &format!("{name}@<version>"), table, None);
+            let command = on_the_target(format!("{pick}{pin}"), destination);
+            format!(
+                "{error}\n\
+                 next: pick a version that runs on LabVIEW {project_year} with \
+                 `{command}`, or raise labview in lvpm.toml"
+            )
+        }
         // lvpm.toml was put back, so the pin may only be on the command line.
         EditError::Lock(LockError::PinnedNotListed { package, .. }) => format!(
             "{error}\n\
@@ -691,11 +710,65 @@ mod tests {
     }
 
     fn written(error: &EditError) -> String {
-        super::error(error, "`lvpm add`", None)
+        super::error(
+            error,
+            "`lvpm add`",
+            None,
+            &DependencyTable::Dependencies,
+            None,
+        )
     }
 
     fn written_on(error: &EditError, destination: Option<&str>) -> String {
-        super::error(error, "`lvpm remove`", destination)
+        written_for(error, "`lvpm remove`", destination)
+    }
+
+    fn written_for(error: &EditError, rerun: &str, destination: Option<&str>) -> String {
+        super::error(
+            error,
+            rerun,
+            destination,
+            &DependencyTable::Dependencies,
+            None,
+        )
+    }
+
+    #[test]
+    fn the_newer_labview_hint_is_the_command_the_user_ran_with_its_table_pin_and_destination() {
+        let error = EditError::Lock(LockError::NeedsNewerLabview {
+            name: "omega".into(),
+            version: "1.0".into(),
+            needs_year: 2026,
+            project_year: 2024,
+        });
+        let next = |rerun, table: &DependencyTable, index, destination| {
+            super::error(&error, rerun, destination, table, index)
+                .lines()
+                .last()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            next("`lvpm add`", &DependencyTable::Dependencies, None, None),
+            "next: pick a version that runs on LabVIEW 2024 with `lvpm add omega@<version>`, \
+             or raise labview in lvpm.toml"
+        );
+        assert_eq!(
+            next(
+                "`lvpm install`",
+                &DependencyTable::DevDependencies,
+                Some("second"),
+                Some("--prefix dest")
+            ),
+            "next: pick a version that runs on LabVIEW 2024 with \
+             `lvpm install omega@<version> --dev --index second --prefix dest`, \
+             or raise labview in lvpm.toml"
+        );
+        assert_eq!(
+            next("`lvpm install`", &group("ci"), None, Some("--global")),
+            "next: pick a version that runs on LabVIEW 2024 with \
+             `lvpm install omega@<version> --group ci --global`, or raise labview in lvpm.toml"
+        );
     }
 
     #[test]
@@ -739,7 +812,7 @@ mod tests {
             name: "caraya".into(),
             found_in: vec![DependencyTable::DevDependencies],
         };
-        let said = |rerun, destination| super::error(&in_dev, rerun, destination);
+        let said = |rerun, destination| written_for(&in_dev, rerun, destination);
         assert_eq!(
             said("`lvpm uninstall`", Some("--prefix dest")),
             "caraya is in [dev-dependencies]\n\
@@ -755,7 +828,7 @@ mod tests {
             found_in: vec![DependencyTable::Dependencies, group("ci")],
         };
         assert_eq!(
-            super::error(&in_normal, "`lvpm uninstall`", Some("--global")),
+            written_for(&in_normal, "`lvpm uninstall`", Some("--global")),
             "beta is in [dependencies] and [dependency-groups.ci]\n\
              next: `lvpm uninstall beta --global` removes it from [dependencies]\n\
              next: `lvpm uninstall beta --group ci --global` removes it from [dependency-groups.ci]"

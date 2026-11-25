@@ -33,9 +33,9 @@ pub struct InstallRequest<'a> {
     pub no_deps: bool,
     /// `--no-project`: install directly, leaving the project's files alone.
     pub no_project: bool,
-    /// `--dev`, `--group` or `--index` as typed: what an add saves, which a
-    /// direct install has nowhere to.
-    pub saving_flag: Option<&'static str>,
+    /// Each of `--dev`, `--group` and `--index` as typed: what an add saves,
+    /// which a direct install has nowhere to.
+    pub saving_flags: &'a [&'static str],
 }
 
 /// The mode of `request`, in the project `env` runs in, if any.
@@ -52,9 +52,9 @@ pub fn install_mode(env: &OpEnv, request: &InstallRequest) -> Result<InstallMode
     let mode = match request.package {
         Some(_) => {
             if request.no_project || env.manifest_for(None, None)?.is_none() {
-                if let Some(flag) = request.saving_flag {
+                if !request.saving_flags.is_empty() {
                     return Err(RouteError::SaveOnlyInAProject {
-                        flag,
+                        flags: request.saving_flags.to_vec(),
                         no_project: request.no_project,
                     });
                 }
@@ -248,7 +248,7 @@ mod tests {
         manifest: None,
         no_deps: false,
         no_project: false,
-        saving_flag: None,
+        saving_flags: &[],
     };
 
     #[test]
@@ -311,15 +311,20 @@ mod tests {
     fn a_saving_flag_is_refused_where_the_install_is_direct_and_taken_in_a_project() {
         let in_a_project = Dir::new("saving-in", Some(PROJECT));
         let outside = Dir::new("saving-out", None);
-        for flag in ["--dev", "--group", "--index"] {
+        for flags in [
+            &["--dev"][..],
+            &["--group"],
+            &["--index"],
+            &["--dev", "--index"],
+        ] {
             let request = InstallRequest {
-                saving_flag: Some(flag),
+                saving_flags: flags,
                 ..GAMMA
             };
             assert_eq!(
                 mode(&in_a_project, request).unwrap(),
                 InstallMode::Add,
-                "{flag}"
+                "{flags:?}"
             );
             let direct = [
                 (
@@ -337,10 +342,10 @@ mod tests {
                 assert!(
                     matches!(
                         why,
-                        RouteError::SaveOnlyInAProject { flag: refused, no_project: said }
-                            if refused == flag && said == no_project
+                        RouteError::SaveOnlyInAProject { flags: ref refused, no_project: said }
+                            if refused == flags && said == no_project
                     ),
-                    "{flag}: {why:?}"
+                    "{flags:?}: {why:?}"
                 );
             }
         }
@@ -351,7 +356,7 @@ mod tests {
         // `install --group test` installs that group: the sync meaning.
         let dir = Dir::new("saving-bare", Some(PROJECT));
         let request = InstallRequest {
-            saving_flag: Some("--group"),
+            saving_flags: &["--group"],
             ..InstallRequest::default()
         };
         assert_eq!(mode(&dir, request).unwrap(), InstallMode::Sync);

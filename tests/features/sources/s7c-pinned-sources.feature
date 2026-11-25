@@ -267,6 +267,15 @@ Feature: a dependency can be pinned to one source
     Then the command fails naming "alpha" and "second"
     And lvpm.toml and lvpm.lock are byte-identical to before
 
+  Scenario: lvpm install --index to a source that does not list the package says to run install again
+    Given "first" lists "alpha" 1.0
+    And "second" lists "gamma" 1.0
+    And the project depends on "gamma" "*"
+    And a current lock
+    When I run "lvpm install alpha --index second --prefix dest"
+    Then the error says "then run `lvpm install` again"
+    And lvpm.toml and lvpm.lock are byte-identical to before
+
   Scenario: lvpm add --index on a github line fails
     Given the repo "owner/repo" has release "v1.0" with "alpha-1.0.vip"
     And the project depends on "alpha" via github "owner/repo"
