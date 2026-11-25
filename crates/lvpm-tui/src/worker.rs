@@ -232,6 +232,14 @@ fn run(builder: &EnvBuilder, job: Job, send: &Sender<Done>) -> Done {
                         )),
                     }
                 }
+                // The TUI names the newest LabVIEW in its flags, which writes
+                // into it only with --global: the TUI has no such flag.
+                Err(_) if matches!(env.read_destination(), Ok(Destination::Global(_))) => {
+                    Outcome::Failed(format!(
+                        "outside a venv the TUI installs nothing into LabVIEW itself; \
+                         run lvpm install {package} --global"
+                    ))
+                }
                 _ => match install::install(&env, Some(&package), &opts) {
                     Ok(()) => Outcome::Done,
                     Err(error) if error.chain().any(|cause| cause.is::<Cancelled>()) => {
@@ -242,5 +250,53 @@ fn run(builder: &EnvBuilder, job: Job, send: &Sender<Done>) -> Done {
             };
             Done::Installed { dry_run, outcome }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lvpm_core::config::Config;
+    use lvpm_core::target::LvTarget;
+
+    #[test]
+    fn an_install_with_no_venv_is_refused_and_writes_nothing_into_labview() {
+        let dir = tempfile::tempdir().unwrap();
+        let labview = dir.path().join("LabVIEW 2026");
+        let config = Config {
+            log_dir: Default::default(),
+            venv_title: Default::default(),
+            cache: dir.path().join("cache"),
+            hooks_run: Vec::new(),
+            local_sources: Vec::new(),
+            venv_dir: ".lv-venv".into(),
+        };
+        let target = LvTarget {
+            version: 26.3,
+            bitness: 64,
+            path: labview.clone(),
+        };
+        let builder = EnvBuilder::new(config, vec![target], dir.path().join("work"));
+        let job = Job::Install {
+            package: "alpha".into(),
+            exact: false,
+            dry_run: false,
+            allow_downgrade: false,
+            cancel: CancelToken::default(),
+        };
+        let (send, receive) = mpsc::channel();
+        let Done::Installed { outcome, .. } = run(&builder, job, &send) else {
+            panic!("an install job ends with its result");
+        };
+        assert_eq!(
+            outcome,
+            Outcome::Failed(
+                "outside a venv the TUI installs nothing into LabVIEW itself; \
+                 run lvpm install alpha --global"
+                    .into()
+            )
+        );
+        assert!(receive.try_recv().is_err(), "no event: nothing was started");
+        assert!(!labview.exists() && !dir.path().join("cache").exists());
     }
 }

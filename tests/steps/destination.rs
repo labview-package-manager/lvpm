@@ -20,6 +20,8 @@ const VENV_DIR: &str = ".lv-venv";
 /// so that "the LabVIEW the manifest names" is not just the newest.
 const NEWER_YEAR: u32 = 2026;
 const MANIFEST_YEAR: u32 = 2025;
+/// A year no detected LabVIEW has or is newer than.
+const NOT_INSTALLED_YEAR: u32 = 2030;
 
 /// What a destination scenario has set up and seen.
 #[derive(Debug, Default)]
@@ -86,17 +88,18 @@ async fn an_env(world: &mut CliWorld, flags: String, cwd: String, headless: bool
         labview_at(&root, MANIFEST_YEAR),
     ];
     let project = world.sandbox.work_dir();
-    let has_manifest = |dir: &Path| {
-        let manifest = ProjectManifest::new().labview(&MANIFEST_YEAR.to_string());
+    let has_manifest = |dir: &Path, year: u32| {
+        let manifest = ProjectManifest::new().labview(&year.to_string());
         std::fs::write(dir.join(MANIFEST_FILE), manifest.render()).expect("write the manifest");
     };
     match cwd.as_str() {
         "anywhere" => {}
         "a project with a venv" => {
-            has_manifest(&project);
+            has_manifest(&project, MANIFEST_YEAR);
             create_venv(&project, &targets[1]);
         }
-        "a project without a venv" => has_manifest(&project),
+        "a project without a venv" => has_manifest(&project, MANIFEST_YEAR),
+        "a project whose labview is not installed" => has_manifest(&project, NOT_INSTALLED_YEAR),
         other => panic!("not a working directory: {other}"),
     }
     world.destination = DestinationState {
@@ -111,6 +114,15 @@ async fn an_env(world: &mut CliWorld, flags: String, cwd: String, headless: bool
 
 #[when("core resolves the destination")]
 async fn core_resolves(world: &mut CliWorld) {
+    resolve(world, |env| env.destination());
+}
+
+#[when("core resolves the destination for reading")]
+async fn core_resolves_for_reading(world: &mut CliWorld) {
+    resolve(world, |env| env.read_destination());
+}
+
+fn resolve(world: &mut CliWorld, settle: impl FnOnce(&OpEnv) -> anyhow::Result<Destination>) {
     let state = &mut world.destination;
     let config = Config {
         log_dir: Default::default(),
@@ -124,14 +136,14 @@ async fn core_resolves(world: &mut CliWorld) {
     let mut env = OpEnv::new(&sink, config, state.targets.clone(), state.cwd.clone());
     env.flags = state.flags.clone();
     env.headless = state.headless;
-    state.result = Some(env.destination().map_err(|why| format!("{why:#}")));
+    state.result = Some(settle(&env).map_err(|why| format!("{why:#}")));
     state.events = sink.events();
 }
 
 // Only this feature's results: the solver's `the result is ...` steps share the
 // start of the sentence.
 #[then(
-    regex = r"^the result is (scratch tree at .+|the venv|the LabVIEW the manifest's labview names|error .+)$"
+    regex = r"^the result is (scratch tree at .+|the venv|the venv's LabVIEW itself, no venv announced|the LabVIEW the manifest's labview names|LabVIEW \d{4} itself(?:, no venv announced)?|LabVIEW \d{4}, chosen headless|error .+)$"
 )]
 async fn the_result_is(world: &mut CliWorld, expected: String) {
     let state = &world.destination;
@@ -158,6 +170,60 @@ async fn the_result_is(world: &mut CliWorld, expected: String) {
                 "the choice is announced: {:?}",
                 state.events
             );
+        }
+        (installation, Ok(Destination::Global(roots))) if installation.starts_with("LabVIEW ") => {
+            let year: u32 = installation[8..12].parse().expect("a year");
+            let chosen = roots.target.as_ref().expect("a LabVIEW installation");
+            assert_eq!(chosen.year(), year);
+            let headless = Event::HeadlessInstallationChosen {
+                repo: state.cwd.clone(),
+                labview: chosen.label(),
+            };
+            match installation.ends_with("chosen headless") {
+                true => assert_eq!(state.events, [headless]),
+                false => assert!(
+                    !state
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, Event::VenvSelected { .. })),
+                    "no venv is announced: {:?}",
+                    state.events
+                ),
+            }
+        }
+        ("the venv's LabVIEW itself, no venv announced", Ok(Destination::Global(roots))) => {
+            let chosen = roots.target.as_ref().expect("a LabVIEW installation");
+            assert_eq!(chosen.path, state.targets[1].path);
+            assert!(
+                !state
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, Event::VenvSelected { .. })),
+                "no venv is announced: {:?}",
+                state.events
+            );
+        }
+        ("error naming --global, with a next line", Err(why)) => {
+            assert!(why.contains("--global"), "{why}");
+            assert!(
+                why.lines()
+                    .any(|line| line.starts_with("next: ") && line.contains("--global")),
+                "{why}"
+            );
+        }
+        ("error naming the installed LabVIEWs", Err(why)) => {
+            assert!(why.contains("2026") && why.contains("2025"), "{why}");
+        }
+        ("error \"which LabVIEW?\" naming both", Err(why)) => {
+            assert!(why.contains("which LabVIEW?"), "{why}");
+            assert!(why.contains("2026") && why.contains("2025"), "{why}");
+        }
+        ("error naming the manifest's labview", Err(why)) => {
+            assert!(why.contains(&NOT_INSTALLED_YEAR.to_string()), "{why}");
+        }
+        ("error \"pick a destination\" naming --global", Err(why)) => {
+            assert!(why.contains("pick a destination"), "{why}");
+            assert!(why.contains("--global"), "{why}");
         }
         ("error \"mutually exclusive\"", Err(why)) => {
             assert!(why.contains("mutually exclusive"), "{why}");

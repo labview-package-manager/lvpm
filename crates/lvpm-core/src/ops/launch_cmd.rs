@@ -44,7 +44,7 @@ pub fn launch(env: &OpEnv, lvproj: Option<&Path>, ini: &[String], check: bool) -
         .iter()
         .map(|kv| ini_override(kv))
         .collect::<Result<Vec<_>>>()?;
-    let Destination::Venv(venv) = env.destination()? else {
+    let Destination::Venv(venv) = env.read_destination()? else {
         bail!("launch needs a venv: run it inside a project that has one, or pass --project <DIR>");
     };
     if check {

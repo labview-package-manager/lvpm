@@ -104,6 +104,14 @@ pub struct OpEnv<'a> {
     old_form_groups_warned: AtomicBool,
 }
 
+/// What a command does at its destination: reading needs no more than naming
+/// it, writing into LabVIEW itself needs `--global`.
+#[derive(Clone, Copy, PartialEq)]
+enum Intent {
+    Read,
+    Write,
+}
+
 /// Where a command's packages live.
 #[derive(Debug)]
 pub enum Destination {
@@ -182,8 +190,8 @@ impl<'a> OpEnv<'a> {
             }
             (None, Some(p)) => Ok(Roots::scratch(p)),
             (None, None) => bail!(
-                "pick a destination: --labview-version <YYYY> for a real install, --prefix <DIR> for a \
-                 scratch tree, or run inside a project that has a venv (`lvpm venv create`)\n\
+                "pick a destination: --global [--labview-version <YYYY>] for LabVIEW itself, --prefix \
+                 <DIR> for a scratch tree, or run inside a project that has a venv (`lvpm venv create`)\n\
                  hint: `lvpm targets` lists detected LabVIEW installations"
             ),
         }
@@ -215,27 +223,48 @@ impl<'a> OpEnv<'a> {
         self.flags.picked(venv_wins)
     }
 
-    /// Settle where a command's packages live, the way cargo settles which crate
-    /// you mean: `--prefix` and `--global` say so outright; otherwise a venv at or
-    /// above the current directory wins, and only when there is none does
-    /// `--labview-version` mean the installation itself.
+    /// Settle where a command that writes packages puts them, the way cargo
+    /// settles which crate you mean: `--prefix` and `--global` say so outright;
+    /// otherwise a venv at or above the current directory wins, and only when
+    /// there is none does `--labview-version` mean the installation itself, and
+    /// then only on a headless machine: a container's LabVIEW *is* the sandbox
+    /// and nobody is there to type `--global`. Anywhere else it is refused,
+    /// because a write into an installation changes every project that uses it.
     ///
-    /// A manifest with no venv is refused — except on a headless machine, where
-    /// the refusal would protect a developer who is not there: a container's
-    /// LabVIEW *is* the sandbox, so `lvpm install` in the project means it.
+    /// A manifest with no venv is refused too, headless excepted for the same
+    /// reason: `lvpm install` in the project means the installation.
     pub fn destination(&self) -> Result<Destination> {
+        self.resolve(Intent::Write)
+    }
+
+    /// [`Self::destination`] for a command that only reads, which needs no
+    /// `--global`: `--labview-version` alone names the installation.
+    pub fn read_destination(&self) -> Result<Destination> {
+        self.resolve(Intent::Read)
+    }
+
+    fn resolve(&self, intent: Intent) -> Result<Destination> {
         let explicit = |r: Roots| match r.target.is_some() {
             true => Destination::Global(r),
             false => Destination::Scratch(r),
         };
         if self.flags.prefix.is_some() || self.flags.global {
-            return self.roots().map(explicit);
+            return self.flagged_roots().map(explicit);
         }
         if self.headless
             && self.flags.project.is_none()
             && let venv::Found::ManifestOnly(repo) = venv::probe(&self.cwd, &self.config.venv_dir)
         {
-            return self.headless_roots(&repo).map(Destination::Global);
+            let roots = self.manifest_roots(&repo)?;
+            self.sink.emit(Event::HeadlessInstallationChosen {
+                repo,
+                labview: roots
+                    .target
+                    .as_ref()
+                    .map(LvTarget::label)
+                    .unwrap_or_default(),
+            });
+            return Ok(Destination::Global(roots));
         }
         if let Some(v) = self.find_venv()? {
             self.sink.emit(Event::VenvSelected {
@@ -244,14 +273,81 @@ impl<'a> OpEnv<'a> {
             });
             return Ok(Destination::Venv(v));
         }
+        if intent == Intent::Write && self.flags.labview_version.is_some() && !self.headless {
+            return Err(self.needs_global());
+        }
         self.roots().map(explicit)
     }
 
-    /// The installation a headless `lvpm install` in a venv-less project means:
-    /// `--labview-version` if given, else the manifest's `labview` — the same
-    /// choice `lvpm venv create` makes, with the same rule that the manifest's
-    /// version is a minimum a newer LabVIEW may satisfy and an older one may not.
-    fn headless_roots(&self, repo: &Path) -> Result<Roots> {
+    /// What `--prefix`, `--global` and `--labview-version` say, with no venv
+    /// looked for unless `--global` is given alone: what a command with an
+    /// explicit destination settles on, and the roots `run-hooks` acts in.
+    pub fn flagged_roots(&self) -> Result<Roots> {
+        let flags = &self.flags;
+        ensure!(
+            !(flags.global && flags.prefix.is_some()),
+            "--global and --prefix are mutually exclusive"
+        );
+        match (flags.global, &flags.labview_version) {
+            (true, None) => self.global_roots(),
+            _ => self.roots(),
+        }
+    }
+
+    /// [`Self::flagged_roots`] for a command that writes into the installation
+    /// it finds with no venv (`run-hooks`): a real one needs `--global`,
+    /// headless excepted.
+    pub(super) fn write_roots(&self) -> Result<Roots> {
+        let roots = self.flagged_roots()?;
+        match roots.target.is_some() && !self.flags.global && !self.headless {
+            true => Err(self.needs_global()),
+            false => Ok(roots),
+        }
+    }
+
+    /// The refusal of a write into LabVIEW itself that `--labview-version`
+    /// alone asked for.
+    fn needs_global(&self) -> anyhow::Error {
+        let year = self.flags.labview_version.as_deref().unwrap_or("YYYY");
+        anyhow::anyhow!(
+            "--labview-version {year} alone does not write into LabVIEW {year} itself: that changes \
+             every project that uses it\n\
+             next: add --global, or --prefix <DIR> for a scratch tree"
+        )
+    }
+
+    /// The installation `--global` means when `--labview-version` does not
+    /// say: a project's own, from its manifest or its venv, else the only one
+    /// installed.
+    fn global_roots(&self) -> Result<Roots> {
+        if self.flags.project.is_none()
+            && let venv::Found::ManifestOnly(repo) = venv::probe(&self.cwd, &self.config.venv_dir)
+        {
+            return self.manifest_roots(&repo);
+        }
+        if let Some(v) = self.find_venv()? {
+            return Ok(self.labview_roots(&v.target));
+        }
+        match self.pickable()?.as_slice() {
+            [] => bail!("no LabVIEW installations detected"),
+            [only] => Ok(self.labview_roots(only)),
+            several => bail!(
+                "which LabVIEW? pass --labview-version <YYYY> (installed: {})\n\
+                 hint: `lvpm targets` lists what is installed",
+                several
+                    .iter()
+                    .map(LvTarget::label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    /// The installation a venv-less project means: `--labview-version` if
+    /// given, else the manifest's `labview` — the same choice `lvpm venv
+    /// create` makes, with the same rule that the manifest's version is a
+    /// minimum a newer LabVIEW may satisfy and an older one may not.
+    fn manifest_roots(&self, repo: &Path) -> Result<Roots> {
         let manifest_path = repo.join(project::FILE_NAME);
         let proj = project::read(&manifest_path)?;
         let min_lv = proj.labview.as_deref();
@@ -271,10 +367,6 @@ impl<'a> OpEnv<'a> {
         );
         let t = target::select_for_project(&self.pickable()?, requested, min_year)?
             .expect("checked above: a flag or a manifest year is set");
-        self.sink.emit(Event::HeadlessInstallationChosen {
-            repo: repo.to_path_buf(),
-            labview: t.label(),
-        });
         Ok(self.labview_roots(&t))
     }
 
@@ -649,6 +741,25 @@ mod tests {
     }
 
     #[test]
+    fn a_global_with_no_version_picks_the_only_installation_and_none_is_an_error() {
+        let mut env = OpEnv::new(
+            &NullSink,
+            config(),
+            vec![labview_2026()],
+            PathBuf::from("."),
+        );
+        env.flags.global = true;
+        let Ok(Destination::Global(roots)) = env.destination() else {
+            panic!("--global alone picks the one installation");
+        };
+        assert_eq!(roots.target.unwrap().path, labview_2026().path);
+
+        env.targets.clear();
+        let why = env.destination().unwrap_err().to_string();
+        assert_eq!(why, "no LabVIEW installations detected");
+    }
+
+    #[test]
     fn a_headless_install_reads_the_manifests_labview_the_way_locking_does() {
         for (labview, said) in [
             ("soon", Some("not a minimum LabVIEW year")),
@@ -664,7 +775,7 @@ mod tests {
             .unwrap();
             let mut env = OpEnv::new(&NullSink, config(), vec![labview_2026()], repo.clone());
             env.flags.labview_version = Some("2026".into());
-            match (env.headless_roots(&repo), said) {
+            match (env.manifest_roots(&repo), said) {
                 (Ok(_), None) => {}
                 (Err(why), Some(said)) => {
                     assert!(format!("{why:#}").contains(said), "{labview}: {why:#}")
@@ -741,12 +852,12 @@ mod tests {
         let installed = vec![labview(2025, 64), labview(2026, 32)];
         let mut env = OpEnv::new(&NullSink, config(), installed, repo.clone());
         env.flags.labview_bitness = Some(32);
-        let chosen = env.headless_roots(&repo).unwrap().target.unwrap();
+        let chosen = env.manifest_roots(&repo).unwrap().target.unwrap();
         assert_eq!(chosen.path, labview(2026, 32).path);
 
         // Without the flag the manifest's own year is the pick.
         env.flags.labview_bitness = None;
-        let chosen = env.headless_roots(&repo).unwrap().target.unwrap();
+        let chosen = env.manifest_roots(&repo).unwrap().target.unwrap();
         assert_eq!(chosen.path, labview(2025, 64).path);
         let _ = std::fs::remove_dir_all(&repo);
     }

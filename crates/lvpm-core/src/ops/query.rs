@@ -221,7 +221,7 @@ pub struct PackageInfo {
 /// What lvpm has installed into the selected destination.
 /// Also says whether they are a venv's, whose list shows fewer hooks.
 pub fn list(env: &OpEnv) -> Result<(Vec<Manifest>, bool)> {
-    let destination = env.destination()?;
+    let destination = env.read_destination()?;
     let in_venv = matches!(destination, Destination::Venv(_));
     Ok((install::list_installed(&destination.store())?, in_venv))
 }

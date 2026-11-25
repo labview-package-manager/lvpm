@@ -94,7 +94,7 @@ Feature: install hooks run only for allowed packages
     And a LabVIEW 2026 installation
     And the lvpm test fixture in the local package folder
     And the LabVIEW installation is free of the lvpm test fixture
-    When I run "lvpm install lvpm_test_fixture --labview-version 2026"
+    When I run "lvpm install lvpm_test_fixture --global --labview-version 2026"
     Then the exit code is 0
     And stderr says "lvpm_test_fixture: skipped install hook PostInstall (hooks are off by default"
     And stdout does not say "skipped install hook"

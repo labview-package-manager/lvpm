@@ -217,10 +217,18 @@ pub fn real_installation_risk(
     env.flags = flags;
     env.headless = headless;
     // Where it does not resolve, the command fails before it changes anything.
+    // Read, not write: `lvpm` itself refuses `--labview-version` without
+    // `--global`, and this guard must refuse whatever it would not.
     let roots = match by_labview {
-        true => env.roots().ok().filter(|roots| roots.target.is_some())?,
+        // `run-hooks` takes `--global` alone, as `lvpm` does; refresh and start do not.
+        true => match command {
+            "run-hooks" => env.flagged_roots(),
+            _ => env.roots(),
+        }
+        .ok()
+        .filter(|roots| roots.target.is_some())?,
         false => {
-            let Ok(Destination::Global(roots)) = env.destination() else {
+            let Ok(Destination::Global(roots)) = env.read_destination() else {
                 return None;
             };
             roots
@@ -1027,10 +1035,42 @@ mod tests {
             "install",
             "install beta",
             "sync --locked --frozen",
-            "sync --global",
             "uninstall --all",
         ] {
             assert!(!risky(command, false), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_labview_version_alone_is_refused_though_lvpm_itself_refuses_it_too() {
+        // `lvpm` says "add --global" to these; the guard stays a superset of
+        // that rule, so a regression of it fails here instead of in LabVIEW.
+        for command in [
+            "install beta --labview-version 2026",
+            "sync --labview-version 2026",
+        ] {
+            assert!(risky(command, false), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_global_alone_settles_on_the_only_installation_and_is_refused() {
+        for command in [
+            "sync --global",
+            "install beta --global",
+            "uninstall --all --global",
+        ] {
+            assert!(risky(command, false), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_global_with_a_labview_version_is_refused() {
+        for command in [
+            "sync --global --labview-version 2026",
+            "install beta --global --labview-version=2026",
+        ] {
+            assert!(risky(command, false), "{command}");
         }
     }
 
@@ -1115,13 +1155,11 @@ mod tests {
                 "{command} in a venv"
             );
         }
-        for command in [
-            "run-hooks beta --prefix dest",
-            "run-hooks beta",
-            "run-hooks --all --global",
-        ] {
+        for command in ["run-hooks beta --prefix dest", "run-hooks beta"] {
             assert!(!risky(command, false), "{command}");
         }
+        // `--global` alone settles on the one installation, for run-hooks as for install.
+        assert!(risky("run-hooks --all --global", false));
     }
 
     #[test]

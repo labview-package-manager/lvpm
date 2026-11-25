@@ -31,7 +31,7 @@ pub struct PostInstallHook {
 /// any did. Hooks write palette files, so the palettes and menus are
 /// refreshed afterwards, as an install does.
 pub fn run_hooks(env: &OpEnv, package: Option<&str>, all: bool, timeout_secs: u64) -> Result<()> {
-    let roots = env.roots()?;
+    let roots = env.write_roots()?;
     let Some(target) = roots.target.clone() else {
         bail!("run-hooks needs a real LabVIEW target, not --prefix");
     };
@@ -278,6 +278,7 @@ mod tests {
         let sink = testing::Recorded::default();
         let mut env = testing::env_on(&sink, &dir);
         fake.place(&mut env);
+        env.flags.global = true;
         env.flags.labview_version = Some("2099".into());
         let why = run_hooks(&env, None, true, 1).unwrap_err().to_string();
         assert_eq!(why, "2 hook(s) failed");
@@ -397,6 +398,7 @@ mod tests {
         let sink = testing::Recorded::default();
         let mut env = testing::env_on(&sink, &dir);
         fake.place(&mut env);
+        env.flags.global = true;
         env.flags.labview_version = Some("2099".into());
         let why = run_hooks(&env, Some("hooked"), false, 1).unwrap_err();
         assert_eq!(why.to_string(), "1 hook(s) failed");
@@ -409,6 +411,38 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(std::fs::read(&file).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_hooks_at_a_labview_version_alone_is_refused_before_it_reads_anything() {
+        let dir = testing::scratch_dir("hooks-needs-global");
+        let fake = testing::FakeInstallation::new(&dir);
+        let vi = fake
+            .roots()
+            .hooks_dir()
+            .join("hooked")
+            .join("PostInstall.vi");
+        let file = skipped_record(&fake, "hooked", &vi);
+        let before = std::fs::read(&file).unwrap();
+
+        let sink = testing::Recorded::default();
+        let mut env = testing::env_on(&sink, &dir);
+        fake.place(&mut env);
+        env.flags.labview_version = Some("2099".into());
+        let why = format!(
+            "{:#}",
+            run_hooks(&env, Some("hooked"), false, 1).unwrap_err()
+        );
+        assert!(why.contains("--labview-version 2099 alone"), "{why}");
+        assert!(why.contains("next: add --global"), "{why}");
+        assert_eq!(sink.events(), [], "no record was read, no hook started");
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+
+        // A headless machine consents: the run goes on to the record, whose VI is gone.
+        env.headless = true;
+        let why = run_hooks(&env, Some("hooked"), false, 1).unwrap_err();
+        assert_eq!(why.to_string(), "1 hook(s) failed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

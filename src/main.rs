@@ -37,7 +37,8 @@ use std::sync::Arc;
     about = "Open-source package manager for LabVIEW packages (.lvpkg; reads .vip and .ogp) — proof of concept"
 )]
 struct Cli {
-    /// Install into this LabVIEW version, e.g. 2026. See `lvpm targets`.
+    /// Install into this LabVIEW version, e.g. 2026. Writing into LabVIEW itself needs --global.
+    /// See `lvpm targets`.
     #[arg(long = "labview-version", global = true, value_name = "YYYY")]
     labview_version: Option<String>,
 
@@ -56,7 +57,7 @@ struct Cli {
     labview_bitness: Option<u8>,
 
     /// Use the LabVIEW installation itself, even from inside a project that
-    /// has a venv.
+    /// has a venv. A write into it needs this flag.
     #[arg(long, global = true, conflicts_with = "project")]
     global: bool,
 
@@ -1658,7 +1659,7 @@ fn cmd_app_probe(env: &OpEnv, ids: &[String]) -> Result<()> {
 /// venv is in effect (started if none is running — and left running, it is the
 /// user's to close), else the target's. Returns a label and the port.
 fn vi_server_for(env: &OpEnv, what: &str) -> Result<(String, u16)> {
-    match env.destination()? {
+    match env.read_destination()? {
         Destination::Venv(v) => {
             let inst = launch::ensure_instance(
                 &v,

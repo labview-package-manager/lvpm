@@ -55,7 +55,7 @@ pub fn linkfix(env: &OpEnv, opts: &LinkfixOptions) -> Result<()> {
             };
             (roots, opts.bitness)
         }
-        None => match env.destination()? {
+        None => match env.read_destination()? {
             Destination::Venv(v) => (
                 linkfix::venv_roots(&v.dir)?,
                 opts.bitness.or(Some(v.target.bitness)),

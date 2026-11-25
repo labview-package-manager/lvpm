@@ -734,6 +734,7 @@ mod tests {
         let sink = Recorded::default();
         let mut env = env_on(&sink, &dir);
         fake.place(&mut env);
+        env.flags.global = true;
         env.flags.labview_version = Some("2099".into());
         let why = uninstall(&env, Some("alpha"), false, Dependencies::Keep, false).unwrap_err();
 
