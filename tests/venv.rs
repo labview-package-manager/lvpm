@@ -867,14 +867,15 @@ fn import_writes_vipm_files_into_the_manifest_and_adopts_an_old_venv() {
 }
 
 #[test]
-#[ignore = "#48"]
+// Upstream's test, on the fork's rules: a group here is
+// `[dependency-groups.<name>]`, so a group named like a package is no failure,
+// and a name with no version refuses the file instead of being set aside.
 fn a_vipc_carries_its_packages_into_the_cache_and_a_failed_import_writes_nothing() {
     let lab = Lab::new("vipc");
-    lab.write_manifest("[dependencies]\nbundled = \"*\"\n");
+    lab.write_manifest("[dependencies]\n");
     lab.ok(&["venv", "create"]);
 
-    // A .vipc carrying one package the local folder does not have, and
-    // naming one with no version.
+    // A package the local folder does not have, for a .vipc to carry.
     let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default();
     inner.start_file("spec", options).unwrap();
@@ -889,35 +890,45 @@ fn a_vipc_carries_its_packages_into_the_cache_and_a_failed_import_writes_nothing
         .unwrap();
     inner.write_all(b"carried 3.0.0.1\n").unwrap();
     let carried = inner.finish().unwrap().into_inner();
-    let config = "<VI_Package_Configuration File_Type=\"xml\" Version=\"0.6\" Creator=\"x\">\r\n  <Target>\r\n    \
-                  <Name>LabVIEW</Name>\r\n    <Version>99.0 (64-bit)</Version>\r\n    \
-                  <Package>\r\n      <Name>carried-3.0.0.1</Name>\r\n      <Included>true</Included>\r\n    </Package>\r\n    \
-                  <Package>\r\n      <Name>mystery</Name>\r\n      <Included>false</Included>\r\n    </Package>\r\n  \
-                  </Target>\r\n</VI_Package_Configuration>";
-    let vipc = lab.root.join("deps.vipc");
-    let mut z = zip::ZipWriter::new(std::fs::File::create(&vipc).unwrap());
-    z.start_file("config.xml", options).unwrap();
-    z.write_all(config.as_bytes()).unwrap();
-    z.start_file("carried-3.0.0.1.vip", options).unwrap();
-    z.write_all(&carried).unwrap();
-    z.finish().unwrap();
-    let vipc = vipc.display().to_string();
+    let package_xml = |name: &str, included: bool| {
+        format!(
+            "    <Package>\r\n      <Name>{name}</Name>\r\n      <Included>{included}</Included>\r\n      \
+             <Dependency>false</Dependency>\r\n      <Pinned>false</Pinned>\r\n    </Package>\r\n"
+        )
+    };
+    // The target as VIPM writes it, with the bitness.
+    let write_vipc = |file: &str, packages: &str| {
+        let config = format!(
+            "<VI_Package_Configuration File_Type=\"xml\" Version=\"0.6\" Creator=\"x\">\r\n  <Target>\r\n    \
+             <Name>LabVIEW</Name>\r\n    <Version>99.0 (64-bit)</Version>\r\n{packages}  \
+             </Target>\r\n</VI_Package_Configuration>"
+        );
+        let vipc = lab.root.join(file);
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&vipc).unwrap());
+        z.start_file("config.xml", options).unwrap();
+        z.write_all(config.as_bytes()).unwrap();
+        z.start_file("carried-3.0.0.1.vip", options).unwrap();
+        z.write_all(&carried).unwrap();
+        z.finish().unwrap();
+        vipc.display().to_string()
+    };
 
-    // `bundled` is a package already, so it cannot also be a group: the
-    // import fails, and the manifest is as it was.
+    // A name with no version fails the import, and the manifest is as it was.
+    let bad_vipc = write_vipc(
+        "bad.vipc",
+        &(package_xml("carried-3.0.0.1", true) + &package_xml("mystery", false)),
+    );
     let before = lab.manifest();
     has(
-        &lab.fails(&["import", &vipc, "--group", "bundled"]),
-        "cannot also be a group",
+        &lab.fails(&["import", &bad_vipc]),
+        "package mystery: no version (expected name-version)",
     );
     assert_eq!(lab.manifest(), before);
 
-    let imported = lab.ok(&["import", &vipc]);
-    has(
-        &imported,
-        "\"mystery\" in config.xml has no version in its name; not imported",
-    );
-    has(&imported, "saved carried = \"3.0.0.1\"");
+    let good_vipc = write_vipc("deps.vipc", &package_xml("carried-3.0.0.1", true));
+    let imported = lab.ok(&["import", &good_vipc]);
+    has(&imported, "imported carried 3.0.0.1");
+    has(&imported, "saved carried = \">=3.0.0.1\"");
     // Installed from the cache: no index has it.
     has(&lab.ok(&["install", "carried"]), "+ carried 3.0.0.1");
     has(
