@@ -52,7 +52,8 @@ except with `--relink` or for a package marked `relink = true`):
 | `lvpm sync` or bare `lvpm install` | a missing or out-of-date `lvpm.lock` is locked again first                          | acts as `--locked`: a missing or out-of-date `lvpm.lock` fails, after a note saying so. `--frozen` still applies. `lock`, a named `install` and a named `uninstall` are not affected | `--no-locked`                    |
 
 Together those mean a headless `lvpm install` into the LabVIEW installation,
-without `--hooks` or `--relink`, never starts LabVIEW: it is downloads, MD5
+without `--hooks` or `--relink` and with no package marked `relink = true`,
+never starts LabVIEW: it is downloads, MD5
 checks, file copies and linkfix, and takes seconds. (A headless install into
 a venv starts a headless LabVIEW for [the load check](usage.md#the-load-check),
 and resaves each package in one only with `--resave`; see

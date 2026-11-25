@@ -885,8 +885,8 @@ resave (2/2) oglib_string ... already saved in LabVIEW 2026, skipped
 - It costs one LabVIEW start per run and about 40 to 85 seconds per package,
   mostly the cold load of its VIs. A package whose VIs are all saved in the
   venv's LabVIEW version already is skipped, and starts no LabVIEW.
-- `--resave` and `--relink` are separate: the relink pass is off unless
-  `--relink` is given. `--dry-run --resave` lists the packages with VIs it
+- `--resave` and `--relink` are separate: the relink pass runs only with
+  `--relink` or for packages marked `relink = true`. `--dry-run --resave` lists the packages with VIs it
   may resave, including ones the version check will skip, and starts no
   LabVIEW. `sync`, `add` and `remove` take `--resave` too; the TUI never resaves.
 - A failed resave is a warning, not an error: the package is still
