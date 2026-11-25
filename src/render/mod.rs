@@ -47,8 +47,6 @@ pub struct Renderer {
     err: Box<dyn Write + Send>,
     /// The stream a begun line is waiting to be ended on.
     open: Option<Stream>,
-    /// A resave began in this run, so a skipped relink says the resave ran.
-    resaved: bool,
     /// The begun line of the package being installed, written again in full
     /// when a resave's lines came between it and its end.
     package_line: String,
@@ -60,7 +58,6 @@ impl Renderer {
             out,
             err,
             open: None,
-            resaved: false,
             package_line: String::new(),
         }
     }

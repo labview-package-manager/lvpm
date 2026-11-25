@@ -809,7 +809,7 @@ the venv started another way than `lvpm launch` gets none of this.
 ### Linkfix
 
 `install` and `sync` run linkfix after the files are copied and
-before the PostInstall hooks. It edits only the LabVIEW files that install
+before the PostInstall hooks, into a venv too. It edits only the LabVIEW files that install
 wrote into the LabVIEW tree, and needs no LabVIEW:
 
 - it repairs owner paths, relative paths, build-machine absolute paths and
@@ -865,10 +865,12 @@ reinstalled, and `--keep-deps` still works.
 
 ### The resave
 
-A venv install opens and saves each package's VIs in the venv's LabVIEW
-before the package reaches `.lv-venv`. A VI saved in an older LabVIEW can
-otherwise load broken from an add-on folder. The package is unpacked into
-`.lv-venv.staging/` beside the venv, resaved there, then moved into place.
+With `--resave`, a venv install opens and saves each package's VIs in the
+venv's LabVIEW before the package reaches `.lv-venv`. Without it, the default,
+linkfix alone prepares the files and no LabVIEW starts. Ask for the resave when
+a VI saved in an older LabVIEW loads broken from an add-on folder after
+linkfix. The package is unpacked into `.lv-venv.staging/` beside the venv,
+resaved there, then moved into place. Linkfix still runs afterwards.
 
 ```console
 starting the venv's LabVIEW for the resave (about a minute per package)
@@ -879,10 +881,10 @@ resave (2/2) oglib_string ... already saved in LabVIEW 2026, skipped
 - It costs one LabVIEW start per run and about 40 to 85 seconds per package,
   mostly the cold load of its VIs. A package whose VIs are all saved in the
   venv's LabVIEW version already is skipped, and starts no LabVIEW.
-- The relink pass is off unless `--relink` is given. The resave still
-  runs, and the relink line says so. `--dry-run` lists the packages with
-  VIs it may resave, including ones the version check will skip, and starts
-  no LabVIEW.
+- `--resave` and `--relink` are separate: the relink pass is off unless
+  `--relink` is given. `--dry-run --resave` lists the packages with VIs it
+  may resave, including ones the version check will skip, and starts no
+  LabVIEW. `sync` takes `--resave` too; the TUI never resaves.
 - A failed resave is a warning, not an error: the package is still
   installed and the exit code stays 0. The warning names the package and its
   folder. Reinstall the package; if it fails again, run `lvpm launch` and
@@ -891,8 +893,8 @@ resave (2/2) oglib_string ... already saved in LabVIEW 2026, skipped
   packages installed without a resave.
 - Scripts read the failures from `--json`: the install summary carries a
   `resave_failed` list, present only when a package failed.
-- A venv installed before this release has packages that were never
-  resaved. Delete `.lv-venv` and run `lvpm sync` to reinstall them.
+- To resave a venv installed without it, delete `.lv-venv` and run
+  `lvpm sync --resave`.
 
 ## Building a package
 

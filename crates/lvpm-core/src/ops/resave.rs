@@ -407,9 +407,10 @@ mod tests {
         )
     }
 
-    fn no_relink() -> InstallOptions {
+    /// `--resave`: a venv install resaves each package before it lands.
+    fn resaving() -> InstallOptions {
         InstallOptions {
-            no_relink: true,
+            resave: true,
             ..InstallOptions::default()
         }
     }
@@ -487,7 +488,7 @@ mod tests {
         let fake = Fake::saving().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
 
         let events = sink.events();
         assert!(events.contains(&Event::ResaveStarting));
@@ -517,7 +518,7 @@ mod tests {
         Fake::failing(&["alpha"]).install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
 
         let events = sink.events();
         let failed = events.iter().find_map(|e| match e {
@@ -549,7 +550,7 @@ mod tests {
         let fake = Fake::failing(&["alpha"]).install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("beta"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("beta"), &resaving()).unwrap();
 
         let events = sink.events();
         assert!(events.iter().any(|e| matches!(
@@ -571,7 +572,7 @@ mod tests {
         let fake = Fake::cannot_start().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("beta"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("beta"), &resaving()).unwrap();
 
         let events = sink.events();
         let both = vec!["alpha".to_string(), "beta".to_string()];
@@ -630,7 +631,7 @@ mod tests {
         let fake = Fake::saving().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("beta"), &no_relink()).unwrap_err();
+        install(&env_on(&sink, &repo), Some("beta"), &resaving()).unwrap_err();
 
         let log = fake.log();
         assert_eq!(log.resaves.len(), 1, "alpha was resaved first");
@@ -660,7 +661,7 @@ mod tests {
             let fake = Fake::saving().install();
             let sink = Recorded::default();
 
-            install(&env_on(&sink, &repo), Some("top"), &no_relink()).unwrap();
+            install(&env_on(&sink, &repo), Some("top"), &resaving()).unwrap();
 
             let log = fake.log();
             assert_eq!(log.resaves.len(), graph.len(), "{graph:?}");
@@ -690,7 +691,7 @@ mod tests {
         let fake = Fake::saving().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
 
         let events = sink.events();
         assert!(!events.contains(&Event::ResaveStarting));
@@ -708,7 +709,7 @@ mod tests {
         let mut env = env_on(&sink, &repo);
         env.headless = true;
 
-        install(&env, Some("alpha"), &InstallOptions::default()).unwrap();
+        install(&env, Some("alpha"), &resaving()).unwrap();
 
         let events = sink.events();
         assert_eq!(resaves(&events), ["alpha"]);
@@ -722,13 +723,73 @@ mod tests {
     }
 
     #[test]
+    fn a_default_venv_install_runs_linkfix_and_starts_no_labview() {
+        let (repo, venv) = repo("resave-default");
+        package(&repo, "alpha", "");
+        let fake = Fake::saving().install();
+        let sink = Recorded::default();
+
+        install(
+            &env_on(&sink, &repo),
+            Some("alpha"),
+            &InstallOptions::default(),
+        )
+        .unwrap();
+
+        let events = sink.events();
+        assert!(events.contains(&Event::LinkfixPreparing), "{events:?}");
+        assert!(!events.contains(&Event::ResaveStarting));
+        assert!(resaves(&events).is_empty());
+        assert_eq!(fake.log().starts, 0);
+        assert!(landed(&venv, "alpha"));
+        assert!(!venv.staging_dir().exists());
+    }
+
+    #[test]
+    fn a_resave_asked_for_still_runs_linkfix() {
+        let (repo, venv) = repo("resave-and-linkfix");
+        package(&repo, "alpha", "");
+        Fake::saving().install();
+        let sink = Recorded::default();
+
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
+
+        let events = sink.events();
+        let at = |want: fn(&Event) -> bool| events.iter().position(want);
+        let resave = at(|e| matches!(e, Event::ResaveStarted { .. })).expect("resaved");
+        let linkfix = at(|e| matches!(e, Event::LinkfixPreparing)).expect("linkfix ran");
+        assert!(resave < linkfix, "the resave comes before linkfix");
+        assert!(landed(&venv, "alpha"));
+    }
+
+    #[test]
+    fn a_dry_run_lists_a_resave_only_when_asked_for() {
+        let (repo, _venv) = repo("resave-dry-default");
+        package(&repo, "alpha", "");
+        Fake::saving().install();
+        let sink = Recorded::default();
+        let dry = InstallOptions {
+            dry_run: true,
+            ..InstallOptions::default()
+        };
+
+        install(&env_on(&sink, &repo), Some("alpha"), &dry).unwrap();
+
+        assert_eq!(planned(&sink.events()), None);
+    }
+
+    #[test]
     fn no_relink_skips_the_relink_and_not_the_resave() {
         let (repo, _venv) = repo("resave-no-relink");
         package(&repo, "alpha", "");
         Fake::saving().install();
         let sink = Recorded::default();
+        let opts = InstallOptions {
+            no_relink: true,
+            ..resaving()
+        };
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &opts).unwrap();
 
         let events = sink.events();
         assert_eq!(resaves(&events), ["alpha"]);
@@ -745,7 +806,7 @@ mod tests {
     fn relink() -> InstallOptions {
         InstallOptions {
             force_relink: true,
-            ..InstallOptions::default()
+            ..resaving()
         }
     }
 
@@ -941,7 +1002,7 @@ mod tests {
         let fake = Fake::saving().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("both"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("both"), &resaving()).unwrap();
 
         let events = sink.events();
         assert!(events.iter().any(|e| matches!(
@@ -964,7 +1025,7 @@ mod tests {
         let fake = Fake::cannot_start().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
 
         let events = sink.events();
         assert_eq!(fake.log().starts, 0);
@@ -993,7 +1054,7 @@ mod tests {
         Fake::failing(&["beta"]).install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("all"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("all"), &resaving()).unwrap();
 
         let events = sink.events();
         assert_eq!(resaves(&events), ["beta", "gamma"]);
@@ -1017,7 +1078,7 @@ mod tests {
         Fake::saving().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
 
         assert_eq!(resaves(&sink.events()), ["alpha"]);
     }

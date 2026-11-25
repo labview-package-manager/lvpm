@@ -22,9 +22,8 @@ In a project that one command does three things:
    in `lvpm.toml`.
 2. Resolves every package, direct or transitive, and writes the exact
    versions, SHA-256 hashes and sources to `lvpm.lock`.
-3. Syncs: installs exactly what the lock lists into `.lv-venv`, resaves the VIs in
-   the venv's LabVIEW and relinks them. lvpm starts that LabVIEW itself,
-   so this takes a minute or so per package.
+3. Syncs: installs exactly what the lock lists into `.lv-venv` and prepares
+   its VIs with linkfix, which needs no LabVIEW.
 
 Look at `lvpm.toml` and `lvpm.lock` now. Commit both: a teammate who runs `lvpm venv create` and `lvpm sync` in a
 fresh clone, or a CI job that runs `lvpm sync`, gets the same packages, byte

@@ -4,6 +4,13 @@
 **Format:** dev-team specs 14.0.1 · **Status:** gate passed; the four stakeholder answers were given by the user on 2026-10-27 · **Date:** 2026-10-27 ·
 **Evidence:** [PR #55 comment](https://github.com/ThatsTheEnd/lvpm/pull/55#issuecomment-6440371424)
 
+> **Changed (2026-11-25,
+> [#59](https://github.com/labview-package-manager/lvpm/issues/59)):** the
+> resave is now opt-in with `--resave`. A default venv install prepares the
+> files with linkfix alone and starts no LabVIEW; `sync` and the TUI do the
+> same. With `--resave` everything below still holds, and linkfix runs after
+> it. The measurements below were taken with no linkfix.
+
 ## Intent Description
 
 A package built from old LabVIEW sources can be broken in a venv. The

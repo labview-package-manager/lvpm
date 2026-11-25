@@ -81,9 +81,9 @@ installation has too, and how to remove that copy. Only LabVIEW files count.
 Two more things follow from LabVIEW reading the addons at launch:
 
 - After `lvpm install`, a LabVIEW already open on the venv cannot see the new
-  files. Restart it with `lvpm launch`. For the same reason the resave (and
-  the relink, with `--relink`) runs in a LabVIEW that lvpm starts fresh on
-  the venv, and is refused while one is already open there.
+  files. Restart it with `lvpm launch`. For the same reason the resave (with
+  `--resave`) and the relink (with `--relink`) run in a LabVIEW that lvpm
+  starts fresh on the venv, and are refused while one is already open there.
 - The venv's LabVIEW is separate from your primary one. It has its own
   `labview.ini`, VI Server port, compiled-object cache, `LabVIEW Data` folder
   and temp folder, so the two never share autosave files, caches or logs.
