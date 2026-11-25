@@ -199,6 +199,9 @@ pub struct Project {
     /// `labview` is written as a bare year, `"2024"`, the lvpm 0.3 form: read
     /// as `">=2024"`, with a warning that names that form.
     pub labview_bare_year: bool,
+    /// Groups written `[dependencies.<group>]`, the lvpm 0.3 form, in file
+    /// order: read as the table [`group_header`] names, with a warning.
+    pub old_form_groups: Vec<String>,
     /// `[sources]`, in file order: a name and an index URL or `oci://` registry
     /// URL as written.
     pub sources: Vec<(String, String)>,
@@ -252,6 +255,7 @@ impl Default for Project {
             version: None,
             labview: None,
             labview_bare_year: false,
+            old_form_groups: Vec::new(),
             sources: Vec::new(),
             default_sources: true,
             min_age_days: 0,
@@ -481,7 +485,8 @@ const MIN_AGE_DAYS: &str = "min-age-days";
 const SOURCE_SETTINGS: [&str; 2] = [DEFAULTS, MIN_AGE_DAYS];
 
 pub(crate) fn parse(text: &str) -> Result<Project> {
-    let f: File = toml::from_str(text)?;
+    let mut f: File = toml::from_str(text)?;
+    let old_form_groups = move_old_form_groups(&mut f)?;
     let written = f.project.labview.as_deref().map(str::trim);
     let labview_bare_year = written.is_some_and(is_year);
     let mut p = Project {
@@ -494,6 +499,7 @@ pub(crate) fn parse(text: &str) -> Result<Project> {
             })
             .transpose()?,
         labview_bare_year,
+        old_form_groups,
         distribution: f.distribution,
         ..Project::default()
     };
@@ -656,6 +662,71 @@ pub fn valid_group_name(name: &str) -> Result<()> {
 
 /// One dependency table's lines, in file order.
 type Entries = Vec<(String, Constraint)>;
+
+/// The header a group is written under: `[dev-dependencies]` for `dev`, in
+/// any case, and `[dependency-groups.<group>]` for every other group.
+pub fn group_header(group: &str) -> String {
+    format!(
+        "[{}]",
+        DependencyTable::from_flags(false, Some(group)).key()
+    )
+}
+
+/// lvpm writes only [`group_header`]'s form, so an edit to the entry `name`
+/// of `table` is refused before anything changes, with the header to rename,
+/// while that table's group is still written `[dependencies.<group>]`, or
+/// while `name` in `[dependencies]` is the key of such a group.
+pub fn refuse_old_form_edit(project: &Project, table: &DependencyTable, name: &str) -> Result<()> {
+    let group = project.old_form_groups.iter().find(|group| {
+        DependencyTable::from_flags(false, Some(group)) == *table
+            || (*table == DependencyTable::Dependencies && same_name(group, name))
+    });
+    let Some(group) = group else {
+        return Ok(());
+    };
+    bail!(
+        "[dependencies.{group}] is the lvpm 0.3 form of a group; rename the header to {}, \
+         then run this again",
+        group_header(group)
+    )
+}
+
+/// lvpm 0.3 wrote a group as `[dependencies.<group>]`: a non-empty table
+/// under `[dependencies]` with none of a line's keys. (An empty one is still a
+/// package line, and refused as one; a misspelt key such as `verison` makes
+/// the table a group.) Each one moves to the table [`group_header`] names, and
+/// its name is returned for the warning.
+fn move_old_form_groups(f: &mut File) -> Result<Vec<String>> {
+    let old_form_names: Vec<String> = (f.dependencies.iter())
+        .filter(|(_, value)| {
+            value.as_table().is_some_and(|fields| {
+                !fields.is_empty() && !fields.keys().any(|k| LINE_KEYS.contains(&k.as_str()))
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in &old_form_names {
+        let lines = f.dependencies.remove(name).expect("listed above");
+        let header = group_header(name);
+        let dev = is_dev_group(name);
+        let taken = match dev {
+            true => !f.dev_dependencies.is_empty(),
+            false => f.dependency_groups.contains_key(name),
+        };
+        if taken {
+            bail!(
+                "[dependencies.{name}] and {header} are the same group: move its lines into {header}"
+            );
+        }
+        match (dev, lines) {
+            (true, toml::Value::Table(lines)) => f.dev_dependencies = lines,
+            (_, lines) => {
+                f.dependency_groups.insert(name.clone(), lines);
+            }
+        }
+    }
+    Ok(old_form_names)
+}
 
 /// `[dependency-groups]`: each key a group name, each value that group's
 /// dependency table, in file order. `dev` is `[dev-dependencies]`, not a group.
@@ -867,17 +938,6 @@ fn dependency_table(
     if fields.contains_key("index") && fields.contains_key("github") {
         bail!(
             "{at}: github and index cannot be used together; a github dependency comes only from its repo"
-        );
-    }
-    // Upstream lvpm spells a group `[dependencies.<group>]`; here that is a
-    // dependency line with none of a line's keys.
-    if table == "dependencies"
-        && !fields.is_empty()
-        && !fields.keys().any(|k| LINE_KEYS.contains(&k.as_str()))
-    {
-        bail!(
-            "{at}: a table under [dependencies] is one dependency line; \
-             a group is written [dependency-groups.{name}]"
         );
     }
     if let Some(key) = fields.keys().find(|k| !LINE_KEYS.contains(&k.as_str())) {
@@ -1538,17 +1598,122 @@ ni-daqmx-labview-support = "26.0.0.49434-0+f282"
     }
 
     #[test]
-    fn an_upstream_style_group_table_names_the_group_spelling() {
-        let e = format!(
-            "{:#}",
-            parse(
-                "[dependencies.test]
-jki_lib_caraya = \"*\"
-"
-            )
-            .unwrap_err()
+    fn a_group_written_under_dependencies_is_read_as_that_group_and_listed_for_the_warning() {
+        let p =
+            parse("[dependencies]\nalpha = \"*\"\n\n[dependencies.test]\njki_lib_caraya = \"*\"\n")
+                .unwrap();
+        assert_eq!(p.dependencies, vec![("alpha".to_string(), Constraint::Any)]);
+        assert_eq!(
+            p.groups,
+            vec![(
+                "test".to_string(),
+                vec![("jki_lib_caraya".to_string(), Constraint::Any)]
+            )]
         );
-        assert!(e.contains("[dependency-groups.test]"), "{e}");
+        assert_eq!(p.old_form_groups, vec!["test".to_string()]);
+    }
+
+    #[test]
+    fn dependencies_dev_is_read_as_dev_dependencies() {
+        let p = parse("[dependencies.Dev]\nci_tools = \"*\"\n").unwrap();
+        assert_eq!(
+            p.dev_dependencies,
+            vec![("ci_tools".to_string(), Constraint::Any)]
+        );
+        assert_eq!(p.old_form_groups, vec!["Dev".to_string()]);
+    }
+
+    #[test]
+    fn a_group_written_the_current_way_is_not_listed_for_the_warning() {
+        let p = parse("[dependency-groups.test]\njki_lib_caraya = \"*\"\n").unwrap();
+        assert!(p.old_form_groups.is_empty());
+    }
+
+    #[test]
+    fn a_dotted_table_with_a_line_key_is_still_a_package() {
+        let p = parse("[dependencies.alpha]\nversion = \"*\"\n").unwrap();
+        assert_eq!(p.dependencies, vec![("alpha".to_string(), Constraint::Any)]);
+        assert!(p.groups.is_empty() && p.old_form_groups.is_empty());
+    }
+
+    #[test]
+    fn both_forms_of_one_group_are_refused_naming_both() {
+        for (text, said) in [
+            (
+                "[dependencies.test]\na = \"*\"\n\n[dependency-groups.test]\nb = \"*\"\n",
+                "[dependencies.test] and [dependency-groups.test] are the same group: \
+                 move its lines into [dependency-groups.test]",
+            ),
+            (
+                "[dependencies.dev]\na = \"*\"\n\n[dev-dependencies]\nb = \"*\"\n",
+                "[dependencies.dev] and [dev-dependencies] are the same group: \
+                 move its lines into [dev-dependencies]",
+            ),
+        ] {
+            let error = parse(text).unwrap_err().to_string();
+            assert!(error.contains(said), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_edit_to_an_old_form_group_is_refused_with_the_header_to_rename() {
+        let p = parse("[dependencies.test]\na = \"*\"\n\n[dependencies.DEV]\nb = \"*\"\n").unwrap();
+        for (table, said) in [
+            (
+                DependencyTable::Group("test".to_string()),
+                "[dependencies.test] is the lvpm 0.3 form of a group; \
+                 rename the header to [dependency-groups.test], then run this again",
+            ),
+            (
+                DependencyTable::DevDependencies,
+                "[dependencies.DEV] is the lvpm 0.3 form of a group; \
+                 rename the header to [dev-dependencies], then run this again",
+            ),
+        ] {
+            let error = refuse_old_form_edit(&p, &table, "x")
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, said);
+        }
+        for table in [
+            DependencyTable::Dependencies,
+            DependencyTable::Group("docs".to_string()),
+        ] {
+            assert!(refuse_old_form_edit(&p, &table, "x").is_ok());
+        }
+    }
+
+    #[test]
+    fn a_package_named_like_an_old_form_group_is_refused_with_the_header_to_rename() {
+        let p = parse("[dependencies.test]\na = \"*\"\n").unwrap();
+        let error = refuse_old_form_edit(&p, &DependencyTable::Dependencies, "TEST")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "[dependencies.test] is the lvpm 0.3 form of a group; \
+             rename the header to [dependency-groups.test], then run this again"
+        );
+        let other = DependencyTable::Group("docs".to_string());
+        assert!(refuse_old_form_edit(&p, &other, "test").is_ok());
+    }
+
+    #[test]
+    fn an_empty_dotted_table_is_a_package_line_and_refused_as_one() {
+        let error = parse("[dependencies.test]\n").unwrap_err().to_string();
+        assert!(
+            error.contains("[dependencies] test: a table needs version"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_dotted_table_with_a_misspelt_key_is_read_as_a_group() {
+        let p = parse("[dependencies.pkg]\nverison = \"*\"\n").unwrap();
+        assert_eq!(p.old_form_groups, vec!["pkg".to_string()]);
+        let line = ("verison".to_string(), Constraint::Any);
+        assert_eq!(p.groups, vec![("pkg".to_string(), vec![line])]);
+        assert!(p.dependencies.is_empty());
     }
 
     #[test]
