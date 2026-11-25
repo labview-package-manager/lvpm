@@ -1,4 +1,9 @@
-# lvpm
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/lvpm-logo-dark.svg">
+    <img alt="lvpm: open-source package manager for LabVIEW" src="docs/assets/lvpm-logo.svg" width="520">
+  </picture>
+</h1>
 
 [![Release](https://github.com/ThatsTheEnd/lvpm/actions/workflows/tag.yml/badge.svg?branch=main)](https://github.com/ThatsTheEnd/lvpm/actions/workflows/tag.yml)
 [![Docs](https://github.com/ThatsTheEnd/lvpm/actions/workflows/docs.yml/badge.svg?branch=main)](https://thatstheend.github.io/lvpm/)
@@ -17,15 +22,19 @@ reference.
 lvpm installs `.vip` and `.ogp` packages, the formats VIPM and OpenG use, and
 its own `.lvpkg`, by name. It takes them from the public package directories, your own hosted
 indexes, or local folders. It installs them either into a LabVIEW installation
-or into a project's own venv, so two projects on one machine can use
-different versions of the same library. Then **linkfix** repairs the installed
+or into a project's own **venv**, so two projects on one machine can use
+different versions of the same library. Venvs are new to LabVIEW: the
+packages live beside the project, LabVIEW mounts them as an
+[LVAddons](https://labviewwiki.org/wiki/LVAddons) overlay (LabVIEW 2024 Q1
+and later), and `C:\Program Files` never changes
+([How a venv works](docs/venvs.md)). Then **linkfix** repairs the installed
 VIs' links and separates their compiled code, without starting LabVIEW
 ([Linkfix](docs/linkfix.md)); `--relink` has LabVIEW load and save them
 instead. Install hooks are off by default: a package's hooks run only if
 you allow them ([Hooks](docs/labview-integration.md#hooks)).
 
 Not affiliated with JKI or NI. Working, in active development; see
-[docs/roadmap.md](docs/roadmap.md) and [Known limitations](#known-limitations).
+[docs/roadmap.md](docs/roadmap.md) and [Known limitations](docs/limitations.md).
 
 <!-- ANCHOR: how-it-works -->
 ## How it works
@@ -35,15 +44,17 @@ flowchart LR
   S["Package sources<br/>VIPM / NI indexes · GitHub releases · your indexes · local folders"] --> L["lvpm<br/>resolve · download · verify · unpack"]
   P["lvpm.toml + lvpm.lock<br/>(optional, per project)"] -.-> L
   L --> T["LabVIEW installation<br/>or project .lv-venv"]
-  L -- "VI Server" --> LV["LabVIEW<br/>relink VIs · run allowed install hooks"]
+  L -- "VI Server" --> LV["LabVIEW<br/>resave a venv's packages · relink with --relink or relink = true · run allowed hooks outside a venv"]
 ```
 
 1. lvpm resolves the package and its dependencies, downloads them and checks
    their MD5.
 2. It unpacks them into the target: a LabVIEW installation, or a project venv
    that LabVIEW overlays onto its own tree.
-3. Over VI Server, it has LabVIEW relink the installed VIs and run the
-   packages' install hooks, for the packages you allowed.
+3. Linkfix repairs the installed VIs' links without LabVIEW. Over VI Server,
+   LabVIEW relinks them only with `--relink` or for a package marked
+   `relink = true`, resaves a venv's packages, and runs the install hooks of the
+   packages you allowed, outside a venv.
 
 In a project, `lvpm.toml` says what you depend on. `lvpm.lock` records the
 exact versions, so every machine and CI job gets the same packages, byte for
@@ -52,8 +63,10 @@ byte.
 
 ## Install
 
-Windows 10/11 with LabVIEW 2020 or later. Linux is built and tested in NI's
-LabVIEW Linux images. In PowerShell:
+Windows 10/11 with LabVIEW 2020 or later (venvs need LabVIEW 2024 Q1 or
+later). Run `lvpm-x86_64-pc-windows-msvc.msi` from the
+[Releases](https://github.com/ThatsTheEnd/lvpm/releases) page, or in
+PowerShell:
 
 ```powershell
 cd $env:TEMP
@@ -61,10 +74,14 @@ irm https://raw.githubusercontent.com/ThatsTheEnd/lvpm/main/scripts/install.ps1 
 .\install.ps1
 ```
 
-This installs per-user and needs no elevation. If PowerShell refuses to run
-the script, allow it with [Set-ExecutionPolicy](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/set-executionpolicy?view=powershell-7.6).
-Script options, the manual
-download, Linux and building from source are in [docs/install.md](docs/install.md).
+The script verifies the release zip's SHA-256 and puts `lvpm.exe` in
+`%LOCALAPPDATA%\lvpm\bin`, on your user `PATH`. Both install per-user and
+need no elevation. If PowerShell refuses to run the script, allow it with
+[Set-ExecutionPolicy](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/set-executionpolicy?view=powershell-7.6).
+
+On Linux x64, download `lvpm-x86_64-unknown-linux-gnu.tar.gz` from the same
+page. Script options, the checksum steps, Linux and building from source are
+in [docs/install.md](docs/install.md).
 
 ## Quick start
 
@@ -79,7 +96,7 @@ $ lvpm uninstall oglib_error
 Or browse and install in a terminal UI: `lvpm tui`.
 
 `--labview-version` picks the target when more than one LabVIEW is
-installed. Relinking and hooks need LabVIEW's VI Server (TCP) enabled, which
+installed. Relinking, hooks and a venv's resave need LabVIEW's VI Server (TCP) enabled, which
 is its default setting (Tools » Options » VI Server). lvpm starts LabVIEW
 itself when it is not running, and says so.
 
@@ -96,6 +113,10 @@ $ lvpm launch MyProject.lvproj              # a LabVIEW that sees the venv
 ```
 
 Commit `lvpm.toml` and `lvpm.lock` ([The lock file](docs/usage.md#the-lock-file)).
+
+A project that already has a `vipm.toml` or a `.vipc` gets its packages into
+`lvpm.toml` with `lvpm import <file>`, then `lvpm sync`
+([Importing into a project](docs/usage.md#importing-into-a-project)).
 
 To package your own library, add a `[distribution]` table to `lvpm.toml`
 ([Building a package](docs/usage.md#building-a-package)), then:
@@ -184,10 +205,13 @@ below as one book, starting with a tutorial; CONTRIBUTING.md stays in the repo.
 | --- | --- |
 | [docs/install.md](docs/install.md) | Install script options, manual and Linux install, building from source |
 | [docs/usage.md](docs/usage.md) | Commands and flags, `lvpm.toml`, `lvpm.lock`, add/remove/upgrade, venvs, package sources, configuration |
-| [docs/labview-integration.md](docs/labview-integration.md) | What an install does inside LabVIEW: relinking, install hooks, VI Server |
+| [docs/venvs.md](docs/venvs.md) | How a venv works: the overlay, its palettes, keeping the LabVIEW installation clean |
+| [docs/labview-integration.md](docs/labview-integration.md) | What an install does inside LabVIEW: linkfix, relinking, install hooks, VI Server |
+| [docs/package-notes.md](docs/package-notes.md) | Commonly used packages in a venv: which hooks they need, which don't work yet |
 | [docs/ci-docker.md](docs/ci-docker.md) | Running lvpm headless in NI's Windows container |
 | [docs/linux.md](docs/linux.md) | LabVIEW for Linux: what differs, measured in NI's Linux container |
-| [docs/manifest.md](docs/manifest.md) | The `lvpm.toml` format, and how a `vipm.toml` is read |
+| [docs/manifest.md](docs/manifest.md) | The `lvpm.toml` format, and how a `vipm.toml` is read ([compatibility with VIPM](docs/manifest.md#compatibility-with-vipmtoml)) |
+| [docs/limitations.md](docs/limitations.md) | Known limitations |
 | [docs/ogpm-model.md](docs/ogpm-model.md) | The OpenG package model lvpm implements, mapped term by term |
 | [docs/adr/](docs/adr/README.md) | Architecture decisions, and why |
 | [Architecture map](https://thatstheend.github.io/lvpm/map/) | Interactive map of the code, with guided flows from `lvpm init` to an installed package |
@@ -195,36 +219,8 @@ below as one book, starting with a tutorial; CONTRIBUTING.md stays in the repo.
 
 ## Known limitations
 
-- `Replace Mode = If Newer` only writes when the file is absent; doing it
-  properly means comparing archive timestamps against disk.
-- Dependency conflicts are solved only when a project is locked. A named
-  install outside a project still lets the first resolution of a name win, and
-  a floor resolves to the newest version satisfying it.
-- No mass compile; LabVIEW recompiles installed VIs on first load.
-- Install hooks are off by default and the allowlist is by package name, not
-  by VI: allowing a package allows every hook VI it ships, and a hook runs
-  with your rights. The rules are in
-  [Hooks](docs/labview-integration.md#hooks).
-- A hook VI's own `error out` is not read back. A hook that fails internally
-  but runs to completion reports as ok.
-- A failure part-way through unpacking leaves files behind with no manifest,
-  and one failed download aborts the rest of the plan.
-- In NI's LabVIEW Linux images CI runs only the smoke flow
-  ([Continuous integration](CONTRIBUTING.md#continuous-integration)); the
-  `@labview` acceptance scenarios run in the Windows image only. Linux does
-  not yet honour a package's `Exclusive_OS` ([docs/linux.md](docs/linux.md)).
-- In a venv, install hooks are extracted but never run (they act on the
-  LabVIEW installation, not on an overlay), and file groups aimed at machine
-  locations (`<OS ...>`, `<temp>`) are skipped. Both are recorded in the
-  manifest and shown by `lvpm list`. No warning yet when a global copy of a
-  venv package shadows it.
-
-- `lvpm build` packages one library's members as a `.lvpkg`, lvpm's own
-  format: no build hooks, no probes or templates from outside the library.
-  VIPM cannot read it, so don't hand it to VIPM users
-  ([ADR 6](docs/adr/0006-lvpkg-only-vip-read-only.md)).
-
-[docs/roadmap.md](docs/roadmap.md) has what is planned.
+[docs/limitations.md](docs/limitations.md) lists what does not work yet, and
+[docs/roadmap.md](docs/roadmap.md) what is planned.
 
 ## License
 

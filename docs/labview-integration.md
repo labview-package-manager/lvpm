@@ -1,14 +1,58 @@
 # What an install does in LabVIEW
 
+After the files are copied, an install prepares them for their new location
+(linkfix, or a LabVIEW relink when asked), runs the install hooks you
+allowed, and rebuilds palettes and menus. Only the relink, the hooks and a
+venv's resave ([usage](usage.md#the-resave)) need a running LabVIEW; lvpm
+talks to it over VI Server.
+
+In a venv, the packages' palette files are kept apart and merged into one
+addon after every install and uninstall
+([How a venv works](venvs.md#palettes)).
+
+## Linkfix
+
+**Linkfix runs by default after copying, before the PostInstall hooks.** It
+makes the LabVIEW files the install wrote ready for their location: it
+repairs their dependency links and separates their compiled code, without
+opening LabVIEW. Source logic and the saved LabVIEW version are kept; package
+archives and unrelated files are not changed. The output names what it
+edited and what it skipped, rather than guessing at a layout it does not
+know.
+
+`--no-linkfix` skips it; `lvpm linkfix --dry-run --verbose` inspects an
+existing tree. It saves LabVIEW searches and save prompts, but does not
+replace a package's setup hooks and does not promise that a package works.
+[linkfix](linkfix.md) has what it changes, where it stops, its per-file
+reports and how it is validated.
+
 ## Relinking
 
-Freshly unpacked VIs still declare the paths their build machine wrote.
-`lvpm install` therefore ends with a relink pass: a small relink VI, shipped
-beside `lvpm.exe` as `relink-package.vi` and copied to lvpm's work folder (`%TEMP%` on Windows, the cache on Linux)
-when needed, is driven over every
-installed package folder through VI Server. It loads each VI, lets LabVIEW
-resolve the links, saves, and reports the files it actually rewrote. The VI
-is saved for LabVIEW 2020, so any LabVIEW from 2020 on can load it.
+Freshly unpacked VIs still declare the paths their build machine wrote:
+`<vilib>`-style tokens for the most part, plus a residue of absolute paths
+from the build machine.
+
+**The LabVIEW load-and-save pass is opt-in.** `--relink` runs it for every
+package instead of linkfix; a package marked `relink = true`, below, gets it
+after linkfix without the flag. In measurements across 10 packages saved
+between LabVIEW 8.6 and 2020, unrelinked VIs load and run from a venv
+untouched: LabVIEW resolves what the linker tables miss by searching vi.lib,
+and an LVAddons overlay *is* vi.lib. LabVIEW can also record dependencies
+that the packaged file did not list. None of that means every package works
+without preparation, or that linkfix reproduces every LabVIEW save.
+`tools/linkfix/audit.py` inspects packaged paths;
+`tools/linkfix/deptree.py check` checks that declared dependencies resolve.
+
+A package whose VIs only LabVIEW can repair can be marked `relink = true` in
+the manifest; it is then relinked after linkfix
+([manifest](https://github.com/ThatsTheEnd/lvpm/blob/main/docs/manifest.md#relinking-a-package-in-labview)).
+
+With `--relink`, a small relink VI, shipped beside `lvpm.exe` as
+`relink-package.vi` and copied to lvpm's work folder (`%TEMP%` on Windows, the
+cache on Linux) when needed, is driven over every installed package folder through
+VI Server. It loads each VI, lets LabVIEW resolve the links, saves, and
+reports the files it actually rewrote. The VI is saved for LabVIEW 2020, so
+any LabVIEW from 2020 on can load it.
 
 - One pass over the whole plan, so no package is relinked before a later
   package's files are on disk.
@@ -31,7 +75,7 @@ A hook runs only for a package you allowed.
 | A LabVIEW installation, from a project (`sync`, `add`) | The package's line in the project's `lvpm.toml` has `hooks = "run"` ([manifest](https://github.com/ThatsTheEnd/lvpm/blob/main/docs/manifest.md#allowing-install-hooks)) |
 | A LabVIEW installation, outside a project (`lvpm install <name>`) | The name is in the user config `hooks.run` (`lvpm config set hooks.run <name>...`; [configuration](usage.md#configuration)) |
 | Either of those, for one command | The command has `--hooks`, which allows every package |
-| A venv | Never. A venv runs no hook, and nothing allows one |
+| A venv | Never during an install or uninstall, and nothing allows one. `lvpm run-hooks <pkg>` runs a kept PostInstall by hand, in the LabVIEW installation the venv is bound to |
 | A LabVIEW that runs headless (`LV_RTE_HEADLESS`) | Only with `--hooks`. `hooks = "run"` and `hooks.run` do not apply there |
 | A scratch `--prefix` tree | Never. No warning; a plain note says the scratch tree has no LabVIEW to run them |
 
@@ -101,9 +145,23 @@ dialogs over the install.
 | Hook               | Moment                                                                                                            |
 | ------------------ | ----------------------------------------------------------------------------------------------------------------- |
 | `PreInstall.vi`    | before the package's files are copied                                                                             |
-| `PostInstall.vi`   | after the relink pass                                                                                             |
+| `PostInstall.vi`   | after linkfix, or after the relink pass when one runs                                                             |
 | `PreUninstall.vi`  | before the package's files are removed                                                                            |
 | `PostUninstall.vi` | after removal (uninstall hooks are extracted at install time; the archive is long gone when uninstall needs them) |
+
+Measured on the 22 hooks of a 50-package project: six are harmful from a
+venv, and the rest open documentation pages, recompile examples or leave
+markers. The one that was needed is NI's Advanced HTTP Client's. It repairs
+the Call Library path that VI Package Builder broke when it built the
+package, a known VIPM issue: [VI Package Builder removes cross platform
+wildcards from Call Library Function nodes during the build process](https://support.vipm.io/hc/en-us/articles/360053941572-VI-Package-Builder-removes-cross-platform-wildcards-from-Call-Library-Function-nodes-during-the-build-process).
+Linkfix's `clfn-wildcard` method now makes that repair itself
+([linkfix](linkfix.md#call-library-wildcards)). Dataflow G's G-Image works
+around the same issue differently: its hook unzips clean copies of its VIs
+over the installed ones. Linkfix covers that one too.
+
+[Package notes](package-notes.md) has what we found about commonly used
+packages in a venv: whose hooks are needed, and which don't work there yet.
 
 Hook failures are reported, never fatal: the files are installed either way,
 and an uninstall is never left half-done. `lvpm run-hooks <name>` reruns a
@@ -118,8 +176,9 @@ The transport underneath relink and hooks is a typed VI Server TCP client
 formats (scalars, strings, paths, n-dimensional arrays, and variants with
 named attributes) and is documented in
 [docs/vi-server-protocol.md](vi-server-protocol.md). lvpm reads the
-target's port from its `LabVIEW.ini` (LabVIEW 2025 defaults to 3363, 2026 to 3364) and starts the IDE when nothing answers there. Only relinking and hooks
-need LabVIEW; everything else runs without any LabVIEW process.
+target's port from its `LabVIEW.ini` (LabVIEW 2025 defaults to 3363, 2026 to 3364) and starts the IDE when nothing answers there. Only relinking, hooks
+and a venv's resave need LabVIEW; everything else runs without any LabVIEW
+process.
 
 For diagnosis the primitives are exposed directly:
 

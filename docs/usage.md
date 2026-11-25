@@ -700,35 +700,11 @@ $ lvpm launch MyProject.lvproj    # a LabVIEW that sees the venv
 - When the LabVIEW installation has its own copy of a venv package (from
   VIPM, `lvpm install --global` or by hand), LabVIEW loads that copy instead.
   lvpm warns about it after an install into the venv, at `lvpm launch` and in
-  `lvpm venv status`, with the fix for each package. Only LabVIEW files count.
+  `lvpm venv status`, with the fix for each package. Only LabVIEW files count
+  ([Keeping the LabVIEW installation clean](venvs.md#keeping-the-labview-installation-clean)).
 
-How it works: the venv directory is an [LVAddons](https://labviewwiki.org/wiki/LVAddons)
-location (its `packages/` folder), one addon per package, each mirroring the
-LabVIEW install dir under `packages/<pkg>/1/`. The binding (`venv.json`), the
-install records (`installed/`) and the venv LabVIEW's own state
-(`labview.ini`, `objcache/`, `data/`, `temp/`) sit beside it. A venv made by
-an older lvpm, with these under `.lvpm/`, is refused: close its LabVIEW, run
-`lvpm venv remove` and `lvpm venv create`, then `lvpm install`. A LabVIEW started with `LVAddons.AdditionalLocations`
-pointing there overlays them onto its own tree, so a package in the venv
-resolves as `<vilib>/...` exactly as a globally installed one would. The VIs
-you write against it link portably, and `C:\Program Files` never changes.
-Needs LabVIEW 2024 Q1 or later.
-
-Palette menus are the exception to one addon per package. LabVIEW shows
-only one addon's copy of a folder, and packages share palette folders: the
-`menus/` tree, and Addons palette categories such as `vi.lib/addons/HSE`. So
-after each install or uninstall lvpm moves every package's `menus/` files and
-the `.mnu` files under its `vi.lib/addons/` to `palettes/contributions/<pkg>/`
-(the VIs beside them stay put) and publishes one merged addon,
-`packages/venv-palettes/`. When packages ship different `dir.mnu` files at one
-path, the first package by name supplies it, and lvpm says how many differ
-(`--json` names them). Two packages that ship any other menu file with
-different contents refuse the merge and leave the published addon as it was.
-An addon that already matches is not rewritten, so a running venv LabVIEW is
-left alone; after a change lvpm says to restart it, since LabVIEW reads its
-palettes at startup. The package name `venv-palettes` is reserved.
-`lvpm launch` refuses a venv whose merged addon no longer matches its
-packages; `lvpm sync` rebuilds it.
+How a venv works, its layout, its palettes, and why the LabVIEW installation
+should hold as few packages as possible: [How a venv works](venvs.md).
 
 #### Window titles, icon and taskbar
 
@@ -758,16 +734,6 @@ windows get the app id `lvpm.venv.<hash of the project path>`, so the venv's
 LabVIEW has its own taskbar button. *Pin to taskbar* on it pins
 `lvpm --project <repo> launch`, with the venv's icon and name. A LabVIEW on
 the venv started another way than `lvpm launch` gets none of this.
-
-Two things follow from LabVIEW reading an addon's contents at launch:
-
-- After `lvpm install`, a LabVIEW already open on the venv cannot see the new
-  files. Restart it with `lvpm launch`. For the same reason the resave (and the
-  relink, with `--relink`) runs in a LabVIEW that lvpm starts fresh on the venv, and is refused while one
-  is already open there.
-- The real installation always wins over the overlay: a package installed
-  both globally and in the venv loads from the global copy, whatever its
-  version. Keep the target installation clean of what the venv provides.
 
 ### Linkfix
 
