@@ -486,7 +486,10 @@ fn moved_tags_text(moved: &[MovedTag], rerun: &str) -> String {
         ));
     }
     let accept: Vec<String> = (moved.iter())
-        .map(|tag| format!("--upgrade-package {}@{}", tag.name, tag.version))
+        .map(|tag| {
+            let pin = format!("{}@{}", tag.name, tag.version);
+            format!("--upgrade-package {}", shell_word(&pin))
+        })
         .collect();
     text.push_str(&format!(
         "\nnext: if the tags moved on purpose, accept the new manifests with `lvpm lock {}` (or \
@@ -598,7 +601,7 @@ fn listing_failures_text(failures: &[ListingFailure]) -> String {
     lines.extend(per_package.map(|failure| match failure.fault {
         ListingFault::NotListed => format!(
             "{failure}; check the name, or publish it with lvpm publish --to {}",
-            failure.feed
+            shell_word(&failure.feed.to_string())
         ),
         _ => failure.to_string(),
     }));

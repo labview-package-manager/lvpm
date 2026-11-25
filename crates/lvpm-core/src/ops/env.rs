@@ -69,16 +69,26 @@ impl DestinationFlags {
 }
 
 /// `word` as one word of a command line a user is told to run. Letters, digits
-/// and `_.,@=:/\+-` stay bare; anything else goes in single quotes, which are
-/// literal in POSIX shells and PowerShell, with a `'` inside doubled. Nothing
-/// in the word ever expands, so a name a feed supplies cannot run a command.
-// shortcut: a doubled ' is PowerShell's escape; a POSIX shell reads it as two quoted parts and drops the apostrophe. Upgrade if a real package name has one.
+/// and `_.:/\+-@=` stay bare, unless the word starts with `-`, `@` or `=`;
+/// anything else goes in single quotes, which are literal in POSIX shells and
+/// PowerShell, with every quote character inside doubled. Nothing in the word
+/// ever expands, so a name a feed supplies cannot run a command.
+// shortcut: a doubled quote is PowerShell's escape; a POSIX shell reads it as two quoted parts and drops it. Upgrade if a real package name has one.
 pub fn shell_word(word: &str) -> String {
-    let bare = |c: char| c.is_ascii_alphanumeric() || r"_.,@=:/\+-".contains(c);
-    match word.is_empty() || !word.chars().all(bare) {
-        false => word.to_string(),
-        true => format!("'{}'", word.replace('\'', "''")),
+    let bare = |c: char| c.is_ascii_alphanumeric() || r"_.:/\+-@=".contains(c);
+    let leads = |c: char| !"-@=".contains(c);
+    if word.starts_with(leads) && word.chars().all(bare) {
+        return word.to_string();
     }
+    let mut quoted = String::from("'");
+    for c in word.chars() {
+        // PowerShell ends a single-quoted string at U+2018..U+201B as well as at '
+        if matches!(c, '\'' | '\u{2018}'..='\u{201B}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    quoted + "'"
 }
 
 /// What an operation runs in.
@@ -722,7 +732,20 @@ mod tests {
     fn a_word_a_shell_reads_is_quoted_literally_and_one_with_a_quote_is_double_quoted() {
         for (word, said) in [
             ("plain", "plain"),
-            (r"C:\dir/a-b_c.d,e+f", r"C:\dir/a-b_c.d,e+f"),
+            (r"C:\dir/a-b_c.d+f", r"C:\dir/a-b_c.d+f"),
+            ("gamma@1.0", "gamma@1.0"),
+            ("a,b", "'a,b'"),
+            ("-x", "'-x'"),
+            ("@x", "'@x'"),
+            ("=x", "'=x'"),
+            (
+                "a\u{2019};calc;\u{2019}",
+                "'a\u{2019}\u{2019};calc;\u{2019}\u{2019}'",
+            ),
+            (
+                "\u{2018}\u{201A}\u{201B}",
+                "'\u{2018}\u{2018}\u{201A}\u{201A}\u{201B}\u{201B}'",
+            ),
             ("gamma@*", "'gamma@*'"),
             ("a b", "'a b'"),
             ("a&b", "'a&b'"),

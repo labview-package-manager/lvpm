@@ -220,7 +220,8 @@ fn problems(
         if project.relink_for(&m.name) && !m.relinked {
             found.push(format!(
                 "{}: relink = true but the relink pass has not completed (run `lvpm relink {}`)",
-                m.name, m.name
+                m.name,
+                super::env::shell_word(&m.name)
             ));
         }
     }
