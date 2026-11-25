@@ -17,6 +17,7 @@ use super::sync::{
     Selection, SyncOptions, announce_migration, apply_sync, fetch_locked, plan_sync,
     refuse_unknown_groups,
 };
+use crate::dependency::roots_above;
 use crate::errors::{EditError, LockError, SyncError};
 use crate::events::{Event, ManifestEdit, Phase};
 use crate::index::Index;
@@ -46,6 +47,31 @@ pub fn add(
     source_pin: Option<&str>,
     options: &InstallOptions,
 ) -> Result<(), EditError> {
+    add_and_sync(env, spec, table, source_pin, options, None)
+}
+
+/// [`add`] for a command that says what it is doing: `announce` is said once
+/// the lock is made and not before, so a refusal (a package no source lists, a
+/// conflict) never says it.
+pub fn add_announcing(
+    env: &OpEnv,
+    spec: &str,
+    table: DependencyTable,
+    source_pin: Option<&str>,
+    options: &InstallOptions,
+    announce: Event,
+) -> Result<(), EditError> {
+    add_and_sync(env, spec, table, source_pin, options, Some(announce))
+}
+
+fn add_and_sync(
+    env: &OpEnv,
+    spec: &str,
+    table: DependencyTable,
+    source_pin: Option<&str>,
+    options: &InstallOptions,
+    announce: Option<Event>,
+) -> Result<(), EditError> {
     let request = Request::parse(spec, source_pin)?;
     let prepared = Prepared::of(env)?;
     project::refuse_old_form_edit(&prepared.found.1, &table, &request.name)?;
@@ -68,12 +94,12 @@ pub fn add(
             prepared.set(&table, &request.name, &floor, source_pin)?
         }
     };
-    commit(env, prepared, edit, &index, dest, options)
+    commit(env, prepared, edit, &index, dest, options, announce)
 }
 
 /// Take `name` out of `table` of `lvpm.toml`, lock, and sync the destination.
-/// A package that another locked package requires stays locked and installed,
-/// and is reported as such.
+/// A package that another locked package requires is refused, naming the
+/// packages to remove first, and nothing is changed.
 ///
 /// Both files are written only once the lock is made and every archive of the
 /// sync is in hand. With `options.dry_run` nothing is written, and the manifest
@@ -87,9 +113,9 @@ pub fn remove(
     take_out_and_sync(env, name, table, options, None)
 }
 
-/// [`remove`] for a command that says what it is doing first: `announce` is
-/// the first thing said, once `name` is known to be in `table` and not before,
-/// so a refusal never says it.
+/// [`remove`] for a command that says what it is doing: `announce` is said once
+/// the lock is made and nothing requires `name`, and not before, so a refusal
+/// (not a dependency, wrong table, required by another package) never says it.
 pub fn remove_announcing(
     env: &OpEnv,
     name: &str,
@@ -113,15 +139,18 @@ fn take_out_and_sync(
         refuse_unknown_groups(&prepared.found.1, std::slice::from_ref(group))?;
     }
     let edit = prepared.take_out(&table, name).map_err(|why| match why {
-        EditError::NotADependency { name, .. } => {
-            let installed = installed_in_the_target(env, &name);
-            EditError::NotADependency { name, installed }
-        }
+        // A package the manifest does not list but another one requires is
+        // locked and installed all the same: that is what stops it.
+        EditError::NotADependency { name, .. } => prepared
+            .previous
+            .as_ref()
+            .and_then(|lock| required(lock, &name))
+            .unwrap_or_else(|| {
+                let installed = installed_in_the_target(env, &name);
+                EditError::NotADependency { name, installed }
+            }),
         other => other,
     })?;
-    if let Some(event) = announce {
-        env.sink.emit(event);
-    }
     let dest = env.destination()?;
     announce_project(env, &prepared, &dest);
 
@@ -132,7 +161,18 @@ fn take_out_and_sync(
         prepared.previous.as_ref(),
         &Moving::Nothing,
     )?;
-    commit(env, prepared, edit, &index, dest, options)
+    commit(env, prepared, edit, &index, dest, options, announce)
+}
+
+/// `name` cannot go while `lock` holds packages that require it: they are
+/// named, and so are the ones the project lists that need it, to go first.
+fn required(lock: &Lockfile, name: &str) -> Option<EditError> {
+    let required_by = lock.dependents_of(name);
+    (!required_by.is_empty()).then(|| EditError::Required {
+        name: name.to_string(),
+        roots: roots_above(name, |package| lock.dependents_of(package)),
+        required_by,
+    })
 }
 
 /// `name` is installed in the target, as far as it can be told: a target that
@@ -388,7 +428,9 @@ fn announce_project(env: &OpEnv, prepared: &Prepared, dest: &Destination) {
 }
 
 /// Lock the edited manifest, plan and fetch the sync, and only then write the
-/// files and put the destination right.
+/// files and put the destination right. A removal that leaves a locked package
+/// requiring what it took out is refused once the lock is made, and `announce`
+/// is said after that.
 fn commit(
     env: &OpEnv,
     prepared: Prepared,
@@ -396,6 +438,7 @@ fn commit(
     index: &Index,
     dest: Destination,
     options: &InstallOptions,
+    announce: Option<Event>,
 ) -> Result<(), EditError> {
     let Prepared {
         found: (manifest_path, _),
@@ -413,6 +456,14 @@ fn commit(
     // Locking warns about the requirements no source lists.
     let (lock, changes, after) =
         locking::relock_with(env, &edit.project, index, previous.as_ref())?;
+    if let Some(ManifestEdit::Removed { name, .. }) = &edit.change
+        && let Some(refusal) = required(&lock, name)
+    {
+        return Err(refusal);
+    }
+    if let Some(event) = announce {
+        env.sink.emit(event);
+    }
     // The edited group is installed with the default selection. A package the
     // lock lists stays where it is: only what the lock drops goes.
     let selection = Selection {
@@ -426,7 +477,7 @@ fn commit(
     }
 
     if options.dry_run {
-        announce_edit(env, &edit, &lock, true);
+        announce_edit(env, &edit, true);
         if !changes.is_empty() {
             env.sink.emit(Event::LockWouldChange { changes });
         }
@@ -459,7 +510,7 @@ fn commit(
     env.cancel.begin_unpack()?;
     restoring_on_failure(&[&manifest_path, &lock_path], || {
         write_manifest_and_lock(manifest, &lock_path, &lock_text)?;
-        announce_edit(env, &edit, &lock, false);
+        announce_edit(env, &edit, false);
         announce_written(env, lock_path.clone(), &lock, changes, after);
         match plan.is_empty() {
             true => env.sink.emit(Event::SyncNothingToDo),
@@ -495,9 +546,8 @@ fn edit_error(failure: anyhow::Error) -> EditError {
     }
 }
 
-/// Say what the edit did to the manifest, and for a removal what keeps the
-/// package locked.
-fn announce_edit(env: &OpEnv, edit: &Edit, lock: &Lockfile, dry_run: bool) {
+/// Say what the edit did to the manifest.
+fn announce_edit(env: &OpEnv, edit: &Edit, dry_run: bool) {
     let Some(change) = &edit.change else {
         return;
     };
@@ -508,25 +558,6 @@ fn announce_edit(env: &OpEnv, edit: &Edit, lock: &Lockfile, dry_run: bool) {
         created_table: edit.created_table,
         dry_run,
     });
-    if let ManifestEdit::Removed { name, .. } = change {
-        let required_by: Vec<String> = lock
-            .packages
-            .iter()
-            .filter(|package| {
-                package
-                    .requires
-                    .iter()
-                    .any(|required| project::same_name(required, name))
-            })
-            .map(|package| package.name.clone())
-            .collect();
-        if !required_by.is_empty() {
-            env.sink.emit(Event::PackageStillRequired {
-                name: name.clone(),
-                required_by,
-            });
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1373,25 +1404,52 @@ alpha = \"1.0\"
     }
 
     #[test]
-    fn a_package_another_one_requires_stays_locked_installed_and_is_said_to_be_required() {
+    fn a_package_another_one_requires_is_refused_naming_it_and_changes_nothing() {
         let manifest = format!("{PROJECT}alpha = \">=1.0\"\n");
         let world = World::new("still", &manifest);
         run_add(&world, "alpha@>=1.0", &InstallOptions::default()).unwrap();
-        let sink = Recorder::default();
-        remove(
-            &world.env(&sink),
+        let (manifest, lock, installed) = (world.manifest(), world.lock(), world.installed());
+        for dry_run in [false, true] {
+            let why = remove(
+                &world.env(&Recorder::default()),
+                "alpha",
+                DependencyTable::Dependencies,
+                &InstallOptions {
+                    dry_run,
+                    ..InstallOptions::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&why, EditError::Required { name, required_by, roots }
+                    if name == "alpha" && required_by == &["beta"] && roots == &["beta"]),
+                "dry_run {dry_run}: {why:?}"
+            );
+            assert_eq!(world.manifest(), manifest);
+            assert_eq!(world.lock(), lock);
+            assert_eq!(world.installed(), installed);
+        }
+    }
+
+    #[test]
+    fn a_package_the_manifest_does_not_list_but_another_requires_is_required_not_a_non_dependency()
+    {
+        let world = World::new("unlisted-required", PROJECT);
+        run_add(&world, "gamma", &InstallOptions::default()).unwrap();
+        let lock = world.lock();
+        let why = remove(
+            &world.env(&Recorder::default()),
             "alpha",
             DependencyTable::Dependencies,
             &InstallOptions::default(),
         )
-        .unwrap();
-        assert_eq!(world.manifest(), PROJECT);
-        assert_eq!(world.locked(), ["alpha 2.0", "beta 1.0"]);
-        assert_eq!(world.installed(), ["alpha 2.0", "beta 1.0"]);
-        assert!(sink.events().contains(&Event::PackageStillRequired {
-            name: "alpha".into(),
-            required_by: vec!["beta".into()]
-        }));
+        .unwrap_err();
+        assert!(
+            matches!(&why, EditError::Required { name, roots, .. }
+                if name == "alpha" && roots == &["beta"]),
+            "{why:?}"
+        );
+        assert_eq!(world.lock(), lock);
     }
 
     #[test]
@@ -1402,11 +1460,18 @@ alpha = \"1.0\"
             ("delta", "1.0", "ni_lib_missing>=1.0"),
         );
         run_add(&world, "delta", &InstallOptions::default()).unwrap();
-        run_add(&world, "alpha@>=1.0", &InstallOptions::default()).unwrap();
+        add(
+            &world.env(&Recorder::default()),
+            "delta",
+            DependencyTable::DevDependencies,
+            None,
+            &InstallOptions::default(),
+        )
+        .unwrap();
         let (manifest, lock) = (world.manifest(), world.lock().unwrap());
 
-        // beta still needs alpha: the lock holds what it did, and the
-        // destination already has it all.
+        // [dependencies] still lists delta: the lock holds what it did, and
+        // the destination already has it all.
         let token = CancelToken::new();
         let sink = CancelOn::new(&token, |event| {
             matches!(event, Event::RequirementUnresolved { .. })
@@ -1415,8 +1480,8 @@ alpha = \"1.0\"
         env.cancel = token;
         let why = remove(
             &env,
-            "alpha",
-            DependencyTable::Dependencies,
+            "delta",
+            DependencyTable::DevDependencies,
             &InstallOptions::default(),
         )
         .unwrap_err();
@@ -1549,13 +1614,18 @@ alpha = \"1.0\"
     }
 
     #[test]
-    fn what_a_removal_announces_is_the_first_thing_it_says_and_only_once_the_name_is_listed() {
+    fn what_a_removal_announces_is_said_once_the_lock_is_made_and_only_if_it_goes_ahead() {
         let announced = Event::UninstallRemovesFromProject {
             package: "beta".into(),
             destination: None,
             dry_run: false,
         };
-        let world = World::new("announce", PROJECT);
+        let manifest = format!(
+            "{PROJECT}alpha = \">=1.0\"
+"
+        );
+        let world = World::new("announce", &manifest);
+        run_add(&world, "alpha@>=1.0", &InstallOptions::default()).unwrap();
         let refused = |table, name: &str| {
             let sink = Recorder::default();
             let why = remove_announcing(
@@ -1568,13 +1638,18 @@ alpha = \"1.0\"
             .unwrap_err();
             (why, sink.events())
         };
+        // Not a dependency, in another table, in no group, and required.
         for (table, name) in [
             (DependencyTable::Dependencies, "zeta"),
             (DependencyTable::DevDependencies, "beta"),
             (ci(), "beta"),
+            (DependencyTable::Dependencies, "alpha"),
         ] {
             let (why, events) = refused(table, name);
-            assert!(events.is_empty(), "{name}: {why:?} said {events:?}");
+            assert!(
+                !events.contains(&announced),
+                "{name}: {why:?} said {events:?}"
+            );
         }
         let sink = Recorder::default();
         remove_announcing(
@@ -1585,7 +1660,48 @@ alpha = \"1.0\"
             announced.clone(),
         )
         .unwrap();
-        assert_eq!(sink.events().first(), Some(&announced));
+        let events = sink.events();
+        let said = events.iter().position(|event| *event == announced);
+        let edited = events
+            .iter()
+            .position(|event| matches!(event, Event::ManifestEdited { .. }));
+        assert!(said < edited && said.is_some(), "{events:?}");
+        assert_eq!(
+            events.iter().filter(|event| **event == announced).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn what_an_add_announces_is_said_once_the_lock_is_made_and_not_for_a_package_no_source_lists() {
+        let announced = Event::InstallAddsToProject {
+            package: "gamma".into(),
+            destination: None,
+            dry_run: false,
+        };
+        let world = World::new("announce-add", PROJECT);
+        let add_announcing = |spec: &str, sink: &Recorder| {
+            add_announcing(
+                &world.env(sink),
+                spec,
+                DependencyTable::Dependencies,
+                None,
+                &InstallOptions::default(),
+                announced.clone(),
+            )
+        };
+        let sink = Recorder::default();
+        add_announcing("zeta", &sink).unwrap_err();
+        assert!(!sink.events().contains(&announced), "{:?}", sink.events());
+
+        let sink = Recorder::default();
+        add_announcing("gamma", &sink).unwrap();
+        let events = sink.events();
+        let said = events.iter().position(|event| *event == announced);
+        let edited = events
+            .iter()
+            .position(|event| matches!(event, Event::ManifestEdited { .. }));
+        assert!(said < edited && said.is_some(), "{events:?}");
     }
 
     #[test]

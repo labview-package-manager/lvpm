@@ -8,6 +8,7 @@ use super::env::{Destination, OpEnv};
 use super::hooks::{HOOK_TIMEOUT_SECS, HookCall, hook_action_info};
 use super::install::{Applied, InstallOptions, finish};
 use super::session::InstallSession;
+use crate::errors::EditError;
 use crate::events::{Event, HookKind, KeptBecause, UnrunReason};
 use crate::project::same_name;
 use crate::{dependency, install, project};
@@ -223,16 +224,22 @@ fn with_dependencies(
     }
     if !plan.dependents.is_empty() {
         // Removing what another installed package needs leaves that one
-        // broken: refused before anything is touched, unless --force.
-        ensure!(
-            force,
-            "{} is required by installed packages: {}\n\
-             hint: uninstall {} first, or pass --force to remove {} anyway",
-            plan.root,
-            plan.dependents.join(", "),
-            plan.dependents.join(", "),
-            plan.root
-        );
+        // broken: refused before anything is touched, unless --force. The
+        // front end words it, as it does for a project's.
+        if !force {
+            let dependents_of = |name: &str| {
+                (installed.iter())
+                    .filter(|p| p.dependencies.iter().any(|d| same_name(d, name)))
+                    .map(|p| p.name.clone())
+                    .collect()
+            };
+            return Err(EditError::Required {
+                roots: dependency::roots_above(&plan.root, dependents_of),
+                name: plan.root,
+                required_by: plan.dependents,
+            }
+            .into());
+        }
         env.sink.emit(Event::UninstallRequiredBy {
             package: plan.root.clone(),
             dependents: plan.dependents.clone(),
@@ -482,13 +489,13 @@ mod tests {
             Dependencies::Keep,
             false,
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        // Typed, so that the front end words it as a project's refusal is.
         assert!(
-            why.contains("required by installed packages: beta"),
-            "{why}"
+            matches!(why.downcast_ref::<EditError>(), Some(EditError::Required { name, required_by, roots })
+                if name == "alpha" && required_by == &["beta"] && roots == &["beta"]),
+            "{why:?}"
         );
-        assert!(why.contains("--force"), "{why}");
         assert!(file.exists(), "nothing was touched");
         uninstall(
             &env_for(&sink, &dir),

@@ -632,97 +632,82 @@ fn uninstall_in_a_project_takes_the_package_out_of_the_manifest_and_all_leaves_i
 }
 
 #[test]
-#[ignore = "#54 slice 3"]
-fn uninstall_keeps_packages_dependencies_and_the_manifest_in_step() {
+fn uninstall_refuses_a_package_another_one_requires_and_a_script_must_say_what_happens_to_dependencies()
+ {
     let lab = Lab::new("uninstall");
     lab.package("app", "1.0.0.1", "lib");
     lab.package("lib", "1.0.0.1", "core");
     lab.package("other", "1.0.0.1", "core");
     lab.package("core", "1.0.0.1", "");
-    lab.write_manifest("[dependencies]\n");
+    lab.write_manifest(
+        "[dependencies]
+",
+    );
     lab.ok(&["venv", "create"]);
     lab.ok(&["install", "app"]);
     lab.ok(&["install", "other"]);
+    let manifest = lab.manifest();
 
-    // What another package needs is refused, unless forced.
-    let refused = lab.fails(&["uninstall", "core", "--keep-deps"]);
-    has(&refused, "core is required by installed packages");
-    has(&refused, "--force");
-    // A script never gets a prompt: it has to say what happens to dependencies.
+    // In a project the lock decides: core is refused, and the next line names
+    // the packages the project lists that need it.
+    let refused = lab.fails(&["uninstall", "core"]);
     has(
-        &lab.fails(&["uninstall", "app"]),
+        &refused,
+        "core is required by installed packages: lib, other",
+    );
+    has(
+        &refused,
+        "next: run `lvpm uninstall app` and `lvpm uninstall other` first",
+    );
+    assert!(lab.record("core").is_file());
+    assert_eq!(lab.manifest(), manifest);
+
+    // A direct uninstall says it the same way, and can be forced.
+    let refused = lab.fails(&["uninstall", "core", "--no-project", "--keep-deps"]);
+    has(
+        &refused,
+        "core is required by installed packages: lib, other",
+    );
+    has(&refused, "or pass --force to remove core anyway");
+    // A direct uninstall of what the manifest does not declare may take
+    // dependencies with it, and a script never gets a prompt about that: it has
+    // to say what happens to them.
+    lab.write_manifest("[dependencies]\nother = \"*\"\n");
+    has(
+        &lab.fails(&["uninstall", "app", "--no-project"]),
         "--with-deps or --keep-deps",
     );
     assert!(lab.record("app").is_file());
-
-    // Unshared dependencies go with it, shared ones stay, and so does the manifest.
-    let removed = lab.ok(&["uninstall", "app", "--with-deps"]);
-    // `other` was installed by name, so the manifest declares it.
-    has(
-        &removed,
-        "keeping core: required by a package declared in lvpm.toml",
-    );
-    has(&removed, "removed app from lvpm.toml [dependencies]");
-    for (name, there) in [
-        ("app", false),
-        ("lib", false),
-        ("core", true),
-        ("other", true),
-    ] {
-        assert_eq!(lab.record(name).is_file(), there, "{name}");
-    }
-    assert!(!lab.file("app", "app.txt").exists());
-    assert!(!lab.venv().join("packages").join("app").exists());
-    lacks(&lab.manifest(), "app =");
-
-    // A dependency the manifest declares is the project's: kept.
-    lab.ok(&["install", "app"]);
-    std::fs::write(
-        lab.manifest_path(),
-        lab.manifest()
-            .replace("[dependencies]\n", "[dependencies]\nlib = \"*\"\n"),
-    )
-    .unwrap();
-    has(
-        &lab.ok(&["uninstall", "app", "--with-deps"]),
-        "keeping lib: declared in lvpm.toml",
-    );
-    assert!(lab.record("lib").is_file());
-
-    // fork: uninstall has no flag to leave the manifest alone; that call goes.
-    has(&lab.manifest(), "lib = \"*\"");
-
-    // --all empties the venv and never edits the manifest.
-    let before = lab.manifest();
-    lab.ok(&["uninstall", "--all"]);
-    assert_eq!(lab.manifest(), before);
-    has(
-        &lab.ok(&["list"]),
-        "lvpm has installed nothing into this target",
-    );
 }
 
-// Waits on a decision, not a slice: the fork puts lvpm.toml and lvpm.lock back when the
-// sync stops (add_remove.rs), so the manifest still lists what was uninstalled.
+// The fork puts lvpm.toml and lvpm.lock back when the sync stops partway
+// (add_remove.rs), where upstream keeps the manifest edit; `lvpm sync` then
+// puts the destination back in line with them.
 #[test]
-#[ignore = "#54: a stopped sync puts lvpm.toml back"]
-fn uninstall_takes_the_named_package_out_of_the_manifest_even_when_a_dependency_fails() {
+fn an_uninstall_whose_sync_stops_puts_lvpm_toml_and_lvpm_lock_back() {
     let lab = Lab::new("uninstall-fails");
     lab.package("app", "1.0.0.1", "lib");
     lab.package("lib", "1.0.0.1", "");
-    lab.write_manifest("[dependencies]\n");
+    lab.write_manifest(
+        "[dependencies]
+",
+    );
     lab.ok(&["venv", "create"]);
     lab.ok(&["install", "app"]);
+    let manifest = lab.manifest();
     // A folder where lib recorded a file: removing it fails on any OS.
     let blocked = lab.file("lib", "lib.txt");
     std::fs::remove_file(&blocked).unwrap();
     std::fs::create_dir_all(blocked.join("in-the-way")).unwrap();
 
     let failed = lab.fails(&["uninstall", "app", "--with-deps"]);
-    has(&failed, "lvpm.toml: removed app = \">=1.0.0.1\"");
     has(&failed, "lib.txt");
-    lacks(&lab.manifest(), "app =");
-    assert!(!lab.record("app").exists());
+    has(
+        &failed,
+        "lvpm.toml and lvpm.lock were put back as they were",
+    );
+    assert_eq!(lab.manifest(), manifest);
+    has(&lab.manifest(), "app =");
     assert!(
         lab.record("lib").is_file(),
         "the failed dependency stays recorded, to retry"

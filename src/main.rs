@@ -1088,12 +1088,13 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 (InstallMode::Sync, _) => cmd_sync(&env, &sync.options(apply, env.headless)),
                 // A named install in a project is an add, and always names one.
                 (InstallMode::Add, Some(spec)) => {
-                    env.sink.emit(Event::InstallAddsToProject {
+                    let announce = Event::InstallAddsToProject {
                         package: spec.to_string(),
                         destination: env.destination_flag().map(str::to_string),
                         dry_run: apply.dry_run,
-                    });
-                    cmd_add(&env, spec, DependencyTable::Dependencies, None, apply)
+                    };
+                    let table = DependencyTable::Dependencies;
+                    cmd_add(&env, spec, table, None, apply, Some(announce))
                 }
                 (InstallMode::Add | InstallMode::Additive, package) => {
                     ops::install::install(&env, package, &apply.options(*no_deps, *allow_downgrade))
@@ -1113,6 +1114,7 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
             dependency_table(*dev, group.as_deref())?,
             source_pin.as_deref(),
             apply,
+            None,
         )
         .map(|()| Report::done("add")),
         Cmd::Remove {
@@ -1432,23 +1434,34 @@ fn cmd_uninstall(
         _ if cli.yes => Dependencies::Remove,
         _ => Dependencies::Ask(&ask),
     };
-    ops::uninstall::uninstall(env, request.package, request.all, deps, request.force)
+    ops::uninstall::uninstall(env, request.package, request.all, deps, request.force).map_err(
+        |why| match why.downcast::<EditError>() {
+            Ok(required) => anyhow!(render::edit::direct_error(
+                &required,
+                env.destination_flags_as_typed().as_deref(),
+                request.no_project
+            )),
+            Err(other) => other,
+        },
+    )
 }
 
+/// `announce` is what the command says once the lock is made, if it says one.
 fn cmd_add(
     env: &OpEnv,
     package: &str,
     table: DependencyTable,
     source_pin: Option<&str>,
     apply: &ApplyArgs,
+    announce: Option<Event>,
 ) -> Result<()> {
-    ops::add_remove::add(
-        env,
-        package,
-        table,
-        source_pin,
-        &apply.options(false, false),
-    )
+    let options = apply.options(false, false);
+    match announce {
+        Some(event) => {
+            ops::add_remove::add_announcing(env, package, table, source_pin, &options, event)
+        }
+        None => ops::add_remove::add(env, package, table, source_pin, &options),
+    }
     .map_err(|why| edit_error(env, &why, "`lvpm add`"))
 }
 

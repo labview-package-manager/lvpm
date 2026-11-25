@@ -72,12 +72,11 @@ Feature: add and remove edit the manifest, then lock and sync
     When I run "lvpm remove gamma --prefix dest"
     Then "gamma" is gone from lvpm.toml, lvpm.lock and dest
 
-  Scenario: remove keeps a package another one still requires
+  Scenario: remove refuses a package another one requires
     Given the project also depends on "alpha" ">=1.0", locked and synced
     When I run "lvpm remove alpha --prefix dest"
-    Then "alpha" is gone from lvpm.toml
-    And "alpha" stays in lvpm.lock and dest
-    And the output says "alpha" is still required by "beta"
+    Then the command fails with: alpha is required by installed packages: beta
+    And nothing changed
 
   Scenario: remove --dev removes from [dev-dependencies]
     Given dev dependency "caraya" ">=1.0", locked and synced
@@ -134,7 +133,7 @@ Feature: add and remove edit the manifest, then lock and sync
   Scenario: install with a name in a project is add, and says so
     Given a project with a venv
     When I run "lvpm install gamma", and "lvpm add gamma" in an identical world
-    Then the first output line says gamma is being added to lvpm.toml and the project synced to lvpm.lock
+    Then the output says gamma is being added to lvpm.toml and the project synced to lvpm.lock
     And both manifests, locks and destinations are identical
 
   Scenario Outline: --no-project keeps a named install additive

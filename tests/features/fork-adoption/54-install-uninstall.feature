@@ -47,6 +47,7 @@ Feature: install and uninstall are the project commands
   Scenario: an unknown package changes nothing
     When I run "lvpm install zeta --prefix dest"
     Then the command fails saying "zeta" is in no configured source
+    And the output does not say "adding"
     And nothing changed
 
   Scenario Outline: --no-project needs a package, and is not --project
@@ -197,3 +198,56 @@ Feature: install and uninstall are the project commands
   Scenario: a direct uninstall of a listed package says it is still listed
     When I run "lvpm uninstall alpha --no-project --prefix dest"
     Then the output says "alpha" is still in lvpm.toml and "lvpm uninstall alpha" removes it for good
+
+  # Slice 3: a package another one requires. Each refusal names the roots that
+  # require it, and the destination as typed, so the command it suggests acts
+  # on the same target.
+  Scenario: uninstall of a package another one requires, not listed itself
+    Given the project also depends on "app" "*", locked and synced
+    When I run "lvpm uninstall lib --prefix dest"
+    Then the command fails with: lib is required by installed packages: app
+    And the error's next line says to run "lvpm uninstall app" first
+    And the error's next line names "--prefix dest"
+    And the output does not say "removing"
+    And nothing changed
+
+  Scenario: uninstall of a listed package another one requires
+    Given the project also depends on "app" "*", locked and synced
+    And the project also depends on "lib" "*", locked and synced
+    When I run "lvpm uninstall lib --prefix dest"
+    Then the command fails with: lib is required by installed packages: app
+    And the error's next line says to run "lvpm uninstall app" first
+    And the output does not say "removing"
+    And nothing changed
+
+  Scenario: two packages require it
+    Given the project also depends on "app" "*", locked and synced
+    And the project also depends on "app2" "*", locked and synced
+    When I run "lvpm uninstall lib --prefix dest"
+    Then the command fails with: lib is required by installed packages: app, app2
+    And the error's next line says to run "lvpm uninstall app" and "lvpm uninstall app2" first
+    And nothing changed
+
+  Scenario: --dry-run refuses it the same way
+    Given the project also depends on "app" "*", locked and synced
+    And the project also depends on "lib" "*", locked and synced
+    When I run "lvpm uninstall lib --dry-run --prefix dest"
+    Then the command fails with: lib is required by installed packages: app
+    And the error's next line says to run "lvpm uninstall app" first
+    And nothing changed
+
+  Scenario: following the next line works
+    Given the project also depends on "app" "*", locked and synced
+    And the project also depends on "lib" "*", locked and synced
+    When I run "lvpm uninstall app --prefix dest"
+    And I run "lvpm uninstall lib --prefix dest"
+    Then "app" and "lib" are gone from lvpm.toml, lvpm.lock and dest
+
+  Scenario: the direct route says it the same way
+    Given the project also depends on "app" "*", locked and synced
+    When I run "lvpm uninstall lib --no-project --prefix dest"
+    Then the command fails with: lib is required by installed packages: app
+    And the error's next line says to run "lvpm uninstall app" first
+    And the error's next line names "--no-project --prefix dest"
+    And the error's next line names "--force"
+    And nothing changed

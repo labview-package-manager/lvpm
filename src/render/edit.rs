@@ -28,13 +28,6 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 );
             }
         }
-        Event::PackageStillRequired { name, required_by } => r.line(
-            Stream::Out,
-            &format!(
-                "{name} is still required by {}: it stays in lvpm.lock and installed",
-                required_by.join(", ")
-            ),
-        ),
         Event::InstallAddsToProject {
             package,
             destination,
@@ -50,7 +43,8 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
             };
             r.line(Stream::Out, &said);
             if let Some(flag) = destination {
-                let note = destination_note(flag, &format!("gets {package}"), "install");
+                let gets = if *dry_run { "would get" } else { "gets" };
+                let note = destination_note(flag, &format!("{gets} {package}"), "install");
                 r.line(Stream::Out, &note);
             }
         }
@@ -69,7 +63,8 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
             };
             r.line(Stream::Out, &said);
             if let Some(flag) = destination {
-                let note = destination_note(flag, &format!("loses {package}"), "uninstall");
+                let loses = if *dry_run { "would lose" } else { "loses" };
+                let note = destination_note(flag, &format!("{loses} {package}"), "uninstall");
                 r.line(Stream::Out, &note);
             }
         }
@@ -95,7 +90,8 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
 
 /// What a named `install` or `uninstall` tells a user who gave a destination
 /// flag: it only picks where the project syncs. `change` is what `lvpm.toml`
-/// undergoes ("gets x"); `verb` is the command, which `--no-project` makes direct.
+/// undergoes ("gets x", "would get x" on a dry run); `verb` is the command,
+/// which `--no-project` makes direct.
 fn destination_note(flag: &str, change: &str, verb: &str) -> String {
     format!(
         "note: in a project, {flag} picks where the project syncs; lvpm.toml {change}. \
@@ -227,9 +223,14 @@ pub fn error(error: &EditError, rerun: &str, destination: Option<&str>) -> Strin
         } => format!("{error}\nnext: check the name"),
         EditError::NotInGroup { name, group } => format!(
             "{error}\n\
-             next: name a package that [dependency-groups.{group}] lists, or add it with \
-             `lvpm add {name} --group {group}`"
+             next: name a package that [dependency-groups.{group}] lists, or add it with `{}`",
+            on_the_target(format!("lvpm add {name} --group {group}"), destination)
         ),
+        EditError::Required { roots, .. } => {
+            let uninstall =
+                |root: &String| on_the_target(format!("lvpm uninstall {root}"), destination);
+            required(error, roots.iter().map(uninstall).collect(), None)
+        }
         EditError::InOtherTable { name, found_in } => {
             // The verb the user ran; `lvpm remove` stays `remove` until it is an alias.
             let verb = if rerun.contains("uninstall") {
@@ -242,6 +243,38 @@ pub fn error(error: &EditError, rerun: &str, destination: Option<&str>) -> Strin
         }
         EditError::Other(cause) => format!("{cause:#}"),
     }
+}
+
+/// What a direct `uninstall` prints when other installed packages require its
+/// package: the same words as a project's, and the way past them. `no_project`
+/// is whether the user typed it, which the commands it suggests need then too.
+pub fn direct_error(error: &EditError, destination: Option<&str>, no_project: bool) -> String {
+    let EditError::Required { name, roots, .. } = error else {
+        return error.to_string();
+    };
+    let flag = if no_project { " --no-project" } else { "" };
+    let commands = (roots.iter())
+        .map(|root| on_the_target(format!("lvpm uninstall {root}{flag}"), destination))
+        .collect();
+    required(error, commands, Some(name))
+}
+
+/// A package other packages require cannot go: the error, then one `next:` line
+/// that names the `commands` that take every root out first. `force` is the
+/// package a direct uninstall may remove anyway.
+fn required(error: &EditError, commands: Vec<String>, force: Option<&str>) -> String {
+    let commands: Vec<String> = commands
+        .iter()
+        .map(|command| format!("`{command}`"))
+        .collect();
+    let list = match commands.split_last() {
+        Some((last, first)) if !first.is_empty() => format!("{} and {last}", first.join(", ")),
+        _ => commands.join(""),
+    };
+    let or_force = force.map_or_else(String::new, |name| {
+        format!(", or pass --force to remove {name} anyway")
+    });
+    format!("{error}\nnext: run {list} first{or_force}")
 }
 
 /// The way out of naming a table that does not hold the package: one `next:`
@@ -758,6 +791,7 @@ mod tests {
                 name: "g".into(),
                 found_in: vec![DependencyTable::Dependencies, group("ci")],
             },
+            required_by_others(&["app"]),
             EditError::Lock(LockError::NoLabview),
             EditError::Lock(LockError::NeedsNewerLabview {
                 name: "omega".into(),
@@ -802,16 +836,81 @@ mod tests {
         );
     }
 
+    fn required_by_others(roots: &[&str]) -> EditError {
+        EditError::Required {
+            name: "lib".into(),
+            required_by: vec!["mid".into(), "app2".into()],
+            roots: roots.iter().map(|root| root.to_string()).collect(),
+        }
+    }
+
     #[test]
-    fn a_package_that_stays_says_which_packages_require_it() {
-        let (mut renderer, out, _) = renderer();
-        renderer.render(&Event::PackageStillRequired {
-            name: "alpha".into(),
-            required_by: vec!["beta".into(), "caraya".into()],
-        });
+    fn a_package_others_require_says_who_and_one_next_line_names_every_root_to_remove_first() {
         assert_eq!(
-            out.text(),
-            "alpha is still required by beta, caraya: it stays in lvpm.lock and installed\n"
+            written(&required_by_others(&["app"])),
+            "lib is required by installed packages: mid, app2\n\
+             next: run `lvpm uninstall app` first"
+        );
+        assert_eq!(
+            written(&required_by_others(&["app", "app2"])),
+            "lib is required by installed packages: mid, app2\n\
+             next: run `lvpm uninstall app` and `lvpm uninstall app2` first"
+        );
+        assert_eq!(
+            written_on(&required_by_others(&["a", "b", "c"]), Some("--prefix dest")),
+            "lib is required by installed packages: mid, app2\n\
+             next: run `lvpm uninstall a --prefix dest`, `lvpm uninstall b --prefix dest` \
+             and `lvpm uninstall c --prefix dest` first"
+        );
+    }
+
+    #[test]
+    fn a_direct_uninstall_says_it_the_same_way_and_how_to_force_it() {
+        let error = required_by_others(&["app"]);
+        assert_eq!(
+            super::direct_error(&error, Some("--prefix dest"), true),
+            "lib is required by installed packages: mid, app2\n\
+             next: run `lvpm uninstall app --no-project --prefix dest` first, \
+             or pass --force to remove lib anyway"
+        );
+        assert_eq!(
+            super::direct_error(&error, None, false),
+            "lib is required by installed packages: mid, app2\n\
+             next: run `lvpm uninstall app` first, or pass --force to remove lib anyway"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_note_says_what_lvpm_toml_would_get_or_lose() {
+        let (mut renderer, out, _) = renderer();
+        renderer.render(&Event::InstallAddsToProject {
+            package: "gamma".into(),
+            destination: Some("--prefix".into()),
+            dry_run: true,
+        });
+        renderer.render(&Event::UninstallRemovesFromProject {
+            package: "gamma".into(),
+            destination: Some("--prefix".into()),
+            dry_run: true,
+        });
+        let text = out.text();
+        assert!(text.contains("lvpm.toml would get gamma."), "{text}");
+        assert!(text.contains("lvpm.toml would lose gamma."), "{text}");
+        assert!(!text.contains("gets") && !text.contains("loses"), "{text}");
+    }
+
+    #[test]
+    fn a_name_that_is_not_in_the_group_carries_the_destination_in_the_command_it_suggests() {
+        let text = written_on(
+            &EditError::NotInGroup {
+                name: "beta".into(),
+                group: "ci".into(),
+            },
+            Some("--prefix dest"),
+        );
+        assert!(
+            text.ends_with("or add it with `lvpm add beta --group ci --prefix dest`"),
+            "{text}"
         );
     }
 }

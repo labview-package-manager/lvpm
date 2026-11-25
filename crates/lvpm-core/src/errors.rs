@@ -428,6 +428,16 @@ pub enum EditError {
     /// it is installed in the target all the same.
     #[error("{name} is not a dependency of this project")]
     NotADependency { name: String, installed: bool },
+    /// `remove` names a package that locked packages require, so it cannot go:
+    /// `required_by` requires it directly, and `roots` are the packages the
+    /// project lists that need it, which are to go first. Nothing was changed.
+    /// A direct `uninstall` says the same when its installed records do.
+    #[error("{name} is required by installed packages: {}", .required_by.join(", "))]
+    Required {
+        name: String,
+        required_by: Vec<String>,
+        roots: Vec<String>,
+    },
     /// `remove` names a package that is not in the table asked for, `[dependency-groups.<group>]`.
     #[error("{name} is not in [dependency-groups.{group}]")]
     NotInGroup { name: String, group: String },

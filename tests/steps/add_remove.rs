@@ -703,6 +703,12 @@ async fn gone_from_the_manifest_the_lock_and_a_folder(
     );
 }
 
+#[then(regex = r#"^"([^"]+)" and "([^"]+)" are gone from lvpm\.toml, lvpm\.lock and dest$"#)]
+async fn both_are_gone_from_everywhere(world: &mut CliWorld, first: String, second: String) {
+    gone_from_everywhere(world, first).await;
+    gone_from_everywhere(world, second).await;
+}
+
 #[then(regex = r#"^"([^"]+)" is gone from lvpm\.lock and dest$"#)]
 async fn gone_from_the_lock_and_dest(world: &mut CliWorld, name: String) {
     world.assert_succeeded();
@@ -736,15 +742,6 @@ async fn gone_from_the_dev_table_the_lock_and_dest(world: &mut CliWorld, name: S
 async fn stays_in_the_lock_and_dest(world: &mut CliWorld, name: String) {
     assert!(world.is_locked(&name), "{name} is no longer locked");
     assert!(world.is_installed(&name), "{name} is no longer installed");
-}
-
-#[then(regex = r#"^the output says "([^"]+)" is still required by "([^"]+)"$"#)]
-async fn the_output_says_it_is_still_required(
-    world: &mut CliWorld,
-    name: String,
-    required_by: String,
-) {
-    world.assert_said(&format!("{name} is still required by {required_by}"));
 }
 
 #[then(
@@ -881,6 +878,41 @@ async fn the_next_line_names(world: &mut CliWorld, flag: String) {
     assert!(next[0].contains(&flag), "{flag:?} is not in: {}", next[0]);
 }
 
+/// `commands` is every command the line names, in order, as `"a" and "b"`; the
+/// plain text of the line is `next: run a ... and b ... first`, each command
+/// followed by whatever flags it carries.
+#[then(regex = r#"^the error's next line says to run ("[^"]+"(?: and "[^"]+")*) first$"#)]
+async fn the_next_line_says_to_run_first(world: &mut CliWorld, commands: String) {
+    world.assert_failed();
+    let printed = printed_plain(world);
+    let next: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.starts_with("next: "))
+        .collect();
+    assert_eq!(next.len(), 1, "one next line in:\n{printed}");
+    let wanted: Vec<&str> = commands
+        .split(" and ")
+        .map(|c| c.trim_matches('"'))
+        .collect();
+    let mut rest = next[0]
+        .strip_prefix("next: run ")
+        .unwrap_or_else(|| panic!("not a run line: {}", next[0]));
+    for (at, command) in wanted.iter().enumerate() {
+        rest = rest
+            .strip_prefix(command)
+            .unwrap_or_else(|| panic!("{command:?} is not next in: {}", next[0]));
+        let end = if at + 1 < wanted.len() {
+            " and "
+        } else {
+            " first"
+        };
+        let flags_end = rest
+            .find(end)
+            .unwrap_or_else(|| panic!("{end:?} does not follow {command:?} in: {}", next[0]));
+        rest = &rest[flags_end + end.len()..];
+    }
+}
+
 #[then("the error's next line says to check the name")]
 async fn the_next_line_says_to_check_the_name(world: &mut CliWorld) {
     world.assert_failed();
@@ -955,29 +987,35 @@ async fn says_it_is_still_listed(world: &mut CliWorld, name: String, command: St
 }
 
 #[then(
-    regex = r"^the first output line says (\w+) is being added to lvpm\.toml and the project synced to lvpm\.lock$"
+    regex = r"^the output says (\w+) is being added to lvpm\.toml and the project synced to lvpm\.lock$"
 )]
-async fn the_first_line_says_it_is_an_add(world: &mut CliWorld, name: String) {
-    let first = world.output().stdout.lines().next().unwrap_or_default();
-    for said in [
+async fn the_output_says_it_is_an_add(world: &mut CliWorld, name: String) {
+    let stdout = &world.output().stdout;
+    let said = [
         format!("adding {name} to lvpm.toml"),
         "syncing the project to lvpm.lock".to_string(),
-    ] {
-        assert!(first.contains(&said), "{said:?} is not in: {first:?}");
-    }
+    ];
+    assert!(
+        stdout
+            .lines()
+            .any(|line| said.iter().all(|part| line.contains(part))),
+        "{said:?} is not on one line of:\n{stdout}"
+    );
 }
 
-/// `install` says it is an add first; what follows is `add`'s own output.
+/// `install` says it is an add, once the lock is made; what else it prints is
+/// `add`'s own output.
 #[then("both manifests, locks and destinations are identical")]
 async fn both_worlds_are_identical(world: &mut CliWorld) {
     let twin = world.add_remove.twin.as_ref().expect("a second world");
     let (one, two) = (world.output(), &twin.output);
     assert_eq!(one.exit_code, two.exit_code, "{one:?}\n{two:?}");
-    let after_the_first_line: Vec<&str> = one.stdout.lines().skip(1).collect();
+    let not_its_own =
+        |line: &&str| !(line.starts_with("adding ") || line.starts_with("note: in a project,"));
     assert_eq!(
-        after_the_first_line,
+        one.stdout.lines().filter(not_its_own).collect::<Vec<_>>(),
         two.stdout.lines().collect::<Vec<_>>(),
-        "what they print after install's first line"
+        "what they print besides install's own lines"
     );
     assert_eq!(one.stderr, two.stderr);
     // Each world has a feed of its own, so its address is in both files.

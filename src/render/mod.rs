@@ -165,7 +165,6 @@ impl Renderer {
             | Event::LockNothingNewer { .. }
             | Event::LockWouldChange { .. } => lock::render(self, event),
             Event::ManifestEdited { .. }
-            | Event::PackageStillRequired { .. }
             | Event::InstallAddsToProject { .. }
             | Event::UninstallRemovesFromProject { .. }
             | Event::UninstalledStillListed { .. } => edit::render(self, event),

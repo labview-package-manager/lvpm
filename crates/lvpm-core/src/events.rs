@@ -472,17 +472,12 @@ pub enum Event {
         created_table: bool,
         dry_run: bool,
     },
-    /// A package `remove` took out of the manifest stays locked and installed:
-    /// these locked packages still require it.
-    PackageStillRequired {
-        name: String,
-        required_by: Vec<String>,
-    },
     /// `install` with a package name, inside a project and without
     /// `--no-project`, is an `add`. `package` is as it was typed;
     /// `destination` is the destination flag it was given, if any (`--prefix`),
-    /// which only picks where the project syncs. The first thing it says;
-    /// `dry_run`: nothing is written, so it is what would be added.
+    /// which only picks where the project syncs. Said once the lock is made, so
+    /// a package no source lists never gets it; `dry_run`: nothing is written,
+    /// so it is what would be added.
     InstallAddsToProject {
         package: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -493,9 +488,10 @@ pub enum Event {
     /// `uninstall` with a package name, inside a project and without
     /// `--no-project`, is a `remove`. `package` is as it was typed;
     /// `destination` is the destination flag that picked the target, if any,
-    /// which only says where the project syncs. The first thing it says, once
-    /// the package is known to be in the table `lvpm.toml` is edited in;
-    /// `dry_run`: nothing is written, so it is what would be removed.
+    /// which only says where the project syncs. Said once the package is known
+    /// to be in the table `lvpm.toml` is edited in, the lock is made and no
+    /// locked package requires it; `dry_run`: nothing is written, so it is what
+    /// would be removed.
     UninstallRemovesFromProject {
         package: String,
         #[serde(skip_serializing_if = "Option::is_none")]

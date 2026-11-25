@@ -321,7 +321,7 @@ Between Slice 2 and Slice 3, a project uninstall of a required package still kee
   - "removing X from lvpm.toml and syncing the project to lvpm.lock" is the first line, and is said only once X is known to be in the table being edited (`add_remove::remove_announcing`); a refusal (not a dependency, wrong table, not in the group, unknown group) says none of it. Under `--dry-run` both it and the install line say "would remove X from ... and sync" / "would add X to ... and sync" (`dry_run` on both events). The upgrader note under it is not reworded for a dry run.
   - `--keep-deps` and `--force` in a project: "{flag} cannot be used in a project, because lvpm.lock decides what stays", next line names `--no-project`.
   - A project-only flag on a direct uninstall (`OnlyInAProject`) says why the uninstall is direct: no package ("drop F, or name a package"), `--no-project` ("drop F, or drop --no-project"), or no lvpm.toml found (the "run this in a project" text).
-  - `NotADependency` for an installed name has the next line `lvpm uninstall x --no-project` plus the destination flags as typed, with values (`--prefix dest`, `--global`, `--labview-version 2026`); so do the `UninstalledStillListed` note and the other-table hints. They are listed in the order that decides the target: `--prefix`, `--labview-version` (not when a venv wins and `--global` is absent), `--global`. The `NotInGroup` hint (`lvpm add x --group g`) does not carry them yet.
+  - `NotADependency` for an installed name has the next line `lvpm uninstall x --no-project` plus the destination flags as typed, with values (`--prefix dest`, `--global`, `--labview-version 2026`); so do the `UninstalledStillListed` note and the other-table hints. They are listed in the order that decides the target: `--prefix`, `--labview-version` (not when a venv wins and `--global` is absent), `--global`. The `NotInGroup` hint (`lvpm add x --group g`) did not carry them until Step 3.1.
 - The other-table hints use the verb the user ran: `lvpm uninstall x --dev` for `uninstall`, and `lvpm remove` stays `lvpm remove` for `lvpm remove` until Slice 5.
 - `--no-relink` (hidden, a no-op on every command) is not refused on a direct uninstall. `--relink-timeout` is not either: it has a default, so a typed one cannot be told from none without carrying clap's `value_source` to `flag_given`; `--keep-open` and `--relink-progress` are refused. Both are marked with a `shortcut:` comment on `ApplyArgs::flag_given`.
 - Slice-1 characterization rows 34 and 147 need no migration: they run in a directory with no project. `tests/support/sandbox.rs` (`restore_labview_installation`) gets `--no-project`, since the work directory can hold a scenario's project.
@@ -391,6 +391,23 @@ Between Slice 2 and Slice 3, a project uninstall of a required package still kee
 **REFACTOR**: `announce_edit` loses its inline dependents filter.
 **Files**: `crates/lvpm-core/src/ops/add_remove.rs`, `crates/lvpm-core/src/ops/uninstall.rs`, `crates/lvpm-core/src/lockfile.rs`, `crates/lvpm-core/src/errors.rs`, `crates/lvpm-core/src/events.rs`, `src/render/edit.rs`, `src/render/mod.rs`, `tests/features/fork-adoption/54-install-uninstall.feature`, `tests/features/lvpm-lockfile/slice-13-lvpm-add-lvpm-remove-install-pkg-routing.feature`, `tests/steps/add_remove.rs`
 **Commit**: `feat(uninstall): refuse to remove a package another one requires (#54)`
+
+**Built differently in Step 3.1** (decided while building; the scenarios and tests are the record):
+
+- The scenarios name a destination (`--prefix dest`), as Slices 1 and 2 do, so the `next:` line carries it: "next: run `lvpm uninstall app --prefix dest` first". The step checks each named command is followed only by flags.
+- A root is a package nothing requires. The walk goes up from the direct dependents and passes over one that is itself required (listed and required: removing it is refused too); a cycle with no top names its direct dependents. The direct route walks the installed records the same way (`dependency::roots_above`).
+- The direct route's refusal is the typed `EditError::Required` inside the `anyhow` error; `main` renders it with `render::edit::direct_error`, so both routes share `render::edit::required`. Its `next:` is still one line: "next: run `lvpm uninstall app --no-project --prefix dest` first, or pass --force to remove lib anyway" (`--no-project` only when typed).
+- `EditError::Required` Display is the first line, so the message is the same on both routes. `PackageStillRequired` and its rendering are deleted; `announce_edit` lost its dependents filter and its `lock` parameter.
+- The announce events (`InstallAddsToProject`, `UninstallRemovesFromProject`) are said by core in `commit`, after the relock and the `Required` check, so a refusal says none of it. They are no longer the first output line: the resolve lines come before them. Slice-13's "the first output line says gamma is being added" (a `@labview` scenario) says "the output says" now, and `both manifests, locks and destinations are identical` drops install's own two lines (`adding ...`, `note: in a project, ...`) instead of the first line.
+- A name in no table that the previous lock holds with dependents is `Required` before the destination is looked up; a name in a table is checked on the new lock.
+- tests/venv.rs: `uninstall_keeps_packages_dependencies_and_the_manifest_in_step` was only its required-by half and is now `uninstall_refuses_a_package_another_one_requires_and_a_script_must_say_what_happens_to_dependencies` (runs). Its prompt check needed a manifest that does not declare `app`, since a declared package keeps its dependencies and nothing is left to ask about.
+
+**Also in this step** (carry-over from the Slice 2 review):
+
+- a. A named install says "adding X to lvpm.toml and syncing ..." only once the lock is made (`add_remove::add_announcing`, core emits it), so an unknown package says none of it; the unknown-package scenario adds `And the output does not say "adding"`.
+- b. Under `--dry-run` the destination note says "lvpm.toml would get X" / "would lose X" (unit test in `src/render/edit.rs`).
+- c. The `NotInGroup` hint carries the destination flags as typed, like the other hints (unit test).
+- d. tests/venv.rs `uninstall_takes_the_named_package_out_of_the_manifest_even_when_a_dependency_fails` asserted upstream's behaviour. It is now `an_uninstall_whose_sync_stops_puts_lvpm_toml_and_lvpm_lock_back`: lvpm.toml and lvpm.lock are as they were, the output says "lvpm.toml and lvpm.lock were put back as they were", and the dependency that failed stays recorded. No equivalent existed at the CLI level (core has `a_sync_that_fails_part_way_puts_the_manifest_and_the_lock_back`, which runs `add`).
 
 ### Slice 4: install saves into dev, a group or a source
 
@@ -703,8 +720,8 @@ See each step.
   - [x] Step 1.1: Route a named install by --no-project, not by destination flag
 - [x] Wave 2 / Slice 2: uninstall in a project edits the project
   - [x] Step 2.1: Route a named uninstall in a project to remove
-- [ ] Wave 3 / Slice 3: a package another one requires cannot be removed
-  - [ ] Step 3.1: Refuse the removal before anything is written
+- [x] Wave 3 / Slice 3: a package another one requires cannot be removed
+  - [x] Step 3.1: Refuse the removal before anything is written
 - [ ] Wave 4 / Slice 4: install saves into dev, a group or a source
   - [ ] Step 4.1: --dev, --group and --index on a named install
 - [ ] Wave 5 / Slice 5: add and remove are aliases

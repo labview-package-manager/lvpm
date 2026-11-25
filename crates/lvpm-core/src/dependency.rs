@@ -60,6 +60,30 @@ pub fn package_dependency_names(
     names
 }
 
+/// The packages that need `name`, walked up `dependents_of` to the top: those
+/// nothing requires, which are the ones to remove first. A package that is
+/// required and also listed is passed over for what requires it, since removing
+/// it would be refused too. A cycle with no top has its first dependents.
+pub fn roots_above(name: &str, dependents_of: impl Fn(&str) -> Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::from([key(name)]);
+    let mut queue = dependents_of(name);
+    let mut roots = Vec::new();
+    while let Some(package) = queue.pop() {
+        if !seen.insert(key(&package)) {
+            continue;
+        }
+        match dependents_of(&package) {
+            above if above.is_empty() => roots.push(package),
+            above => queue.extend(above),
+        }
+    }
+    if roots.is_empty() {
+        return dependents_of(name);
+    }
+    roots.sort_by_cached_key(|root| key(root));
+    roots
+}
+
 /// Plan a removal from the installed graph, without changing it.
 ///
 /// `project_roots` contains all project declarations, including groups not
@@ -215,6 +239,49 @@ mod tests {
             skipped_groups: vec![],
             archive_sha256: None,
         }
+    }
+
+    /// `edges` as (package, what it requires).
+    fn dependents_in<'a>(
+        edges: &'a [(&'a str, &'a [&'a str])],
+    ) -> impl Fn(&str) -> Vec<String> + 'a {
+        move |name| {
+            (edges.iter())
+                .filter(|(_, requires)| requires.iter().any(|r| key(r) == key(name)))
+                .map(|(package, _)| package.to_string())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn the_roots_above_a_package_are_the_top_of_what_requires_it() {
+        let edges: &[(&str, &[&str])] = &[
+            ("app", &["mid"]),
+            ("mid", &["lib"]),
+            ("Other", &["lib"]),
+            ("lib", &[]),
+        ];
+        assert_eq!(
+            roots_above("lib", dependents_in(edges)),
+            ["app", "Other"],
+            "a package that is required itself is passed over for its requirer"
+        );
+        assert_eq!(
+            roots_above("app", dependents_in(edges)),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_diamond_names_its_one_root_once_and_a_cycle_names_its_dependents() {
+        let diamond: &[(&str, &[&str])] = &[
+            ("app", &["left", "right"]),
+            ("left", &["lib"]),
+            ("right", &["lib"]),
+        ];
+        assert_eq!(roots_above("lib", dependents_in(diamond)), ["app"]);
+        let cycle: &[(&str, &[&str])] = &[("a", &["b"]), ("b", &["a"])];
+        assert_eq!(roots_above("a", dependents_in(cycle)), ["b"]);
     }
 
     #[test]
