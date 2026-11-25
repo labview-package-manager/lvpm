@@ -68,12 +68,29 @@ impl DestinationFlags {
     }
 }
 
-/// `word` as one word of a command line a user is told to run: in double quotes
-/// when it holds white space or a character a shell reads (`<>|&;()`).
+/// `word` as one word of a command line a user is told to run. Letters, digits
+/// and `_.,@=:/\+-` stay bare; anything else goes in single quotes, which are
+/// literal in POSIX shells and PowerShell. A word with a `'` goes in double
+/// quotes, with `"`, `$` and the backtick escaped.
+// shortcut: a word with ' is quoted for POSIX shells only, cmd.exe is out of scope; upgrade if Windows users hit it
 pub fn shell_word(word: &str) -> String {
-    match word.contains(|c: char| c.is_whitespace() || "<>|&;()".contains(c)) {
-        true => format!("\"{word}\""),
-        false => word.to_string(),
+    let bare = |c: char| c.is_ascii_alphanumeric() || r"_.,@=:/\+-".contains(c);
+    match (
+        word.is_empty() || !word.chars().all(bare),
+        word.contains('\''),
+    ) {
+        (false, _) => word.to_string(),
+        (true, false) => format!("'{word}'"),
+        (true, true) => {
+            let mut quoted = String::from("\"");
+            for c in word.chars() {
+                if "\"$`".contains(c) {
+                    quoted.push('\\');
+                }
+                quoted.push(c);
+            }
+            quoted + "\""
+        }
     }
 }
 
@@ -697,7 +714,7 @@ mod tests {
         env.flags.prefix = Some(PathBuf::from("my dest"));
         assert_eq!(
             env.destination_flags_as_typed().as_deref(),
-            Some("--prefix \"my dest\" --global")
+            Some("--prefix 'my dest' --global")
         );
         // --project picked the project, so a repeated command needs it too, but
         // it is not the flag that picked the target.
@@ -705,34 +722,45 @@ mod tests {
         assert_eq!(env.destination_flag(), Some("--prefix"));
         assert_eq!(
             env.destination_flags_as_typed().as_deref(),
-            Some("--prefix \"my dest\" --global --project \"my proj\"")
+            Some("--prefix 'my dest' --global --project 'my proj'")
         );
         // The target alone, for a command that cannot take --project.
         assert_eq!(
             env.target_flags_as_typed().as_deref(),
-            Some("--prefix \"my dest\" --global")
+            Some("--prefix 'my dest' --global")
         );
     }
 
     #[test]
-    fn a_value_a_shell_reads_is_quoted_in_every_flag_a_hint_repeats() {
-        for (value, said) in [
-            ("a&b", "\"a&b\""),
-            ("a;b", "\"a;b\""),
-            ("a b", "\"a b\""),
-            ("a(b)", "\"a(b)\""),
-            ("a>b", "\"a>b\""),
-            ("a|b", "\"a|b\""),
+    fn a_word_a_shell_reads_is_quoted_literally_and_one_with_a_quote_is_double_quoted() {
+        for (word, said) in [
             ("plain", "plain"),
+            (r"C:\dir/a-b_c.d,e+f", r"C:\dir/a-b_c.d,e+f"),
+            ("gamma@*", "'gamma@*'"),
+            ("a b", "'a b'"),
+            ("a&b", "'a&b'"),
+            ("a;b", "'a;b'"),
+            ("a(b)", "'a(b)'"),
+            ("a>b", "'a>b'"),
+            ("a|b", "'a|b'"),
+            ("a$b", "'a$b'"),
+            ("x\"y", "'x\"y'"),
+            ("", "''"),
+            ("O'Brien", "\"O'Brien\""),
+            (r#"it's "$HOME" `x`"#, r#""it's \"\$HOME\" \`x\`""#),
         ] {
-            assert_eq!(shell_word(value), said);
+            assert_eq!(shell_word(word), said, "{word:?}");
         }
+    }
+
+    #[test]
+    fn a_value_a_shell_reads_is_quoted_in_every_flag_a_hint_repeats() {
         let mut env = OpEnv::new(&NullSink, config(), Vec::new(), PathBuf::from("."));
         env.flags.prefix = Some(PathBuf::from("a&b"));
         env.flags.project = Some(PathBuf::from("p;q"));
         assert_eq!(
             env.destination_flags_as_typed().as_deref(),
-            Some("--prefix \"a&b\" --project \"p;q\"")
+            Some("--prefix 'a&b' --project 'p;q'")
         );
     }
 

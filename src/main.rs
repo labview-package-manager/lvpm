@@ -1437,6 +1437,11 @@ fn edit_error(
     table: &DependencyTable,
     index: Option<&str>,
 ) -> anyhow::Error {
+    let project = env
+        .flags
+        .project
+        .as_ref()
+        .map(|dir| dir.display().to_string());
     anyhow!(render::edit::error(
         why,
         &render::edit::Typed {
@@ -1446,6 +1451,7 @@ fn edit_error(
             index,
             destination: env.destination_flags_as_typed().as_deref(),
             target: env.target_flags_as_typed().as_deref(),
+            project: project.as_deref(),
         },
     ))
 }

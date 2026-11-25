@@ -107,18 +107,20 @@ fn flag_for(table: &DependencyTable) -> String {
     match table {
         DependencyTable::Dependencies => String::new(),
         DependencyTable::DevDependencies => "--dev".to_string(),
-        DependencyTable::Group(group) => format!("--group {group}"),
+        DependencyTable::Group(group) => format!("--group {}", shell_word(group)),
     }
 }
 
 /// The `lvpm <verb>` (`install` or `uninstall`) that puts `name` in `table` or
-/// takes it out, on the target the user picked.
+/// takes it out, on the target the user picked. Every word a shell may read is
+/// quoted here, once: callers pass the words as they are.
 fn command_for(
     verb: &str,
     name: &str,
     table: &DependencyTable,
     destination: Option<&str>,
 ) -> String {
+    let name = shell_word(name);
     let command = match flag_for(table).as_str() {
         "" => format!("lvpm {verb} {name}"),
         flag => format!("lvpm {verb} {name} {flag}"),
@@ -134,10 +136,21 @@ fn command_with_pin(
     index: Option<&str>,
     destination: Option<&str>,
 ) -> String {
-    let pin = index.map_or_else(String::new, |source| format!(" --index {source}"));
+    let pin = index.map_or_else(String::new, |source| {
+        format!(" --index {}", shell_word(source))
+    });
     on_the_target(
         format!("{}{pin}", command_for(verb, package, table, None)),
         destination,
+    )
+}
+
+/// `lvpm <verb> <package> --no-project` on `target`: the direct command that
+/// leaves the project alone.
+fn no_project_command(verb: &str, package: &str, target: Option<&str>) -> String {
+    on_the_target(
+        format!("lvpm {verb} {} --no-project", shell_word(package)),
+        target,
     )
 }
 
@@ -209,6 +222,8 @@ pub struct Typed<'a> {
     /// `destination` without `--project`: for a command with `--no-project`,
     /// which clap refuses beside it.
     pub target: Option<&'a str>,
+    /// The directory `--project` named, if it was given.
+    pub project: Option<&'a str>,
 }
 
 impl Typed<'_> {
@@ -216,10 +231,9 @@ impl Typed<'_> {
     /// without its `--index` when `keep_pin` is false.
     fn rerun(&self, keep_pin: bool) -> String {
         let index = self.index.filter(|_| keep_pin);
-        let package = shell_word(self.package);
         format!(
             "`{}`",
-            command_with_pin(self.verb, &package, self.table, index, self.destination)
+            command_with_pin(self.verb, self.package, self.table, index, self.destination)
         )
     }
 
@@ -233,14 +247,17 @@ impl Typed<'_> {
     /// The command that does the same to the package without the project, on
     /// the same target: it keeps no table, pin or `--project`.
     fn without_the_project(&self) -> String {
-        on_the_target(
-            format!(
-                "lvpm {} {} --no-project",
-                self.verb,
-                shell_word(self.package)
-            ),
-            self.target,
-        )
+        no_project_command(self.verb, self.package, self.target)
+    }
+
+    /// `in <dir>, ` when `--project` alone picked the target: the command
+    /// without it would act on the project the shell is in, so it says where to
+    /// run it. Empty when another flag picked the target.
+    fn in_the_project(&self) -> String {
+        match (self.target, self.project) {
+            (None, Some(dir)) => format!("in {}, ", shell_word(dir)),
+            _ => String::new(),
+        }
     }
 }
 
@@ -259,12 +276,15 @@ pub fn error(error: &EditError, typed: &Typed) -> String {
         EditError::Lock(LockError::NeedsNewerLabview {
             name, project_year, ..
         }) => {
-            let package = format!("{name}@<version>");
+            let package = format!("{name}@VERSION");
             // The package that needs the newer LabVIEW may be a dependency of
             // the one typed: its table and pin are not that one's.
             let command = match typed.is_the_package(name) {
                 true => command_with_pin("install", &package, table, index, destination),
-                false => on_the_target(format!("lvpm install {package}"), destination),
+                false => on_the_target(
+                    format!("lvpm install {}", shell_word(&package)),
+                    destination,
+                ),
             };
             format!(
                 "{error}\n\
@@ -299,7 +319,7 @@ pub fn error(error: &EditError, typed: &Typed) -> String {
                  quote it, e.g. \"{name}@>=0.5\": an unquoted > sends the output to a file\n\
                  the shell may have created a file named \"=0.5\" here; it can be deleted\n\
                  next: run `{}` with the constraint you mean, or `{}` for the newest version",
-                with(&format!("\"{name}@>=0.5\"")),
+                with(&format!("{name}@>=0.5")),
                 with(name)
             )
         }
@@ -308,13 +328,15 @@ pub fn error(error: &EditError, typed: &Typed) -> String {
             installed: true,
         } => format!(
             "{error}\n\
-             next: `{}` uninstalls it from the target without changing the project",
-            on_the_target(format!("lvpm uninstall {name} --no-project"), target)
+             next: {}`{}` uninstalls it from the target without changing the project",
+            typed.in_the_project(),
+            no_project_command("uninstall", name, target)
         ),
         // Temporary until #55 asks before a sync removes.
         EditError::ForeignInInstallation { .. } => format!(
             "{error}\n\
-             next: run `{}` to {} it without syncing the project",
+             next: {}run `{}` to {} it without syncing the project",
+            typed.in_the_project(),
             typed.without_the_project(),
             typed.verb
         ),
@@ -324,7 +346,12 @@ pub fn error(error: &EditError, typed: &Typed) -> String {
         EditError::NotInGroup { name, group } => format!(
             "{error}\n\
              next: name a package that [dependency-groups.{group}] lists, or add it with `{}`",
-            on_the_target(format!("lvpm install {name} --group {group}"), destination)
+            command_for(
+                "install",
+                name,
+                &DependencyTable::Group(group.clone()),
+                destination
+            )
         ),
         EditError::Required { roots, .. } => {
             // One command for each table that lists a root: `uninstall` takes
@@ -361,7 +388,12 @@ pub fn direct_error(error: &EditError, destination: Option<&str>, no_project: bo
     };
     let flag = if no_project { " --no-project" } else { "" };
     let commands = (roots.iter())
-        .map(|(root, _)| on_the_target(format!("lvpm uninstall {root}{flag}"), destination))
+        .map(|(root, _)| {
+            on_the_target(
+                format!("lvpm uninstall {}{flag}", shell_word(root)),
+                destination,
+            )
+        })
         .collect();
     required(error, commands, Some(name))
 }
@@ -799,6 +831,7 @@ mod tests {
             index,
             destination,
             target: destination,
+            project: None,
         };
         super::error(error, &typed)
     }
@@ -838,7 +871,7 @@ mod tests {
         };
         assert_eq!(
             next(&DependencyTable::Dependencies, None, None),
-            "next: pick a version that runs on LabVIEW 2024 with `lvpm install omega@<version>`, \
+            "next: pick a version that runs on LabVIEW 2024 with `lvpm install omega@VERSION`, \
              or raise labview in lvpm.toml"
         );
         assert_eq!(
@@ -848,13 +881,13 @@ mod tests {
                 Some("--prefix dest")
             ),
             "next: pick a version that runs on LabVIEW 2024 with \
-             `lvpm install omega@<version> --dev --index second --prefix dest`, \
+             `lvpm install omega@VERSION --dev --index second --prefix dest`, \
              or raise labview in lvpm.toml"
         );
         assert_eq!(
             next(&group("ci"), None, Some("--global")),
             "next: pick a version that runs on LabVIEW 2024 with \
-             `lvpm install omega@<version> --group ci --global`, or raise labview in lvpm.toml"
+             `lvpm install omega@VERSION --group ci --global`, or raise labview in lvpm.toml"
         );
     }
 
@@ -888,7 +921,7 @@ mod tests {
         );
         assert_eq!(
             said.lines().last().unwrap(),
-            "next: run `lvpm install \"gamma@>=0.5\" --dev --index second --prefix dest` with the \
+            "next: run `lvpm install 'gamma@>=0.5' --dev --index second --prefix dest` with the \
              constraint you mean, or `lvpm install gamma --dev --index second --prefix dest` \
              for the newest version"
         );
@@ -1040,6 +1073,7 @@ mod tests {
                 index: Some("second"),
                 destination: Some("--prefix dest"),
                 target: Some("--prefix dest"),
+                project: None,
             };
             super::error(error, &typed)
                 .lines()
@@ -1051,10 +1085,10 @@ mod tests {
         assert_eq!(
             rerun(&pinned),
             "next: pin alpha to a source that lists it, or list it in that source, \
-             then run `lvpm install \"alpha@>=1.0\" --group ci --prefix dest` again"
+             then run `lvpm install 'alpha@>=1.0' --group ci --prefix dest` again"
         );
         // Anything else repeats it with its pin.
-        let expected = "`lvpm install \"alpha@>=1.0\" --group ci --index second --prefix dest`";
+        let expected = "`lvpm install 'alpha@>=1.0' --group ci --index second --prefix dest`";
         for error in [
             EditError::Cancelled,
             EditError::Lock(LockError::NoLabview),
@@ -1214,6 +1248,7 @@ mod tests {
             index: None,
             destination: Some("--prefix dest --project P"),
             target: Some("--prefix dest"),
+            project: None,
         };
         super::error(error, &typed)
     }
@@ -1254,6 +1289,7 @@ mod tests {
                 index: Some("second"),
                 destination: Some("--prefix dest"),
                 target: Some("--prefix dest"),
+                project: None,
             };
             super::error(error, &typed)
                 .lines()
@@ -1264,12 +1300,12 @@ mod tests {
         // Typed with a constraint and in another case, it is still the package.
         assert!(
             typed("Omega@>=1.0", &error("omega"))
-                .contains("`lvpm install omega@<version> --dev --index second --prefix dest`")
+                .contains("`lvpm install omega@VERSION --dev --index second --prefix dest`")
         );
         // A dependency of what was typed is not saved where that was.
         let said = typed("omega", &error("lib"));
         assert!(
-            said.contains("`lvpm install lib@<version> --prefix dest`"),
+            said.contains("`lvpm install lib@VERSION --prefix dest`"),
             "{said}"
         );
         assert!(
@@ -1281,7 +1317,7 @@ mod tests {
     #[test]
     fn a_package_a_shell_reads_is_quoted_by_the_rule_the_destination_flags_use() {
         // The flags' own quoting is tested beside `shell_word`, in `OpEnv`.
-        for (package, quoted) in [("a&b", "\"a&b\""), ("a;b", "\"a;b\""), ("gamma", "gamma")] {
+        for (package, quoted) in [("a&b", "'a&b'"), ("a;b", "'a;b'"), ("gamma", "gamma")] {
             let said = written_as(
                 &EditError::Cancelled,
                 "install",
@@ -1304,12 +1340,12 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_that_would_uninstall_what_the_lock_does_not_list_names_it_and_the_way_around() {
+    fn a_sync_that_would_uninstall_what_you_did_not_name_says_so_and_the_way_around() {
         assert_eq!(
             written_in_project(&foreign(), "install", "gamma@>=1.0"),
-            "LabVIEW holds packages that lvpm.lock does not list, and the sync would uninstall \
-             them: delta 1.0, eps 2.1\n\
-             next: run `lvpm install \"gamma@>=1.0\" --no-project --prefix dest` to install it \
+            "the sync would uninstall packages from LabVIEW that you did not name: \
+             delta 1.0, eps 2.1\n\
+             next: run `lvpm install 'gamma@>=1.0' --no-project --prefix dest` to install it \
              without syncing the project"
         );
         assert!(
@@ -1318,5 +1354,152 @@ mod tests {
                  without syncing the project"
             )
         );
+    }
+
+    /// What `lvpm uninstall gamma --project <dir>` printed: no other flag picked
+    /// the target.
+    fn written_with_project_only(error: &EditError, dir: &str) -> String {
+        let typed = Typed {
+            verb: "uninstall",
+            package: "gamma",
+            table: &DependencyTable::Dependencies,
+            index: None,
+            destination: Some("--project 'my proj'"),
+            target: None,
+            project: Some(dir),
+        };
+        super::error(error, &typed)
+    }
+
+    #[test]
+    fn a_hint_that_drops_the_project_says_which_directory_when_project_alone_picked_the_target() {
+        let not_a_dependency = EditError::NotADependency {
+            name: "gamma".into(),
+            installed: true,
+        };
+        assert_eq!(
+            written_with_project_only(&not_a_dependency, "my proj"),
+            "gamma is not a dependency of this project\n\
+             next: in 'my proj', `lvpm uninstall gamma --no-project` uninstalls it from the \
+             target without changing the project"
+        );
+        assert_eq!(
+            written_with_project_only(&foreign(), "p")
+                .lines()
+                .last()
+                .unwrap(),
+            "next: in p, run `lvpm uninstall gamma --no-project` to uninstall it without \
+             syncing the project"
+        );
+        // Another destination flag is the target: nothing silently changes.
+        let typed = Typed {
+            verb: "uninstall",
+            package: "gamma",
+            table: &DependencyTable::Dependencies,
+            index: None,
+            destination: Some("--prefix dest --project p"),
+            target: Some("--prefix dest"),
+            project: Some("p"),
+        };
+        assert!(
+            super::error(&not_a_dependency, &typed)
+                .contains("next: `lvpm uninstall gamma --no-project --prefix dest` uninstalls")
+        );
+    }
+
+    #[test]
+    fn every_command_a_hint_names_quotes_each_word_a_shell_reads_once() {
+        let table = group("g h");
+        let typed = |package, index| Typed {
+            verb: "install",
+            package,
+            table: &table,
+            index,
+            destination: Some("--prefix 'a b'"),
+            target: Some("--prefix 'a b'"),
+            project: None,
+        };
+        let last = |error: &EditError, package, index| {
+            super::error(error, &typed(package, index))
+                .lines()
+                .last()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            last(&EditError::Cancelled, "gamma@*", Some("my src")),
+            "next: run `lvpm install 'gamma@*' --group 'g h' --index 'my src' --prefix 'a b'` again"
+        );
+        assert_eq!(
+            last(
+                &EditError::NotInGroup {
+                    name: "a b".into(),
+                    group: "g h".into()
+                },
+                "x",
+                None
+            ),
+            "next: name a package that [dependency-groups.g h] lists, or add it with \
+             `lvpm install 'a b' --group 'g h' --prefix 'a b'`"
+        );
+        assert_eq!(
+            last(
+                &EditError::NotADependency {
+                    name: "O'Brien".into(),
+                    installed: true
+                },
+                "x",
+                None
+            ),
+            "next: `lvpm uninstall \"O'Brien\" --no-project --prefix 'a b'` uninstalls it from \
+             the target without changing the project"
+        );
+        assert_eq!(
+            last(
+                &EditError::EmptyConstraint { name: "a b".into() },
+                "x",
+                None
+            ),
+            "next: run `lvpm install 'a b@>=0.5' --group 'g h' --prefix 'a b'` with the \
+             constraint you mean, or `lvpm install 'a b' --group 'g h' --prefix 'a b'` for the \
+             newest version"
+        );
+        let required = EditError::Required {
+            name: "lib".into(),
+            required_by: vec!["a b".into()],
+            roots: vec![("a b".into(), vec![group("g h")])],
+        };
+        assert_eq!(
+            last(&required, "x", None),
+            "next: run `lvpm uninstall 'a b' --group 'g h' --prefix 'a b'` first"
+        );
+        assert_eq!(
+            super::direct_error(&required, Some("--prefix 'a b'"), true),
+            "lib is required by installed packages: a b\n\
+             next: run `lvpm uninstall 'a b' --no-project --prefix 'a b'` first, \
+             or pass --force to remove lib anyway"
+        );
+        let (mut renderer, out, _) = renderer();
+        renderer.render(&Event::UninstalledStillListed {
+            name: "a b".into(),
+            dev: false,
+            group: Some("g h".into()),
+            destination: Some("--prefix 'a b'".into()),
+        });
+        assert!(
+            out.text()
+                .contains("`lvpm uninstall 'a b' --group 'g h' --prefix 'a b'` removes it"),
+            "{}",
+            out.text()
+        );
+        let newer = EditError::Lock(LockError::NeedsNewerLabview {
+            name: "a b".into(),
+            version: "1.0".into(),
+            needs_year: 2026,
+            project_year: 2024,
+        });
+        assert!(last(&newer, "a b", Some("my src")).contains(
+            "`lvpm install 'a b@VERSION' --group 'g h' --index 'my src' --prefix 'a b'`"
+        ));
     }
 }

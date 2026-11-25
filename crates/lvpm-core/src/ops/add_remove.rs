@@ -446,18 +446,25 @@ fn floor(
     Ok(resolved.map_or_else(|| "*".to_string(), |version| format!(">={version}")))
 }
 
-/// A sync into LabVIEW itself that would uninstall what neither the old lock nor
-/// the new one lists is refused: that is what other projects, or the user, put
-/// into the installation, and nobody asked for it to go.
-// shortcut: a flat refusal, until #55 asks before a sync removes; then ask here.
+/// With `--global` typed, a sync into LabVIEW itself that would uninstall
+/// anything but the package the edit takes away is refused: the rest is what
+/// other projects, or the user, put into the installation, or what they may
+/// still use (the dependencies the relock drops). A headless project that
+/// resolves to the installation without `--global` is not guarded: it chose it.
+// shortcut: temporary until #55 asks instead; it also refuses the dependencies the edit drops, since lvpm cannot tell who put them there.
 fn refuse_foreign_packages(
+    env: &OpEnv,
     dest: &Destination,
     plan: &SyncPlan,
-    previous: Option<&Lockfile>,
+    change: Option<&ManifestEdit>,
 ) -> Result<(), EditError> {
-    if !matches!(dest, Destination::Global(_)) {
+    if !env.flags.global || !matches!(dest, Destination::Global(_)) {
         return Ok(());
     }
+    let taken_away = match change {
+        Some(ManifestEdit::Removed { name, .. }) => Some(name),
+        _ => None,
+    };
     let packages: Vec<(String, String)> = (plan.steps.iter())
         .filter_map(|step| match step {
             SyncStep::Remove {
@@ -465,12 +472,7 @@ fn refuse_foreign_packages(
                 version,
                 reason: RemoveReason::NotInLock,
                 ..
-            } if !previous.is_some_and(|lock| {
-                lock.packages
-                    .iter()
-                    .any(|package| project::same_name(&package.name, name))
-            }) =>
-            {
+            } if !taken_away.is_some_and(|gone| project::same_name(gone, name)) => {
                 Some((name.clone(), version.clone()))
             }
             _ => None,
@@ -535,7 +537,7 @@ fn commit(
         ..Selection::default()
     };
     let plan = plan_sync(&lock, &install::list_installed(&dest.store())?, &selection);
-    refuse_foreign_packages(&dest, &plan, previous.as_ref())?;
+    refuse_foreign_packages(env, &dest, &plan, edit.change.as_ref())?;
     // After the refusals: an edit that goes nowhere writes no lock.
     if lock_missing {
         env.sink.emit(Event::SyncLockMissing {
@@ -2073,11 +2075,20 @@ alpha = \"1.0\"
                 add(&env, "gamma", table(), None, &options),
                 remove(&env, "beta", table(), &options),
             ];
-            for why in refused {
+            // The removal of beta drops alpha from the lock as well: that is
+            // refused too, for another project may use it.
+            let named = [
+                vec![("delta".to_string(), "1.0".to_string())],
+                vec![
+                    ("alpha".to_string(), "2.0".to_string()),
+                    ("delta".to_string(), "1.0".to_string()),
+                ],
+            ];
+            for (why, expected) in refused.into_iter().zip(named) {
                 let why = why.unwrap_err();
                 assert!(
                     matches!(&why, EditError::ForeignInInstallation { packages }
-                        if packages == &[("delta".to_string(), "1.0".to_string())]),
+                        if packages == &expected),
                     "dry run {dry_run}: {why:?}"
                 );
             }
@@ -2090,5 +2101,95 @@ alpha = \"1.0\"
             assert!(before == after, "dry run {dry_run}: something was written");
         }
         assert_eq!(held(), ["alpha", "beta", "delta"]);
+    }
+
+    /// A `--global` world: the project's destination is the fake installation.
+    fn global_env<'a>(
+        world: &World,
+        sink: &'a dyn EventSink,
+    ) -> (OpEnv<'a>, testing::FakeInstallation) {
+        let fake = testing::FakeInstallation::new(&world.root);
+        let mut env = world.env(sink);
+        env.flags.prefix = None;
+        env.flags.global = true;
+        fake.place(&mut env);
+        (env, fake)
+    }
+
+    fn held(fake: &testing::FakeInstallation) -> Vec<String> {
+        let mut held: Vec<String> = install::list_installed(&fake.roots())
+            .unwrap()
+            .iter()
+            .map(|package| package.name.clone())
+            .collect();
+        held.sort();
+        held
+    }
+
+    #[test]
+    fn a_global_removal_of_the_named_package_goes_ahead_with_no_lock_to_read() {
+        let world = World::new("global-no-lock", PROJECT);
+        let options = InstallOptions {
+            no_relink: true,
+            ..InstallOptions::default()
+        };
+        let sink = Recorder::default();
+        let (env, fake) = global_env(&world, &sink);
+        add(&env, "gamma", DependencyTable::Dependencies, None, &options).unwrap();
+        std::fs::remove_file(world.root.join(lockfile::FILE_NAME)).unwrap();
+        remove(&env, "gamma", DependencyTable::Dependencies, &options).unwrap();
+        assert_eq!(held(&fake), ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_global_removal_that_drops_a_dependency_from_the_lock_is_refused_naming_it() {
+        let world = World::new("global-drops-dep", PROJECT);
+        let options = InstallOptions {
+            no_relink: true,
+            ..InstallOptions::default()
+        };
+        let sink = Recorder::default();
+        let (env, fake) = global_env(&world, &sink);
+        add(&env, "gamma", DependencyTable::Dependencies, None, &options).unwrap();
+        let before = (
+            world.manifest(),
+            world.lock(),
+            testing::snapshot(&fake.target.path),
+            testing::snapshot(&world.root.join("machine")),
+        );
+        // beta needs alpha; the lock without beta has no alpha.
+        let why = remove(&env, "beta", DependencyTable::Dependencies, &options).unwrap_err();
+        assert!(
+            matches!(&why, EditError::ForeignInInstallation { packages }
+                if packages == &[("alpha".to_string(), "2.0".to_string())]),
+            "{why:?}"
+        );
+        let after = (
+            world.manifest(),
+            world.lock(),
+            testing::snapshot(&fake.target.path),
+            testing::snapshot(&world.root.join("machine")),
+        );
+        assert!(before == after, "something was written");
+        assert_eq!(held(&fake), ["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn a_headless_project_with_no_venv_is_not_guarded_for_it_chose_the_installation() {
+        let world = World::new("headless-unguarded", PROJECT);
+        let fake = testing::FakeInstallation::new(&world.root);
+        let sink = Recorder::default();
+        let mut env = world.env(&sink);
+        env.flags.prefix = None;
+        env.flags.labview_version = Some("2099".into());
+        env.headless = true;
+        fake.place(&mut env);
+        fake.with_package("delta");
+        let options = InstallOptions {
+            no_relink: true,
+            ..InstallOptions::default()
+        };
+        add(&env, "gamma", DependencyTable::Dependencies, None, &options).unwrap();
+        assert_eq!(held(&fake), ["alpha", "beta", "gamma"]);
     }
 }

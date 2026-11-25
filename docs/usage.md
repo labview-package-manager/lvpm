@@ -411,10 +411,13 @@ where the project syncs, as on `sync`: a named `install` or `uninstall` edits
 for `uninstall`, `lvpm.toml loses x` and `to uninstall without changing the project`).
 Writing into LabVIEW itself still needs `--global`
 ([Writing into LabVIEW itself](#writing-into-labview-itself)).
-A named `install` or `uninstall` into LabVIEW itself is refused, before it
-writes anything, if the sync would remove packages that neither the old nor the
-new lock lists: packages that other projects or you put there. The error names
-them and suggests `--no-project`. This is a guard until a question replaces it
+A named `install` or `uninstall` with `--global` into LabVIEW itself is refused,
+before it writes anything, if the sync would remove any package but the one
+`uninstall` takes out of `lvpm.toml`: packages that other projects or you put
+there, and dependencies the new lock drops, which another project may use. The
+error names them and suggests `--no-project`. A headless project with no venv,
+which chose the installation without `--global`, is not guarded. This is a
+guard until a question replaces it
 ([#55](https://github.com/labview-package-manager/lvpm/issues/55)).
 
 `install` and `uninstall` edit `lvpm.toml` (comments and layout stay), then lock and

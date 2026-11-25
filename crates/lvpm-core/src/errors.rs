@@ -440,13 +440,13 @@ pub enum EditError {
         required_by: Vec<String>,
         roots: Vec<(String, Vec<DependencyTable>)>,
     },
-    /// The project would sync into a LabVIEW installation itself, and the sync
-    /// would uninstall `packages` (name and version), which neither the old lock
-    /// nor the new one lists: other projects, or the user, put them there.
-    /// Nothing was changed.
+    /// With `--global`, the project would sync into a LabVIEW installation
+    /// itself, and the sync would uninstall `packages` (name and version) besides
+    /// the one the edit takes away: other projects, or the user, may have put
+    /// them there. Nothing was changed.
     // Temporary until #55 asks before a sync removes.
     #[error(
-        "LabVIEW holds packages that lvpm.lock does not list, and the sync would uninstall them: {}",
+        "the sync would uninstall packages from LabVIEW that you did not name: {}",
         names_and_versions(.packages)
     )]
     ForeignInInstallation { packages: Vec<(String, String)> },
