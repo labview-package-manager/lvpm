@@ -890,7 +890,7 @@ fn a_vipc_carries_its_packages_into_the_cache_and_a_failed_import_writes_nothing
         .unwrap();
     inner.write_all(b"carried 3.0.0.1\n").unwrap();
     let carried = inner.finish().unwrap().into_inner();
-    let package = |name: &str, included: bool| {
+    let package_xml = |name: &str, included: bool| {
         format!(
             "    <Package>\r\n      <Name>{name}</Name>\r\n      <Included>{included}</Included>\r\n      \
              <Dependency>false</Dependency>\r\n      <Pinned>false</Pinned>\r\n    </Package>\r\n"
@@ -914,19 +914,19 @@ fn a_vipc_carries_its_packages_into_the_cache_and_a_failed_import_writes_nothing
     };
 
     // A name with no version fails the import, and the manifest is as it was.
-    let bad = write_vipc(
+    let bad_vipc = write_vipc(
         "bad.vipc",
-        &(package("carried-3.0.0.1", true) + &package("mystery", false)),
+        &(package_xml("carried-3.0.0.1", true) + &package_xml("mystery", false)),
     );
     let before = lab.manifest();
     has(
-        &lab.fails(&["import", &bad]),
+        &lab.fails(&["import", &bad_vipc]),
         "package mystery: no version (expected name-version)",
     );
     assert_eq!(lab.manifest(), before);
 
-    let vipc = write_vipc("deps.vipc", &package("carried-3.0.0.1", true));
-    let imported = lab.ok(&["import", &vipc]);
+    let good_vipc = write_vipc("deps.vipc", &package_xml("carried-3.0.0.1", true));
+    let imported = lab.ok(&["import", &good_vipc]);
     has(&imported, "imported carried 3.0.0.1");
     has(&imported, "saved carried = \">=3.0.0.1\"");
     // Installed from the cache: no index has it.

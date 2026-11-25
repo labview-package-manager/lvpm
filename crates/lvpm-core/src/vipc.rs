@@ -79,9 +79,9 @@ fn read_config(path: &Path) -> Result<String, String> {
     Ok(decode(bytes))
 }
 
-/// `config.xml` as text. VIPM writes UTF-8, but older versions wrote the
-/// creator's name in the Windows code page, so bytes that are not UTF-8 are
-/// read as Latin-1, which agrees with Windows-1252 outside 0x80-0x9F.
+/// `config.xml` as text. Some real files carry Windows code page bytes (a
+/// creator's name, say), so bytes that are not UTF-8 are read as Latin-1,
+/// which agrees with Windows-1252 outside 0x80-0x9F.
 fn decode(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| e.into_bytes().iter().map(|&b| b as char).collect())
 }
@@ -458,6 +458,7 @@ mod tests {
         assert_eq!(one(config_xml("26.1 (64-bit)", "")).labview_year, 2026);
         assert_eq!(one(config_xml("24.3 (32-bit)", "")).labview_year, 2024);
         assert_eq!(one(config_xml("9.0", "")).labview_year, 2009);
+        assert_eq!(one(config_xml("99.0", "")).labview_year, 2099);
         assert_eq!(one(config_xml("13.10", "")).labview_year, 2013);
         let any_case = one(demo(&package_xml(
             "demo_lib-1.0.0.1",
@@ -537,6 +538,15 @@ mod tests {
             (
                 config_xml("8.6", ""),
                 "<Version> 8.6 is before LabVIEW 2009".into(),
+            ),
+            (
+                config_xml("1.0", ""),
+                "<Version> 1.0 is before LabVIEW 2009".into(),
+            ),
+            (config_xml("100.0", ""), "<Version> 100.0 is not N.N".into()),
+            (
+                config_xml("13.0(64-bit)", ""),
+                "<Version> 13.0(64-bit) is not N.N".into(),
             ),
             (
                 config_xml("13.0 (64-bit) ", ""),
@@ -635,6 +645,9 @@ mod tests {
         let path = dir.vipc(&[("config.xml", &xml)]);
         let vipc = read(&path, "p.vipc").unwrap();
         assert_eq!(vipc.packages[0].name, "demo_lib");
+        assert_eq!(decode(b"J\xfcrgen".to_vec()), "Jürgen");
+        // UTF-8 stays UTF-8, and is not read again as Latin-1.
+        assert_eq!(decode("Jürgen".as_bytes().to_vec()), "Jürgen");
     }
 
     #[test]
