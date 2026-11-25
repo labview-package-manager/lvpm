@@ -42,6 +42,7 @@ Feature: install and uninstall are the project commands
     Examples:
       | flag              |
       | --no-deps         |
+      | --allow-downgrade |
       | --manifest x.toml |
 
   Scenario: an unknown package changes nothing
@@ -336,6 +337,12 @@ Feature: install and uninstall are the project commands
     Given a directory without lvpm.toml
     When I run "lvpm add caraya --prefix dest"
     Then dest includes "caraya" 1.0
+    And the working directory has no lvpm.toml
+
+  Scenario: remove outside a project uninstalls directly, as uninstall does
+    Given a directory without lvpm.toml
+    When I run "lvpm remove alpha --prefix dest"
+    Then "alpha" is uninstalled from dest
     And the working directory has no lvpm.toml
 
   Scenario: remove takes uninstall's direct flags

@@ -474,7 +474,7 @@ impl<'a> OpEnv<'a> {
 
 /// The names the community indexes are asked for: every dependency of
 /// `project`, in any table, and `own`, the names the command was given
-/// (`lvpm add foo`).
+/// (`lvpm install foo`).
 pub(super) fn wanted_names(project: Option<&Project>, own: &[String]) -> Vec<String> {
     let listed = project.into_iter().flat_map(|p| p.tables());
     let listed = listed.flat_map(|(_, lines)| lines.iter().map(|(name, _)| name.clone()));

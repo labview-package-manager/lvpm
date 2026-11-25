@@ -2,7 +2,7 @@
 //! CLI and any other front end route it the same way.
 //!
 //! In a project, `install` with no package is a sync of the project to its
-//! lock, and with a package it is an `add`: the destination flags only pick
+//! lock, and with a package it adds the package to `lvpm.toml`: the destination flags only pick
 //! where the project syncs. With `--no-project`, or outside a project, it puts
 //! that package where it was asked to and leaves the project alone.
 
@@ -16,7 +16,7 @@ use std::path::Path;
 pub enum InstallMode {
     /// Make the destination equal `lvpm.lock`: bare install, in a project.
     Sync,
-    /// Put the named package in `lvpm.toml`, lock and sync, as `add` does: a
+    /// Put the named package in `lvpm.toml`, lock and sync, as `lvpm install` does: a
     /// named install in a project, unless `--no-project`.
     Add,
     /// Put the named package where it was asked to go, and what it needs.
@@ -31,6 +31,8 @@ pub struct InstallRequest<'a> {
     pub manifest: Option<&'a Path>,
     /// `--no-deps`.
     pub no_deps: bool,
+    /// `--allow-downgrade`.
+    pub allow_downgrade: bool,
     /// `--no-project`: install directly, leaving the project's files alone.
     pub no_project: bool,
     /// Each of `--dev`, `--group` and `--index` as typed: what an add saves,
@@ -45,8 +47,8 @@ pub struct InstallRequest<'a> {
 /// where the project syncs, unless `--no-project`; it is additive otherwise,
 /// and then refuses a saving flag instead of ignoring it.
 /// With no package, in a project (with or without a destination flag), it is a
-/// sync. Add and sync both take the lock's full set, so `--no-deps` and
-/// `--manifest` are refused for them. With no package outside a project there
+/// sync. Add and sync both take the lock's full set, at the lock's versions,
+/// so `--no-deps`, `--allow-downgrade` and `--manifest` are refused for them. With no package outside a project there
 /// is nothing to install.
 pub fn install_mode(env: &OpEnv, request: &InstallRequest) -> Result<InstallMode, RouteError> {
     let mode = match request.package {
@@ -78,10 +80,11 @@ pub fn install_mode(env: &OpEnv, request: &InstallRequest) -> Result<InstallMode
             InstallMode::Sync
         }
     };
-    let unsupported = match (request.no_deps, request.manifest) {
-        (true, _) => Some(LockIncompatible::NoDeps),
-        (false, Some(_)) => Some(LockIncompatible::Manifest),
-        (false, None) => None,
+    let unsupported = match (request.no_deps, request.allow_downgrade, request.manifest) {
+        (true, ..) => Some(LockIncompatible::NoDeps),
+        (_, true, _) => Some(LockIncompatible::AllowDowngrade),
+        (_, _, Some(_)) => Some(LockIncompatible::Manifest),
+        _ => None,
     };
     match unsupported {
         Some(option) => Err(RouteError::NotWithLock {
@@ -95,7 +98,7 @@ pub fn install_mode(env: &OpEnv, request: &InstallRequest) -> Result<InstallMode
 /// What an uninstall request means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UninstallMode {
-    /// Take the named package out of `lvpm.toml`, lock and sync, as `remove`
+    /// Take the named package out of `lvpm.toml`, lock and sync, as `lvpm uninstall`
     /// does: a named uninstall in a project, unless `--no-project`.
     Project,
     /// Take the named package, or everything, out of the destination and leave
@@ -247,6 +250,7 @@ mod tests {
         package: Some("gamma"),
         manifest: None,
         no_deps: false,
+        allow_downgrade: false,
         no_project: false,
         saving_flags: &[],
     };
@@ -326,17 +330,16 @@ mod tests {
                 InstallMode::Add,
                 "{flags:?}"
             );
-            let direct = [
-                (
-                    &in_a_project,
-                    InstallRequest {
-                        no_project: true,
-                        ..request
-                    },
-                    true,
-                ),
-                (&outside, request, false),
-            ];
+            let mut direct = vec![(&outside, request, false)];
+            // clap refuses --dev and --index with --no-project: only --group
+            // can be met with it.
+            if flags == ["--group"] {
+                let opted_out = InstallRequest {
+                    no_project: true,
+                    ..request
+                };
+                direct.push((&in_a_project, opted_out, true));
+            }
             for (dir, request, no_project) in direct {
                 let why = mode(dir, request).unwrap_err();
                 assert!(
@@ -466,6 +469,41 @@ mod tests {
         let opted_out = InstallRequest {
             no_project: true,
             ..request
+        };
+        assert_eq!(
+            mode(&in_a_project, opted_out).unwrap(),
+            InstallMode::Additive
+        );
+    }
+
+    #[test]
+    fn allow_downgrade_is_refused_for_a_sync_and_an_add_and_fine_for_a_direct_install() {
+        let in_a_project = Dir::new("allow-downgrade", Some(PROJECT));
+        for (request, adding) in [(GAMMA, true), (InstallRequest::default(), false)] {
+            let request = InstallRequest {
+                allow_downgrade: true,
+                ..request
+            };
+            assert!(
+                matches!(
+                    mode(&in_a_project, request),
+                    Err(RouteError::NotWithLock {
+                        option: LockIncompatible::AllowDowngrade,
+                        adding: said
+                    }) if said == adding
+                ),
+                "{request:?}"
+            );
+        }
+        let direct = InstallRequest {
+            allow_downgrade: true,
+            ..GAMMA
+        };
+        let outside = Dir::new("allow-downgrade-out", None);
+        assert_eq!(mode(&outside, direct).unwrap(), InstallMode::Additive);
+        let opted_out = InstallRequest {
+            no_project: true,
+            ..direct
         };
         assert_eq!(
             mode(&in_a_project, opted_out).unwrap(),

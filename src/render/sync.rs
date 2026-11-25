@@ -230,6 +230,21 @@ pub fn route_error(error: &RouteError) -> String {
                     "drop --no-deps, or install the package without changing the project: \
                      `lvpm install <package> --no-deps --no-project --prefix <dir>`",
                 ),
+                (LockIncompatible::AllowDowngrade, adding) => (
+                    "--allow-downgrade",
+                    match adding {
+                        false => {
+                            "drop --allow-downgrade (a sync installs the version lvpm.lock names, \
+                             older or newer), or install one package without changing the project: \
+                             `lvpm install <package> --allow-downgrade --no-project --prefix <dir>`"
+                        }
+                        true => {
+                            "drop --allow-downgrade (a sync installs the version lvpm.lock names, \
+                             older or newer), or install the package without changing the project: \
+                             `lvpm install <package> --allow-downgrade --no-project --prefix <dir>`"
+                        }
+                    },
+                ),
                 (LockIncompatible::Manifest, false) => (
                     "--manifest",
                     "drop --manifest to sync this project, or name a package and install it \
@@ -589,6 +604,28 @@ mod tests {
     }
 
     #[test]
+    fn allow_downgrade_in_a_project_says_the_lock_names_the_version_and_names_no_project() {
+        for adding in [false, true] {
+            let text = route_error(&RouteError::NotWithLock {
+                option: LockIncompatible::AllowDowngrade,
+                adding,
+            });
+            assert!(
+                text.starts_with(
+                    "--allow-downgrade cannot be used in a project, because lvpm.lock decides the dependencies\nnext: drop --allow-downgrade (a sync installs the version lvpm.lock names, older or newer), or install "
+                ),
+                "{text}"
+            );
+            assert!(
+                text.ends_with(
+                    "without changing the project: `lvpm install <package> --allow-downgrade --no-project --prefix <dir>`"
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn an_uninstall_flag_the_lock_overrules_names_no_project_as_the_way_out() {
         let text = route_error(&RouteError::UninstallNotWithLock { flag: "--force" });
         assert_eq!(
@@ -641,18 +678,20 @@ mod tests {
         let said = |flags: &[&'static str]| {
             route_error(&RouteError::SaveOnlyInAProject {
                 flags: flags.to_vec(),
-                no_project: true,
+                no_project: false,
             })
         };
+        // clap refuses --dev and --index with --no-project, so these two are
+        // only ever met outside a project.
         assert_eq!(
             said(&["--dev", "--index"]),
             "--dev and --index can only be used when installing a package into a project, which saves it in lvpm.toml\n\
-             next: drop --dev and --index, or drop --no-project"
+             next: drop --dev and --index, or run this in a project, where installing a package adds it to lvpm.toml"
         );
         assert_eq!(
             said(&["--group", "--index"]),
             "--group and --index can only be used when installing a package into a project, which saves it in lvpm.toml\n\
-             next: drop --group and --index (with no package it installs that group), or drop --no-project"
+             next: drop --group and --index (with no package it installs that group), or run this in a project, where installing a package adds it to lvpm.toml"
         );
     }
 

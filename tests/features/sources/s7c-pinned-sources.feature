@@ -273,7 +273,7 @@ Feature: a dependency can be pinned to one source
     And the project depends on "gamma" "*"
     And a current lock
     When I run "lvpm install alpha --index second --prefix dest"
-    Then the error says "then run `lvpm install` again"
+    Then the error says "then run `lvpm install alpha --prefix dest` again"
     And lvpm.toml and lvpm.lock are byte-identical to before
 
   Scenario: lvpm add --index on a github line fails

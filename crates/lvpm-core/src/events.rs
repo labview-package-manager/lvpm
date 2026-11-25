@@ -459,7 +459,7 @@ pub enum Event {
         from: String,
         to: String,
     },
-    /// `add` or `remove` changed one entry of the manifest. `dev`: the entry
+    /// `install` or `uninstall` changed one entry of the manifest. `dev`: the entry
     /// is in `[dev-dependencies]`; `group`: in `[dependency-groups.<group>]`.
     /// `created_table`: that group's table is new. `dry_run`: it is shown and
     /// not written.
@@ -473,7 +473,7 @@ pub enum Event {
         dry_run: bool,
     },
     /// `install` with a package name, inside a project and without
-    /// `--no-project`, is an `add`. `package` is as it was typed;
+    /// `--no-project`, adds the package to `lvpm.toml`. `package` is as it was typed;
     /// `destination` is the destination flag it was given, if any (`--prefix`),
     /// which only picks where the project syncs. Said once the lock is made, so
     /// a package no source lists never gets it; `dry_run`: nothing is written,
@@ -486,7 +486,7 @@ pub enum Event {
         dry_run: bool,
     },
     /// `uninstall` with a package name, inside a project and without
-    /// `--no-project`, is a `remove`. `package` is as it was typed;
+    /// `--no-project`, removes the package from `lvpm.toml`. `package` is as it was typed;
     /// `destination` is the destination flag that picked the target, if any,
     /// which only says where the project syncs. Said once the package is known
     /// to be in the table `lvpm.toml` is edited in, the lock is made and no

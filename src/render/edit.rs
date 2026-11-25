@@ -124,6 +124,21 @@ fn command_for(
     on_the_target(command, destination)
 }
 
+/// `command_for`, with the source `index` pins the package to, before the target.
+fn command_with_pin(
+    verb: &str,
+    package: &str,
+    table: &DependencyTable,
+    index: Option<&str>,
+    destination: Option<&str>,
+) -> String {
+    let pin = index.map_or_else(String::new, |source| format!(" --index {source}"));
+    on_the_target(
+        format!("{}{pin}", command_for(verb, package, table, None)),
+        destination,
+    )
+}
+
 /// `command` with the destination flags the user gave, as typed with their
 /// values: without them it could act on another target.
 fn on_the_target(command: String, destination: Option<&str>) -> String {
@@ -174,39 +189,72 @@ fn edit_line(edit: &ManifestEdit, table: &DependencyTable, dry_run: bool) -> Str
     }
 }
 
+/// A named `lvpm install` or `lvpm uninstall` as the user typed it, for the
+/// commands a hint suggests: they repeat all of it, so they act on the same
+/// package, table, source pin and target.
+pub struct Typed<'a> {
+    /// `install` or `uninstall`.
+    pub verb: &'a str,
+    /// The package, as typed (`gamma@>=0.5`).
+    pub package: &'a str,
+    /// Where the command saved the package, or took it from.
+    pub table: &'a DependencyTable,
+    /// The source it pinned the package to (`--index`).
+    pub index: Option<&'a str>,
+    /// The destination flags given, as typed with their values.
+    pub destination: Option<&'a str>,
+}
+
+impl Typed<'_> {
+    /// The command to run again, as `run {rerun} again` reads: the one typed,
+    /// without its `--index` when `keep_pin` is false.
+    fn rerun(&self, keep_pin: bool) -> String {
+        let index = self.index.filter(|_| keep_pin);
+        let package = match self
+            .package
+            .contains(|c: char| c.is_whitespace() || "<>|&;()".contains(c))
+        {
+            true => format!("\"{}\"", self.package),
+            false => self.package.to_string(),
+        };
+        format!(
+            "`{}`",
+            command_with_pin(self.verb, &package, self.table, index, self.destination)
+        )
+    }
+}
+
 /// What a named `lvpm install` and `lvpm uninstall` in a project print when they
-/// fail: what happened, then the next thing to do. `rerun` is the command to run again, as "run {rerun}
-/// again" reads. `destination` is the destination flags the user gave, as typed
-/// with their values, for a suggested command that acts on the target. `table`
-/// and `index` are where the command saved the package and the source it pinned,
-/// for a suggested command that saves it the same way.
-pub fn error(
-    error: &EditError,
-    rerun: &str,
-    destination: Option<&str>,
-    table: &DependencyTable,
-    index: Option<&str>,
-) -> String {
+/// fail: what happened, then the next thing to do.
+pub fn error(error: &EditError, typed: &Typed) -> String {
+    let Typed {
+        table,
+        index,
+        destination,
+        ..
+    } = *typed;
+    let rerun = typed.rerun(true);
     match error {
         EditError::Lock(LockError::NeedsNewerLabview {
             name, project_year, ..
         }) => {
-            let pin = index.map_or_else(String::new, |source| format!(" --index {source}"));
-            let pick = command_for("install", &format!("{name}@<version>"), table, None);
-            let command = on_the_target(format!("{pick}{pin}"), destination);
+            let package = format!("{name}@<version>");
+            let command = command_with_pin("install", &package, table, index, destination);
             format!(
                 "{error}\n\
                  next: pick a version that runs on LabVIEW {project_year} with \
                  `{command}`, or raise labview in lvpm.toml"
             )
         }
-        // lvpm.toml was put back, so the pin may only be on the command line.
+        // lvpm.toml was put back, so the pin may only be on the command line:
+        // the rerun leaves it out, for the pin is what the user is to change.
         EditError::Lock(LockError::PinnedNotListed { package, .. }) => format!(
             "{error}\n\
              next: pin {package} to a source that lists it, or list it in that source, \
-             then run {rerun} again"
+             then run {} again",
+            typed.rerun(false)
         ),
-        EditError::Lock(cause) => lock_error(cause, rerun),
+        EditError::Lock(cause) => lock_error(cause, &rerun),
         EditError::Sync(SyncError::Incomplete { done, left, cause }) => format!(
             "{}\nlvpm.toml and lvpm.lock were put back as they were\n\
              next: fix what is wrong and run {rerun} again; `lvpm sync` puts the destination \
@@ -217,13 +265,18 @@ pub fn error(
         EditError::Cancelled => {
             format!("{error}; lvpm.toml and lvpm.lock are unchanged\nnext: run {rerun} again")
         }
-        EditError::EmptyConstraint { name } => format!(
-            "{error}\n\
-             quote it, e.g. \"{name}@>=0.5\": an unquoted > sends the output to a file\n\
-             the shell may have created a file named \"=0.5\" here; it can be deleted\n\
-             next: run `lvpm install \"{name}@>=0.5\"` with the constraint you mean, or \
-             `lvpm install {name}` for the newest version"
-        ),
+        EditError::EmptyConstraint { name } => {
+            let with =
+                |package: &str| command_with_pin("install", package, table, index, destination);
+            format!(
+                "{error}\n\
+                 quote it, e.g. \"{name}@>=0.5\": an unquoted > sends the output to a file\n\
+                 the shell may have created a file named \"=0.5\" here; it can be deleted\n\
+                 next: run `{}` with the constraint you mean, or `{}` for the newest version",
+                with(&format!("\"{name}@>=0.5\"")),
+                with(name)
+            )
+        }
         EditError::NotADependency {
             name,
             installed: true,
@@ -698,28 +751,40 @@ mod tests {
         );
     }
 
-    fn written(error: &EditError) -> String {
-        super::error(
-            error,
-            "`lvpm install`",
-            None,
-            &DependencyTable::Dependencies,
-            None,
-        )
-    }
-
-    fn written_on(error: &EditError, destination: Option<&str>) -> String {
-        written_for(error, "`lvpm uninstall`", destination)
-    }
-
-    fn written_for(error: &EditError, rerun: &str, destination: Option<&str>) -> String {
-        super::error(
-            error,
-            rerun,
+    fn written_as(
+        error: &EditError,
+        verb: &str,
+        package: &str,
+        table: &DependencyTable,
+        index: Option<&str>,
+        destination: Option<&str>,
+    ) -> String {
+        let typed = Typed {
+            verb,
+            package,
+            table,
+            index,
             destination,
+        };
+        super::error(error, &typed)
+    }
+
+    /// What `lvpm install gamma` printed.
+    fn written(error: &EditError) -> String {
+        written_as(
+            error,
+            "install",
+            "gamma",
             &DependencyTable::Dependencies,
             None,
+            None,
         )
+    }
+
+    /// What `lvpm uninstall alpha`, given `destination`, printed.
+    fn written_on(error: &EditError, destination: Option<&str>) -> String {
+        let table = DependencyTable::Dependencies;
+        written_as(error, "uninstall", "alpha", &table, None, destination)
     }
 
     #[test]
@@ -730,32 +795,20 @@ mod tests {
             needs_year: 2026,
             project_year: 2024,
         });
-        let next = |rerun, table: &DependencyTable, index, destination| {
-            super::error(&error, rerun, destination, table, index)
+        let next = |table: &DependencyTable, index, destination| {
+            written_as(&error, "install", "omega", table, index, destination)
                 .lines()
                 .last()
                 .unwrap()
                 .to_string()
         };
         assert_eq!(
-            next("`lvpm install`", &DependencyTable::Dependencies, None, None),
-            "next: pick a version that runs on LabVIEW 2024 with `lvpm install omega@<version>`, \
-             or raise labview in lvpm.toml"
-        );
-        // An uninstall picks no version, so the hint is the install that does.
-        assert_eq!(
-            next(
-                "`lvpm uninstall`",
-                &DependencyTable::Dependencies,
-                None,
-                None
-            ),
+            next(&DependencyTable::Dependencies, None, None),
             "next: pick a version that runs on LabVIEW 2024 with `lvpm install omega@<version>`, \
              or raise labview in lvpm.toml"
         );
         assert_eq!(
             next(
-                "`lvpm install`",
                 &DependencyTable::DevDependencies,
                 Some("second"),
                 Some("--prefix dest")
@@ -765,7 +818,7 @@ mod tests {
              or raise labview in lvpm.toml"
         );
         assert_eq!(
-            next("`lvpm install`", &group("ci"), None, Some("--global")),
+            next(&group("ci"), None, Some("--global")),
             "next: pick a version that runs on LabVIEW 2024 with \
              `lvpm install omega@<version> --group ci --global`, or raise labview in lvpm.toml"
         );
@@ -784,6 +837,27 @@ mod tests {
         ] {
             assert!(text.contains(said), "{said:?} is not in:\n{text}");
         }
+    }
+
+    #[test]
+    fn an_empty_constraint_hint_keeps_the_table_pin_and_destination_of_the_command() {
+        let error = EditError::EmptyConstraint {
+            name: "gamma".into(),
+        };
+        let said = written_as(
+            &error,
+            "install",
+            "gamma@",
+            &DependencyTable::DevDependencies,
+            Some("second"),
+            Some("--prefix dest"),
+        );
+        assert_eq!(
+            said.lines().last().unwrap(),
+            "next: run `lvpm install \"gamma@>=0.5\" --dev --index second --prefix dest` with the \
+             constraint you mean, or `lvpm install gamma --dev --index second --prefix dest` \
+             for the newest version"
+        );
     }
 
     #[test]
@@ -807,19 +881,19 @@ mod tests {
     }
 
     #[test]
-    fn the_hint_for_another_table_is_the_command_the_user_ran_on_the_target_they_picked() {
+    fn the_hint_for_another_table_is_always_an_uninstall_on_the_target_the_user_picked() {
         let in_dev = EditError::InOtherTable {
             name: "caraya".into(),
             found_in: vec![DependencyTable::DevDependencies],
         };
-        let said = |rerun, destination| written_for(&in_dev, rerun, destination);
+        let said = |destination| written_on(&in_dev, destination);
         assert_eq!(
-            said("`lvpm uninstall`", Some("--prefix dest")),
+            said(Some("--prefix dest")),
             "caraya is in [dev-dependencies]\n\
              next: use --dev: `lvpm uninstall caraya --dev --prefix dest`"
         );
         assert_eq!(
-            said("`lvpm uninstall`", Some("--labview-version 2026")),
+            said(Some("--labview-version 2026")),
             "caraya is in [dev-dependencies]\n\
              next: use --dev: `lvpm uninstall caraya --dev --labview-version 2026`"
         );
@@ -828,7 +902,7 @@ mod tests {
             found_in: vec![DependencyTable::Dependencies, group("ci")],
         };
         assert_eq!(
-            written_for(&in_normal, "`lvpm uninstall`", Some("--global")),
+            written_on(&in_normal, Some("--global")),
             "beta is in [dependencies] and [dependency-groups.ci]\n\
              next: `lvpm uninstall beta --global` removes it from [dependencies]\n\
              next: `lvpm uninstall beta --group ci --global` removes it from [dependency-groups.ci]"
@@ -851,7 +925,7 @@ mod tests {
             "sync stopped before it was done: disk full\n\
              not done:\n  install gamma 1.0\n\
              lvpm.toml and lvpm.lock were put back as they were\n\
-             next: fix what is wrong and run `lvpm install` again; `lvpm sync` puts the destination \
+             next: fix what is wrong and run `lvpm install gamma` again; `lvpm sync` puts the destination \
              back in line with lvpm.lock"
         );
     }
@@ -903,14 +977,77 @@ mod tests {
         assert!(
             text.ends_with(
                 "\nnext: pin alpha to a source that lists it, or list it in that source, \
-                 then run `lvpm install` again"
+                 then run `lvpm install gamma` again"
             ),
             "{text}"
         );
         assert!(!text.contains("index key"), "{text}");
         let text = written(&EditError::Lock(LockError::NoLabview));
-        assert!(text.ends_with("then run `lvpm install` again"), "{text}");
+        assert!(
+            text.ends_with("then run `lvpm install gamma` again"),
+            "{text}"
+        );
         assert!(!text.contains("`lvpm lock`"), "{text}");
+    }
+
+    #[test]
+    fn a_bare_rerun_would_be_a_sync_so_every_hint_repeats_the_whole_command_as_typed() {
+        let pinned = EditError::Lock(LockError::PinnedNotListed {
+            package: "alpha".into(),
+            source_name: "second".into(),
+            feed: "http://second.example/index.vipr".into(),
+        });
+        let rerun = |error: &EditError| {
+            let typed = Typed {
+                verb: "install",
+                package: "alpha@>=1.0",
+                table: &group("ci"),
+                index: Some("second"),
+                destination: Some("--prefix dest"),
+            };
+            super::error(error, &typed)
+                .lines()
+                .last()
+                .unwrap()
+                .to_string()
+        };
+        // The pin is what the user is told to change, so it is not repeated.
+        assert_eq!(
+            rerun(&pinned),
+            "next: pin alpha to a source that lists it, or list it in that source, \
+             then run `lvpm install \"alpha@>=1.0\" --group ci --prefix dest` again"
+        );
+        // Anything else repeats it with its pin.
+        let expected = "`lvpm install \"alpha@>=1.0\" --group ci --index second --prefix dest`";
+        for error in [
+            EditError::Cancelled,
+            EditError::Lock(LockError::NoLabview),
+            EditError::Sync(SyncError::Incomplete {
+                done: Vec::new(),
+                left: Vec::new(),
+                cause: "x".into(),
+            }),
+        ] {
+            let last = rerun(&error);
+            assert!(last.contains(expected), "{last}");
+        }
+    }
+
+    #[test]
+    fn an_uninstall_hint_to_rerun_names_the_package_table_and_destination_and_no_pin() {
+        let text = written_as(
+            &EditError::Cancelled,
+            "uninstall",
+            "caraya",
+            &DependencyTable::DevDependencies,
+            None,
+            Some("--prefix dest"),
+        );
+        assert_eq!(
+            text,
+            "cancelled; lvpm.toml and lvpm.lock are unchanged\n\
+             next: run `lvpm uninstall caraya --dev --prefix dest` again"
+        );
     }
 
     #[test]
@@ -918,7 +1055,7 @@ mod tests {
         let text = written(&EditError::Cancelled);
         assert_eq!(
             text,
-            "cancelled; lvpm.toml and lvpm.lock are unchanged\nnext: run `lvpm install` again"
+            "cancelled; lvpm.toml and lvpm.lock are unchanged\nnext: run `lvpm install gamma` again"
         );
     }
 

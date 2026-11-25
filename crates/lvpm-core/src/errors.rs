@@ -561,6 +561,9 @@ pub enum DirectBecause {
 pub enum LockIncompatible {
     /// Leaving out the dependencies of the packages.
     NoDeps,
+    /// Letting a package go to an older version: a sync installs the lock's
+    /// version, older or newer, so there is nothing to allow.
+    AllowDowngrade,
     /// Reading the dependencies from another manifest.
     Manifest,
 }

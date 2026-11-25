@@ -281,11 +281,7 @@ enum Cmd {
         dry_run: bool,
     },
     /// Install a package by name, or name@version; `add` is the same command.
-    /// In a project, a bare install is `lvpm sync` and a named install adds
-    /// the package to lvpm.toml, locks and syncs, whatever --global, --prefix
-    /// or --labview-version say: they only pick where the project syncs.
-    /// --no-project installs the package alone, leaving the project's files as
-    /// they are.
+    /// In a project a bare install is `lvpm sync` and a named install adds the package to lvpm.toml, locks and syncs; --no-project installs it alone.
     #[command(visible_alias = "add", mut_arg("group", |arg| arg.help(
         "With a package: save it in [dependency-groups.NAME]. Without: also install this group (repeatable)"
     )))]
@@ -377,12 +373,8 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         timeout: u64,
     },
-    /// Remove a package; `remove` is the same command. In a project, a named
-    /// uninstall takes the package out of lvpm.toml, locks and syncs, whatever
-    /// --global, --prefix or --labview-version say: they only pick where the
-    /// project syncs. --no-project uninstalls the package alone, leaving the
-    /// project's files as they are; so does --all, and so does naming no
-    /// package outside a project.
+    /// Remove a package; `remove` is the same command.
+    /// In a project a named uninstall takes the package out of lvpm.toml, locks and syncs; --no-project and --all leave the project's files alone.
     #[command(visible_alias = "remove")]
     Uninstall {
         /// Package to remove. Omit when using --all.
@@ -1062,6 +1054,7 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 package: package.as_deref(),
                 manifest: manifest.as_deref(),
                 no_deps: *no_deps,
+                allow_downgrade: *allow_downgrade,
                 no_project: *no_project,
                 saving_flags: &saving_flags(*dev, &sync.group, source_pin.as_deref()),
             };
@@ -1369,7 +1362,7 @@ fn cmd_uninstall_project(
     };
     let options = apply.options(false, false);
     ops::add_remove::remove_announcing(env, package, table.clone(), &options, announce)
-        .map_err(|why| edit_error(env, &why, "`lvpm uninstall`", &table, None))
+        .map_err(|why| edit_error(env, &why, "uninstall", package, &table, None))
 }
 
 /// `uninstall` that leaves the project alone: the named package, or `--all`, out
@@ -1430,25 +1423,29 @@ fn cmd_install_adds(
     };
     let options = apply.options(false, false);
     ops::add_remove::add_announcing(env, package, table.clone(), source_pin, &options, announce)
-        .map_err(|why| edit_error(env, &why, "`lvpm install`", &table, source_pin))
+        .map_err(|why| edit_error(env, &why, "install", package, &table, source_pin))
 }
 
-/// What a project `install` or `uninstall` that failed prints: its next step
-/// names the destination flags it was given, so a command it suggests acts on
-/// the same target, and the table and source pin it saved into.
+/// What a project `install` or `uninstall` of `package` that failed prints: its
+/// next step is the command as typed (the table, the source pin and the
+/// destination flags it was given), so it acts on the same package and target.
 fn edit_error(
     env: &OpEnv,
     why: &EditError,
-    rerun: &str,
+    verb: &str,
+    package: &str,
     table: &DependencyTable,
     index: Option<&str>,
 ) -> anyhow::Error {
     anyhow!(render::edit::error(
         why,
-        rerun,
-        env.destination_flags_as_typed().as_deref(),
-        table,
-        index,
+        &render::edit::Typed {
+            verb,
+            package,
+            table,
+            index,
+            destination: env.destination_flags_as_typed().as_deref(),
+        },
     ))
 }
 

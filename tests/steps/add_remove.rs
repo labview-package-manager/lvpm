@@ -498,6 +498,7 @@ async fn core_routes(world: &mut CliWorld, command_line: String) {
         package,
         manifest: None,
         no_deps,
+        allow_downgrade: false,
         no_project,
         saving_flags: &[],
     };
