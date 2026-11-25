@@ -33,13 +33,17 @@ pub struct InstallRequest<'a> {
     pub no_deps: bool,
     /// `--no-project`: install directly, leaving the project's files alone.
     pub no_project: bool,
+    /// `--dev`, `--group` or `--index` as typed: what an add saves, which a
+    /// direct install has nowhere to.
+    pub saving_flag: Option<&'static str>,
 }
 
 /// The mode of `request`, in the project `env` runs in, if any.
 ///
 /// A named package is an [`InstallMode::Add`] in a project, whatever the
 /// destination flags (`--global`, `--prefix`, `--labview-version`) say about
-/// where the project syncs, unless `--no-project`; it is additive otherwise.
+/// where the project syncs, unless `--no-project`; it is additive otherwise,
+/// and then refuses a saving flag instead of ignoring it.
 /// With no package, in a project (with or without a destination flag), it is a
 /// sync. Add and sync both take the lock's full set, so `--no-deps` and
 /// `--manifest` are refused for them. With no package outside a project there
@@ -48,6 +52,12 @@ pub fn install_mode(env: &OpEnv, request: &InstallRequest) -> Result<InstallMode
     let mode = match request.package {
         Some(_) => {
             if request.no_project || env.manifest_for(None, None)?.is_none() {
+                if let Some(flag) = request.saving_flag {
+                    return Err(RouteError::SaveOnlyInAProject {
+                        flag,
+                        no_project: request.no_project,
+                    });
+                }
                 // The one package, installed where it was asked to go, has no
                 // use for another manifest's dependencies.
                 return match request.manifest {
@@ -238,6 +248,7 @@ mod tests {
         manifest: None,
         no_deps: false,
         no_project: false,
+        saving_flag: None,
     };
 
     #[test]
@@ -294,6 +305,56 @@ mod tests {
         assert_eq!(mode(&in_a_project, request).unwrap(), InstallMode::Additive);
         let outside = Dir::new("no-project-out", None);
         assert_eq!(mode(&outside, request).unwrap(), InstallMode::Additive);
+    }
+
+    #[test]
+    fn a_saving_flag_is_refused_where_the_install_is_direct_and_taken_in_a_project() {
+        let in_a_project = Dir::new("saving-in", Some(PROJECT));
+        let outside = Dir::new("saving-out", None);
+        for flag in ["--dev", "--group", "--index"] {
+            let request = InstallRequest {
+                saving_flag: Some(flag),
+                ..GAMMA
+            };
+            assert_eq!(
+                mode(&in_a_project, request).unwrap(),
+                InstallMode::Add,
+                "{flag}"
+            );
+            let direct = [
+                (
+                    &in_a_project,
+                    InstallRequest {
+                        no_project: true,
+                        ..request
+                    },
+                    true,
+                ),
+                (&outside, request, false),
+            ];
+            for (dir, request, no_project) in direct {
+                let why = mode(dir, request).unwrap_err();
+                assert!(
+                    matches!(
+                        why,
+                        RouteError::SaveOnlyInAProject { flag: refused, no_project: said }
+                            if refused == flag && said == no_project
+                    ),
+                    "{flag}: {why:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_saving_flag_without_a_package_is_no_saving_flag_for_the_route() {
+        // `install --group test` installs that group: the sync meaning.
+        let dir = Dir::new("saving-bare", Some(PROJECT));
+        let request = InstallRequest {
+            saving_flag: Some("--group"),
+            ..InstallRequest::default()
+        };
+        assert_eq!(mode(&dir, request).unwrap(), InstallMode::Sync);
     }
 
     #[test]

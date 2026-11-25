@@ -263,6 +263,18 @@ pub fn route_error(error: &RouteError) -> String {
             };
             format!("{error}\nnext: drop {flag}, or {way_in}")
         }
+        RouteError::SaveOnlyInAProject { flag, no_project } => {
+            let way_in = match no_project {
+                true => "drop --no-project",
+                false => "run this in a project, where installing a package adds it to lvpm.toml",
+            };
+            // `--group` alone is the other meaning, and the only one an install with no package has.
+            let aside = match *flag {
+                "--group" => " (with no package it installs that group)",
+                _ => "",
+            };
+            format!("{error}\nnext: drop {flag}{aside}, or {way_in}")
+        }
         RouteError::Other(cause) => format!("{cause:#}"),
     }
 }
@@ -597,6 +609,25 @@ mod tests {
             "--dev can only be used when uninstalling a package from a project\n\
              next: drop --dev, or run this in a project, where uninstalling a package takes it \
              out of lvpm.toml"
+        );
+    }
+
+    #[test]
+    fn a_saving_flag_on_a_direct_install_says_where_to_go_and_group_names_its_other_meaning() {
+        let said =
+            |flag, no_project| route_error(&RouteError::SaveOnlyInAProject { flag, no_project });
+        let refusal = "saves the package in lvpm.toml, so it can only be used when installing a package into a project\n";
+        assert_eq!(
+            said("--dev", false),
+            format!(
+                "--dev {refusal}next: drop --dev, or run this in a project, where installing a package adds it to lvpm.toml"
+            )
+        );
+        assert_eq!(
+            said("--group", true),
+            format!(
+                "--group {refusal}next: drop --group (with no package it installs that group), or drop --no-project"
+            )
         );
     }
 

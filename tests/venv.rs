@@ -515,7 +515,6 @@ fn venv_installs_merge_palette_trees_and_rebuild_them_after_uninstall() {
 }
 
 #[test]
-#[ignore = "#54 slice 4"]
 fn install_by_name_keeps_the_manifest_in_step() {
     let lab = Lab::new("save");
     lab.package("foo", "1.0.0.1", "");
@@ -528,46 +527,49 @@ fn install_by_name_keeps_the_manifest_in_step() {
     // The version asked for, as given.
     has(
         &lab.ok(&["install", "foo@1.0.0.1"]),
-        "saved foo = \"1.0.0.1\" to lvpm.toml [dependencies]",
+        "lvpm.toml: added foo = \"1.0.0.1\" to [dependencies]",
     );
     has(
         &std::fs::read_to_string(lab.file("foo", "foo.txt")).unwrap(),
         "foo 1.0.0.1",
     );
-    // An upgrade replaces the files and updates the entry in place.
-    let upgraded = lab.ok(&["install", "foo"]);
+    // Asking for a newer version replaces the files and updates the entry in
+    // place; asking for no version only rewrites the constraint, as `lvpm lock
+    // --upgrade-package` is what moves a locked package.
+    let upgraded = lab.ok(&["install", "foo@2.0.0.1"]);
     has(&upgraded, "foo 1.0.0.1 -> 2.0.0.1");
     has(
         &upgraded,
-        "updated foo in lvpm.toml [dependencies]: \"1.0.0.1\" -> \"2.0.0.1\"",
+        "lvpm.toml was updated: foo \"1.0.0.1\" -> \"2.0.0.1\"",
     );
     has(
         &std::fs::read_to_string(lab.file("foo", "foo.txt")).unwrap(),
         "foo 2.0.0.1",
     );
-    // A newer installed version is kept, and the manifest never names one
-    // the venv does not hold.
-    let kept = lab.ok(&["install", "foo@1.0.0.1"]);
+    // A direct install keeps a newer installed version, and leaves the manifest
+    // alone: in a project the lock decides, and a named install edits it.
+    let kept = lab.ok(&["install", "foo@1.0.0.1", "--no-project"]);
     has(&kept, "not downgrading");
-    has(&kept, "lvpm.toml not changed: foo 2.0.0.1 stays installed");
     has(&lab.manifest(), "foo = \"2.0.0.1\"");
 
     has(
         &lab.ok(&["install", "bar", "--group", "test"]),
-        "[dependencies.test]",
+        "lvpm.toml: added bar = \">=1.0.0.1\" to [dependency-groups.test]",
     );
-    // fork: install has no flag to leave the manifest alone; upstream's
-    // `install baz` without saving, its `lacks baz` and record checks go.
+    // --no-project installs without saving.
+    lab.ok(&["install", "baz", "--no-project"]);
+    assert!(lab.record("baz").is_file());
     let manifest = lab.manifest();
     assert!(manifest.starts_with("[project]"), "{manifest}");
     has(&manifest, "# the project's packages");
-    has(&manifest, "[dependencies.test]\nbar = \"1.0.0.1\"");
+    has(&manifest, "[dependency-groups.test]\nbar = \">=1.0.0.1\"");
+    assert!(!manifest.contains("baz"), "{manifest}");
 
     // Dry runs change nothing.
     let before = lab.manifest();
     has(
-        &lab.ok(&["install", "foo@1.0.0.1", "--allow-downgrade", "--dry-run"]),
-        "would save foo = \"1.0.0.1\"",
+        &lab.ok(&["install", "foo@1.0.0.1", "--dry-run"]),
+        "would add foo@1.0.0.1 to lvpm.toml",
     );
     assert_eq!(lab.manifest(), before);
     has(

@@ -528,6 +528,18 @@ pub enum RouteError {
         flag: &'static str,
         because: DirectBecause,
     },
+    /// A named install that would not edit `lvpm.toml` was given `flag` (`--dev`,
+    /// `--group`, `--index`), which says where in it to save the package.
+    /// `no_project`: it is `--no-project` that makes the install direct, else
+    /// there is no project.
+    #[error(
+        "{flag} saves the package in lvpm.toml, so it can only be used when installing a \
+         package into a project"
+    )]
+    SaveOnlyInAProject {
+        flag: &'static str,
+        no_project: bool,
+    },
     /// Anything else that went wrong: its own text.
     #[error(transparent)]
     Other(#[from] anyhow::Error),

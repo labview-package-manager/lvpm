@@ -285,9 +285,12 @@ enum Cmd {
     /// --global, --prefix or --labview-version say: they only pick where the
     /// project syncs. --no-project installs the package alone, leaving the
     /// project's files as they are.
+    #[command(mut_arg("group", |arg| arg.help(
+        "With a package: save it in [dependency-groups.NAME]. Without: also install this group (repeatable)"
+    )))]
     Install {
         /// Package to install. Omit it in a project to sync the project.
-        #[arg(conflicts_with_all = ["locked", "frozen", "no_locked", "no_dev", "group"])]
+        #[arg(conflicts_with_all = ["locked", "frozen", "no_locked", "no_dev"])]
         package: Option<String>,
         /// Not supported with a lock: lvpm.lock always holds the full set.
         #[arg(long, value_name = "FILE")]
@@ -299,6 +302,17 @@ enum Cmd {
         /// lvpm.lock are left as they are.
         #[arg(long, requires = "package", conflicts_with = "project")]
         no_project: bool,
+        /// Save the package in [dev-dependencies].
+        #[arg(long, requires = "package", conflicts_with_all = ["no_dev", "group", "no_project"])]
+        dev: bool,
+        /// Take the package only from this [sources] name; writes index = "<NAME>".
+        #[arg(
+            long = "index",
+            value_name = "NAME",
+            requires = "package",
+            conflicts_with = "no_project"
+        )]
+        source_pin: Option<String>,
         /// Replace an installed package with an older version. Without this,
         /// resolving to something older than what is installed is refused.
         #[arg(long)]
@@ -1072,6 +1086,8 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
             manifest,
             no_deps,
             no_project,
+            dev,
+            source_pin,
             allow_downgrade,
             apply,
             sync,
@@ -1081,6 +1097,7 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 manifest: manifest.as_deref(),
                 no_deps: *no_deps,
                 no_project: *no_project,
+                saving_flag: saving_flag(*dev, &sync.group, source_pin.as_deref()),
             };
             let mode = route::install_mode(&env, &request)
                 .map_err(|why| anyhow!(render::sync::route_error(&why)))?;
@@ -1088,13 +1105,8 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 (InstallMode::Sync, _) => cmd_sync(&env, &sync.options(apply, env.headless)),
                 // A named install in a project is an add, and always names one.
                 (InstallMode::Add, Some(spec)) => {
-                    let announce = Event::InstallAddsToProject {
-                        package: spec.to_string(),
-                        destination: env.destination_flag().map(str::to_string),
-                        dry_run: apply.dry_run,
-                    };
-                    let table = DependencyTable::Dependencies;
-                    cmd_add(&env, spec, table, None, apply, Some(announce))
+                    let table = saved_into(*dev, &sync.group)?;
+                    cmd_install_adds(&env, spec, table, source_pin.as_deref(), apply)
                 }
                 (InstallMode::Add | InstallMode::Additive, package) => {
                     ops::install::install(&env, package, &apply.options(*no_deps, *allow_downgrade))
@@ -1373,6 +1385,23 @@ fn dependency_table(dev: bool, group: Option<&str>) -> Result<DependencyTable> {
     Ok(table)
 }
 
+/// The table a named install saves into: `--dev`, or the one `--group`, else
+/// `[dependencies]`.
+fn saved_into(dev: bool, groups: &[String]) -> Result<DependencyTable> {
+    ensure!(groups.len() <= 1, "a package goes into one group");
+    dependency_table(dev, groups.first().map(String::as_str))
+}
+
+/// The flag, as typed, that says where a named install saves the package.
+fn saving_flag(dev: bool, groups: &[String], index: Option<&str>) -> Option<&'static str> {
+    match (dev, groups.is_empty(), index) {
+        (true, ..) => Some("--dev"),
+        (_, false, _) => Some("--group"),
+        (_, _, Some(_)) => Some("--index"),
+        _ => None,
+    }
+}
+
 /// `--dev` or `--group`, as typed: the table a project uninstall takes a
 /// package out of.
 fn table_flag(dev: bool, group: Option<&str>) -> Option<&'static str> {
@@ -1444,6 +1473,22 @@ fn cmd_uninstall(
             Err(other) => other,
         },
     )
+}
+
+/// A named `install` in a project: an add, which says so once the lock is made.
+fn cmd_install_adds(
+    env: &OpEnv,
+    package: &str,
+    table: DependencyTable,
+    source_pin: Option<&str>,
+    apply: &ApplyArgs,
+) -> Result<()> {
+    let announce = Event::InstallAddsToProject {
+        package: package.to_string(),
+        destination: env.destination_flag().map(str::to_string),
+        dry_run: apply.dry_run,
+    };
+    cmd_add(env, package, table, source_pin, apply, Some(announce))
 }
 
 /// `announce` is what the command says once the lock is made, if it says one.

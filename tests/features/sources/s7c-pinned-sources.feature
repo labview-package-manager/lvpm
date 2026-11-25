@@ -204,6 +204,24 @@ Feature: a dependency can be pinned to one source
     And lvpm.lock takes "alpha" 1.0 from "second"
     And the output says "(from second)"
 
+  Scenario: lvpm install --index writes the table form with the pinned source's version
+    Given "first" lists "alpha" 2.0
+    And "second" lists "alpha" 1.0
+    When I run "lvpm install alpha --index second --prefix dest"
+    Then the command succeeds
+    And lvpm.toml pins "alpha" to "second" with ">=1.0"
+    And lvpm.lock takes "alpha" 1.0 from "second"
+    And the output says "(from second)"
+
+  Scenario: lvpm install --index naming an unknown source changes nothing
+    Given "first" lists "alpha" 1.0
+    And the project depends on "alpha" "*"
+    And a current lock
+    When I run "lvpm install alpha --index nope --prefix dest"
+    Then the exit code is non-zero
+    And the error says "index = \"nope\" is not a [sources] name"
+    And lvpm.toml and lvpm.lock are byte-identical to before
+
   Scenario: lvpm add --dev --index writes the pin into [dev-dependencies]
     Given "second" lists "alpha" 1.0
     When I run "lvpm add alpha --dev --index second --prefix dest"

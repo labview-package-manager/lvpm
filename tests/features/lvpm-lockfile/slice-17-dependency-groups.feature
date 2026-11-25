@@ -140,9 +140,11 @@ Feature: Dependency groups
     Then dest's lvpm-installed packages are exactly alpha and ci_tools
     And lvpm.lock is byte-identical to before
 
-  Scenario: --group is refused with a package argument
+  Scenario: --group with a package saves it in that group, as add --group does
     When I run "lvpm install beta --group ci --prefix dest"
-    Then the command fails as a usage error naming "--group"
+    Then [dependency-groups.ci] says "beta" = ">=1.0"
+    And lvpm.lock gives "beta" groups ["ci"]
+    And "beta" 1.0 is installed
 
   # AC6, AC7
   Scenario: add --group writes the group's table and installs it

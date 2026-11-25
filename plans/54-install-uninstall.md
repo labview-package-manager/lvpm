@@ -498,6 +498,17 @@ In `s7c-pinned-sources.feature`, on its Background (`a project with labview "202
 **Files**: `src/main.rs`, `crates/lvpm-core/src/ops/route.rs`, `crates/lvpm-core/src/errors.rs`, `tests/features/fork-adoption/54-install-uninstall.feature`, `tests/features/sources/s7c-pinned-sources.feature`, `tests/features/lvpm-lockfile/slice-17-dependency-groups.feature`
 **Commit**: `feat(install): --dev, --group and --index save a named install (#54)`
 
+**Built differently in Step 4.1** (decided while building; the scenarios and tests are the record):
+
+- A saving flag is refused on every direct install, not only `--group` with `--no-project`: `InstallRequest.saving_flag` (`--dev`, `--group` or `--index` as typed) and `install_mode` give the new `RouteError::SaveOnlyInAProject { flag, no_project }` when a named install is direct, either by `--no-project` or because there is no project. Without it `install x --dev` outside a project would have been accepted and the flag ignored (clap used to refuse `--group` there). The next line says `drop --no-project`, or `run this in a project, where installing a package adds it to lvpm.toml`; for `--group` it also says "(with no package it installs that group)", which names the other meaning. A bare `install --group test` is still a sync: the saving flag is only read with a package. `--dev` and `--index` with `--no-project` stay clap's conflict, as the plan says. New scenario outline for the outside-a-project rows; route unit tests for both routes.
+- The scenarios name a destination, so the outline's `<args>` is followed by `--prefix dest`.
+- The `--group` help is set on `Install` alone (`#[command(mut_arg("group", ...))]`): `SyncArgs` is shared, and `sync --group` keeps its own help.
+- Two groups with a package fail in `main` with "a package goes into one group" (`saved_into`); `--group dev` is `--dev`, as for `add`. The `InstallMode::Add` arm is `saved_into` plus `cmd_install_adds`, which builds the announce and calls `cmd_add`, so the `Cmd::Install` arm stays small for #59's merge.
+- Steps: "lvpm.toml has a new [dependency-groups.test] with ..." is the existing `[dependency-groups.test] says ...` plus "the output says created [dependency-groups.test], a new group". The unknown-source scenario in s7c uses the givens and Then steps of its `add` twin ("the project depends on alpha, a current lock, ... byte-identical") because "nothing changed" needs a noted project that s7c's Background does not make. The outside-a-project outline ends with "the working directory has no lvpm.toml" ("nothing changed" has no manifest to read there).
+- slice-17:144 `install beta --group ci --prefix dest` now saves beta in group ci; its title and Then follow `add --group`: the table, the lock's `groups ["ci"]`, and beta installed.
+- tests/venv.rs `install_by_name_keeps_the_manifest_in_step` runs. In a project a named install is an add and the lock decides, so three upstream checks are in the fork's words: `install foo@1.0.0.1` says "lvpm.toml: added foo = "1.0.0.1" to [dependencies]"; an upgrade is `install foo@2.0.0.1` (`install foo` with no version only rewrites the constraint to `>=` the locked version, as `add` does; `lock --upgrade-package` moves a locked package); "not downgrading" and a manifest that is left alone are the direct install's (`install foo@1.0.0.1 --no-project`), since `install foo@1.0.0.1` in a project downgrades the venv with the lock. `install baz --no-project` is the form that does not save, and the group line reads `bar = ">=1.0.0.1"`. The dry run says "would add foo@1.0.0.1 to lvpm.toml". Not covered: a project downgrade step.
+- e2e/src/local.rs (not run: they need a LabVIEW container): every named `uninstall` that stood for the direct route, with `--keep-deps` or `--with-deps` and the direct route's wording ("--with-deps or --keep-deps", "keeping ...: still required by", "dependency list required", "declared in lvpm.toml"), gets `--no-project`. Its named installs are unchanged: they were adds already (no destination flag), and `--no-project` on them would change what the check sets up.
+
 ### Slice 5: add and remove are aliases
 
 **Depends-on:** 4
@@ -729,8 +740,8 @@ See each step.
   - [x] Step 2.1: Route a named uninstall in a project to remove
 - [x] Wave 3 / Slice 3: a package another one requires cannot be removed
   - [x] Step 3.1: Refuse the removal before anything is written
-- [ ] Wave 4 / Slice 4: install saves into dev, a group or a source
-  - [ ] Step 4.1: --dev, --group and --index on a named install
+- [x] Wave 4 / Slice 4: install saves into dev, a group or a source
+  - [x] Step 4.1: --dev, --group and --index on a named install
 - [ ] Wave 5 / Slice 5: add and remove are aliases
   - [ ] Step 5.1: Delete Cmd::Add and Cmd::Remove
 - [ ] Wave 6 / Slice 6: a write into LabVIEW itself needs --global

@@ -261,3 +261,61 @@ Feature: install and uninstall are the project commands
     And the error's next line names "--no-project --prefix dest"
     And the error's next line names "--force"
     And nothing changed
+
+  # Slice 4: the saving flags. As above, a command that reaches a destination names one.
+  Scenario: install can save into the dev group
+    When I run "lvpm install caraya --dev --prefix dest"
+    Then [dev-dependencies] says "caraya" = ">=1.0"
+    And lvpm.lock and dest include "caraya" 1.0
+
+  Scenario: install --group saves into that group
+    When I run "lvpm install caraya --group test --prefix dest"
+    Then [dependency-groups.test] says "caraya" = ">=1.0"
+    And the output says "created [dependency-groups.test], a new group"
+    And lvpm.lock and dest include "caraya" 1.0
+
+  Scenario: install --dev with a destination flag saves and syncs there
+    When I run "lvpm install caraya --dev --prefix other"
+    Then [dev-dependencies] says "caraya" = ">=1.0"
+    And "other" includes "caraya" 1.0
+
+  Scenario: install --dev of a package [dependencies] lists adds it there too
+    Given the project also depends on "caraya" "*", locked and synced
+    When I run "lvpm install caraya --dev --prefix dest"
+    Then [dev-dependencies] says "caraya" = ">=1.0"
+    And [dependencies] itself has the "caraya" line
+
+  Scenario: a bare install --group still installs that group
+    Given lvpm.toml has [dependency-groups.test] "caraya" "*" and a current lvpm.lock
+    When I run "lvpm install --group test --prefix dest"
+    Then lvpm.lock and dest include "caraya" 1.0
+    And lvpm.toml is byte-identical to before
+
+  Scenario Outline: saving flags that do not fit are refused
+    When I run "lvpm install <args> --prefix dest"
+    Then the command fails naming "<names>"
+    And nothing changed
+
+    Examples:
+      | args                               | names        |
+      | caraya --group test --group ci     | one group    |
+      | caraya --dev --group test          | --dev        |
+      | caraya --dev --no-dev              | --dev        |
+      | --dev                              | --dev        |
+      | --index second                     | --index      |
+      | caraya --dev --no-project          | --no-project |
+      | caraya --group test --no-project   | --no-project |
+      | caraya --index second --no-project | --no-project |
+
+  Scenario Outline: saving flags are refused outside a project too, naming the project
+    Given a directory without lvpm.toml
+    When I run "lvpm install caraya <flag> --prefix dest"
+    Then the command fails naming "<names>"
+    And the error's next line names "run this in a project"
+    And the working directory has no lvpm.toml
+
+    Examples:
+      | flag               | names          |
+      | --dev              | --dev          |
+      | --group test       | --group        |
+      | --index second     | --index        |

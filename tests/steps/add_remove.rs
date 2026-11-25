@@ -451,6 +451,7 @@ async fn core_routes(world: &mut CliWorld, command_line: String) {
         manifest: None,
         no_deps,
         no_project,
+        saving_flag: None,
     };
     world.add_remove.routed = Some(route::install_mode(&env, &request));
 }
