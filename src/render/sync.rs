@@ -221,21 +221,25 @@ pub fn route_error(error: &RouteError) -> String {
             let (flag, next) = match (option, adding) {
                 (LockIncompatible::NoDeps, false) => (
                     "--no-deps",
-                    "drop --no-deps, or install one package where you choose: \
-                     `lvpm install <package> --no-deps --prefix <dir>`",
+                    "drop --no-deps, or install one package without changing the project: \
+                     `lvpm install <package> --no-deps --no-project --prefix <dir>`",
                 ),
                 (LockIncompatible::NoDeps, true) => (
                     "--no-deps",
-                    "drop --no-deps, or say where the package goes: \
-                     `lvpm install <package> --no-deps --prefix <dir>`",
+                    "drop --no-deps, or install the package without changing the project: \
+                     `lvpm install <package> --no-deps --no-project --prefix <dir>`",
                 ),
                 (LockIncompatible::Manifest, _) => (
                     "--manifest",
-                    "drop --manifest to sync this project, or name a package and where it \
-                     goes: `lvpm install <package> --prefix <dir>`",
+                    "drop --manifest to sync this project, or name a package and install it \
+                     without changing the project: \
+                     `lvpm install <package> --no-project --prefix <dir>`",
                 ),
             };
-            format!("{flag} is {error}\nnext: {next}")
+            format!(
+                "{flag} cannot be used in a project, because lvpm.lock decides the dependencies\n\
+                 next: {next}"
+            )
         }
         RouteError::Other(cause) => format!("{cause:#}"),
     }
@@ -537,13 +541,13 @@ mod tests {
             });
             assert!(
                 text.starts_with(
-                    "--no-deps is not supported with a lock (lvpm.lock always holds the full set)\nnext: "
+                    "--no-deps cannot be used in a project, because lvpm.lock decides the dependencies\nnext: "
                 ),
                 "{text}"
             );
             // The way out of it is never the install it refuses.
             assert!(
-                text.ends_with("`lvpm install <package> --no-deps --prefix <dir>`"),
+                text.ends_with("`lvpm install <package> --no-deps --no-project --prefix <dir>`"),
                 "{text}"
             );
         }

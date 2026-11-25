@@ -8,12 +8,14 @@
 //! `dest` or the project's venv, and the sandbox refuses a command that would
 //! do otherwise (`real_installation_risk`).
 
+use super::lock::name_and_version_pairs;
 use super::sync::{printed_plain, quoted};
 use crate::CliWorld;
 use crate::support::events::RecordingSink;
 use crate::support::feed::BROKEN_FEED_DIR;
 use crate::support::fixtures::{
-    ADD_PACKAGES, DELTA_1, FixturePackage, OMEGA_NEEDING_ALPHA_2, OMEGA_NEEDING_LABVIEW_2026,
+    ADD_PACKAGES, DELTA_1, FixturePackage, INSTALL_PACKAGES, OMEGA_NEEDING_ALPHA_2,
+    OMEGA_NEEDING_LABVIEW_2026,
 };
 use crate::support::golden::Output;
 use crate::support::project::{MANIFEST_FILE, ProjectManifest};
@@ -53,18 +55,16 @@ struct Twin {
     output: Output,
 }
 
-/// What the `Background` gives a world: the fixture packages, and a project
-/// that depends on `beta`, locked and synced into `dest`.
-fn set_up_project(sandbox: &Sandbox) {
-    for package in ADD_PACKAGES {
-        sandbox.put_local_package(package);
-    }
+/// What the `Background` gives a world, once its fixture packages are in the
+/// sandbox's local folder: a project that depends on `name`, locked and synced
+/// into `dest`.
+fn set_up_project(sandbox: &Sandbox, name: &str, constraint: &str) {
     sandbox.use_local_project(Some(PROJECT_LABVIEW));
     manifest_edit::set_file(
         &sandbox.work_dir().join(MANIFEST_FILE),
         &DependencyTable::Dependencies,
-        "beta",
-        ">=1.0",
+        name,
+        constraint,
     )
     .expect("edit the manifest");
     sandbox.make_empty_dest();
@@ -170,10 +170,23 @@ async fn fixture_packages(world: &mut CliWorld) {
 }
 
 #[given(
-    r#"a project with labview "2024" depending on "beta" ">=1.0", locked and synced into scratch destination "dest""#
+    r#"fixture packages "alpha" 1.0, "app" 1.0 requiring "lib" >= 1.0, "app2" 1.0 requiring "lib" >= 1.0, "lib" 1.0, "caraya" 1.0"#
 )]
-async fn the_project(world: &mut CliWorld) {
-    set_up_project(&world.sandbox);
+async fn install_fixture_packages(world: &mut CliWorld) {
+    let ids: Vec<String> = INSTALL_PACKAGES.iter().map(FixturePackage::id).collect();
+    assert_eq!(
+        ids,
+        ["alpha-1.0", "app-1.0", "app2-1.0", "lib-1.0", "caraya-1.0"],
+        "the feature and the fixture table disagree"
+    );
+    world.publish(&INSTALL_PACKAGES.iter().collect::<Vec<_>>());
+}
+
+#[given(
+    regex = r#"^a project with labview "2024" depending on "([^"]+)" "([^"]*)", locked and synced into scratch destination "dest"$"#
+)]
+async fn the_project(world: &mut CliWorld, name: String, constraint: String) {
+    set_up_project(&world.sandbox, &name, &constraint);
     world.note_state();
 }
 
@@ -322,7 +335,10 @@ async fn run_inside_the_project(world: &mut CliWorld, command_line: String) {
 #[when(regex = r#"^I run "([^"]+)", and "([^"]+)" in an identical world$"#)]
 async fn run_in_two_worlds(world: &mut CliWorld, first: String, second: String) {
     let twin = Sandbox::new();
-    set_up_project(&twin);
+    for package in ADD_PACKAGES {
+        twin.put_local_package(package);
+    }
+    set_up_project(&twin, "beta", ">=1.0");
     twin.detect_labview();
     twin.use_loopback_project_for_labview(LABVIEW_YEAR);
     twin.setup_lvpm(&["venv", "create", "--labview-version", LABVIEW_YEAR]);
@@ -397,12 +413,13 @@ async fn core_routes(world: &mut CliWorld, command_line: String) {
     );
     let sink = RecordingSink::default();
     let mut env = world.plain_env(&sink);
-    let (mut package, mut no_deps) = (None, false);
+    let (mut package, mut no_deps, mut no_project) = (None, false, false);
     while let Some(word) = words.next() {
         match word {
             "(none)" => {}
             "--global" => env.flags.global = true,
             "--no-deps" => no_deps = true,
+            "--no-project" => no_project = true,
             "--prefix" => env.flags.prefix = words.next().map(PathBuf::from),
             "--labview-version" => env.flags.labview_version = words.next().map(str::to_string),
             named => package = Some(named),
@@ -412,6 +429,7 @@ async fn core_routes(world: &mut CliWorld, command_line: String) {
         package,
         manifest: None,
         no_deps,
+        no_project,
     };
     world.add_remove.routed = Some(route::install_mode(&env, &request));
 }
@@ -446,6 +464,57 @@ async fn the_lock_and_dest_include(world: &mut CliWorld, name: String, version: 
         world.installed().contains(&pair),
         "{pair:?} is not installed"
     );
+}
+
+/// `dest` or `"other"`: a destination folder of the work directory.
+fn folder_named(world: &CliWorld, said: &str) -> PathBuf {
+    world.sandbox.work_dir().join(said.trim_matches('"'))
+}
+
+/// `lvpm.lock and "other" include "caraya" 1.0 and "alpha" 1.0`
+#[then(regex = r#"^lvpm\.lock and ("[^"]+") include ("[^"]+" \S+(?: and "[^"]+" \S+)*)$"#)]
+async fn the_lock_and_a_folder_include(world: &mut CliWorld, folder: String, packages: String) {
+    world.assert_succeeded();
+    let installed = world.installed_at(&folder_named(world, &folder));
+    for pair in name_and_version_pairs(&packages) {
+        assert!(
+            world.locked_versions().contains(&pair),
+            "{pair:?} is not locked"
+        );
+        assert!(
+            installed.contains(&pair),
+            "{pair:?} is not in {folder}: {installed:?}"
+        );
+    }
+}
+
+#[then(regex = r#"^(dest|"[^"]+") includes "([^"]+)" (\S+)$"#)]
+async fn a_folder_includes(world: &mut CliWorld, folder: String, name: String, version: String) {
+    world.assert_succeeded();
+    let pair = (name, version);
+    let installed = world.installed_at(&folder_named(world, &folder));
+    assert!(
+        installed.contains(&pair),
+        "{pair:?} is not in {folder}: {installed:?}"
+    );
+}
+
+#[then(regex = r#"^dest does not include "([^"]+)"$"#)]
+async fn dest_does_not_include(world: &mut CliWorld, name: String) {
+    world.assert_succeeded();
+    assert!(!world.is_installed(&name), "{name} is installed in dest");
+}
+
+#[then(regex = r#"^the output says "([^"]+)" and names "([^"]+)"$"#)]
+async fn the_output_says_and_names(world: &mut CliWorld, said: String, named: String) {
+    world.assert_succeeded();
+    for part in [said, named] {
+        assert!(
+            world.printed().contains(&part),
+            "{part:?} is not in:\n{}",
+            world.printed()
+        );
+    }
 }
 
 #[then(
@@ -724,12 +793,40 @@ async fn fails_saying_it_is_not_a_dependency(world: &mut CliWorld, name: String)
     );
 }
 
-#[then("the command fails saying --no-deps is not supported with a lock")]
-async fn fails_saying_no_deps_is_refused(world: &mut CliWorld) {
+/// `flag` is the option's name: what follows it on the command line (the
+/// `x.toml` of `--manifest x.toml`) is not part of the message.
+#[then(
+    regex = r"^the command fails saying (--[\w-]+)(?: \S+)? cannot be used in a project, because lvpm\.lock decides the dependencies$"
+)]
+async fn fails_saying_the_lock_decides(world: &mut CliWorld, flag: String) {
     world.assert_failed();
-    let said = "--no-deps is not supported with a lock";
+    let said =
+        format!("{flag} cannot be used in a project, because lvpm.lock decides the dependencies");
     assert!(
-        world.printed().contains(said),
+        world.printed().contains(&said),
+        "{said:?} is not in:\n{}",
+        world.printed()
+    );
+}
+
+#[then(regex = r#"^the error's next line names "([^"]+)"$"#)]
+async fn the_next_line_names(world: &mut CliWorld, flag: String) {
+    world.assert_failed();
+    let printed = printed_plain(world);
+    let next: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.starts_with("next: "))
+        .collect();
+    assert_eq!(next.len(), 1, "one next line in:\n{printed}");
+    assert!(next[0].contains(&flag), "{flag:?} is not in: {}", next[0]);
+}
+
+#[then(regex = r#"^the command fails saying "([^"]+)" was not found$"#)]
+async fn fails_saying_it_was_not_found(world: &mut CliWorld, name: String) {
+    world.assert_failed();
+    let said = format!("{name} is in no configured source");
+    assert!(
+        world.printed().contains(&said),
         "{said:?} is not in:\n{}",
         world.printed()
     );
@@ -841,9 +938,10 @@ fn group_entries(manifest: &str, group: &str) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// One quoted phrase, as a sentence: the other steps of this name take several
-/// parts, a manifest line, or a single word (`first`).
-#[then(regex = r#"^the command fails naming "([^"\[][^"]* [^"]*)"$"#)]
+/// One quoted phrase, as a sentence, or one flag or `<PLACEHOLDER>` as clap
+/// prints it: the other steps of this name take several parts, a manifest
+/// line, or a single word (`first`).
+#[then(regex = r#"^the command fails naming "(<[A-Z_]+>|--[\w-]+|[^"\[][^"]* [^"]*)"$"#)]
 async fn fails_naming_a_phrase(world: &mut CliWorld, said: String) {
     world.assert_failed();
     let printed = world.printed();

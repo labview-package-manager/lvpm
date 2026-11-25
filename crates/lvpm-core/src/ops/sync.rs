@@ -2690,7 +2690,8 @@ beta = \"*\"
     }
 
     #[test]
-    fn a_named_install_with_a_destination_flag_adds_there_and_leaves_lvpm_toml_and_lock_alone() {
+    fn a_no_project_install_with_a_destination_flag_adds_there_and_leaves_lvpm_toml_and_lock_alone()
+    {
         type SetUp = fn(&mut OpEnv);
         let flagged: [(&str, SetUp); 2] = [
             ("global", |env| {
@@ -2720,6 +2721,7 @@ beta = \"*\"
             set_up(&mut env);
             let request = InstallRequest {
                 package: Some("gamma"),
+                no_project: true,
                 ..InstallRequest::default()
             };
             assert_eq!(

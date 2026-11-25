@@ -45,7 +45,7 @@ Feature: Package details
 
   Scenario: info and install share the cache
     Given "lvpm info alpha" has run once
-    When "lvpm install alpha --prefix dest" runs
+    When "lvpm install alpha --no-project --prefix dest" runs
     Then the feed serves no archive request for "alpha" 2.0
 
   Scenario: an unknown package fails and names the sources searched

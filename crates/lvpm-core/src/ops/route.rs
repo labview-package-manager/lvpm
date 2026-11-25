@@ -2,12 +2,13 @@
 //! CLI and any other front end route it the same way.
 //!
 //! In a project, `install` with no package is a sync of the project to its
-//! lock, and with a package and no destination flag it is an `add`. With a
-//! package and a destination flag, or outside a project, it puts that package
-//! where it was asked to, as it always has.
+//! lock, and with a package it is an `add`: the destination flags only pick
+//! where the project syncs. With `--no-project`, or outside a project, it puts
+//! that package where it was asked to and leaves the project alone.
 
 use super::env::OpEnv;
 use crate::errors::{LockIncompatible, RouteError};
+use anyhow::anyhow;
 use std::path::Path;
 
 /// What an install request means.
@@ -16,7 +17,7 @@ pub enum InstallMode {
     /// Make the destination equal `lvpm.lock`: bare install, in a project.
     Sync,
     /// Put the named package in `lvpm.toml`, lock and sync, as `add` does: a
-    /// named install in a project, with no destination flag.
+    /// named install in a project, unless `--no-project`.
     Add,
     /// Put the named package where it was asked to go, and what it needs.
     Additive,
@@ -30,24 +31,31 @@ pub struct InstallRequest<'a> {
     pub manifest: Option<&'a Path>,
     /// `--no-deps`.
     pub no_deps: bool,
+    /// `--no-project`: install directly, leaving the project's files alone.
+    pub no_project: bool,
 }
 
 /// The mode of `request`, in the project `env` runs in, if any.
 ///
-/// A named package is an [`InstallMode::Add`] in a project, unless a
-/// destination flag (`--global`, `--prefix`, `--labview-version`) says where it
-/// goes, and is additive otherwise. With no package, in a project (with or
-/// without a destination flag), it is a sync. Add and sync both take the
-/// lock's full set, so `--no-deps` and `--manifest` are refused for them. With
-/// no package outside a project there is nothing to install.
+/// A named package is an [`InstallMode::Add`] in a project, whatever the
+/// destination flags (`--global`, `--prefix`, `--labview-version`) say about
+/// where the project syncs, unless `--no-project`; it is additive otherwise.
+/// With no package, in a project (with or without a destination flag), it is a
+/// sync. Add and sync both take the lock's full set, so `--no-deps` and
+/// `--manifest` are refused for them. With no package outside a project there
+/// is nothing to install.
 pub fn install_mode(env: &OpEnv, request: &InstallRequest) -> Result<InstallMode, RouteError> {
     let mode = match request.package {
         Some(_) => {
-            let flags = &env.flags;
-            let names_a_destination =
-                flags.global || flags.prefix.is_some() || flags.labview_version.is_some();
-            if names_a_destination || env.manifest_for(None, None)?.is_none() {
-                return Ok(InstallMode::Additive);
+            if request.no_project || env.manifest_for(None, None)?.is_none() {
+                // The one package, installed where it was asked to go, has no
+                // use for another manifest's dependencies.
+                return match request.manifest {
+                    Some(_) => Err(RouteError::Other(anyhow!(
+                        "--manifest cannot be used with a package name"
+                    ))),
+                    None => Ok(InstallMode::Additive),
+                };
             }
             InstallMode::Add
         }
@@ -151,6 +159,7 @@ mod tests {
         package: Some("gamma"),
         manifest: None,
         no_deps: false,
+        no_project: false,
     };
 
     #[test]
@@ -165,25 +174,85 @@ mod tests {
         assert_eq!(mode(&dir, GAMMA).unwrap(), InstallMode::Additive);
     }
 
-    #[test]
-    fn a_destination_flag_keeps_a_named_package_additive_even_in_a_project() {
-        let dir = Dir::new("named-flags", Some(PROJECT));
+    /// A named package in a project (a directory of its own, named by `tag`)
+    /// with `set` done to the environment's flags.
+    fn named_in_a_project_with(tag: &str, set: fn(&mut OpEnv)) -> InstallMode {
+        let dir = Dir::new(tag, Some(PROJECT));
         let sink = NullSink;
-        let flagged: [fn(&mut OpEnv); 3] = [
-            |env| env.flags.global = true,
-            |env| env.flags.prefix = Some(PathBuf::from("dest")),
-            |env| env.flags.labview_version = Some("2026".into()),
-        ];
-        for set in flagged {
-            let mut env = dir.env(&sink);
-            set(&mut env);
+        let mut env = dir.env(&sink);
+        set(&mut env);
+        install_mode(&env, &GAMMA).unwrap()
+    }
+
+    #[test]
+    fn named_in_a_project_with_global_is_add() {
+        let mode = named_in_a_project_with("named-global", |env| env.flags.global = true);
+        assert_eq!(mode, InstallMode::Add);
+    }
+
+    #[test]
+    fn named_in_a_project_with_labview_version_is_add() {
+        let mode = named_in_a_project_with("named-labview-version", |env| {
+            env.flags.labview_version = Some("2026".into())
+        });
+        assert_eq!(mode, InstallMode::Add);
+    }
+
+    #[test]
+    fn named_in_a_project_with_prefix_is_add() {
+        let mode = named_in_a_project_with("named-prefix", |env| {
+            env.flags.prefix = Some(PathBuf::from("dest"))
+        });
+        assert_eq!(mode, InstallMode::Add);
+    }
+
+    #[test]
+    fn no_project_is_additive_in_a_project_and_outside_one() {
+        let request = InstallRequest {
+            no_project: true,
+            ..GAMMA
+        };
+        let in_a_project = Dir::new("no-project-in", Some(PROJECT));
+        assert_eq!(mode(&in_a_project, request).unwrap(), InstallMode::Additive);
+        let outside = Dir::new("no-project-out", None);
+        assert_eq!(mode(&outside, request).unwrap(), InstallMode::Additive);
+    }
+
+    #[test]
+    fn a_manifest_is_refused_with_a_named_package_that_would_install_directly() {
+        let request = InstallRequest {
+            manifest: Some(Path::new("other.toml")),
+            ..GAMMA
+        };
+        let in_a_project = Dir::new("manifest-opted-out", Some(PROJECT));
+        let opted_out = InstallRequest {
+            no_project: true,
+            ..request
+        };
+        let outside = Dir::new("manifest-outside", None);
+        for (dir, request) in [(&in_a_project, opted_out), (&outside, request)] {
+            let why = mode(dir, request).unwrap_err();
             assert_eq!(
-                install_mode(&env, &GAMMA).unwrap(),
-                InstallMode::Additive,
-                "{:?}",
-                env.flags
+                why.to_string(),
+                "--manifest cannot be used with a package name"
             );
         }
+    }
+
+    #[test]
+    fn a_manifest_with_a_named_package_in_a_project_is_refused_as_a_lock_cannot_honour_it() {
+        let dir = Dir::new("manifest-named", Some(PROJECT));
+        let request = InstallRequest {
+            manifest: Some(Path::new("other.toml")),
+            ..GAMMA
+        };
+        assert!(matches!(
+            mode(&dir, request),
+            Err(RouteError::NotWithLock {
+                option: LockIncompatible::Manifest,
+                adding: true
+            })
+        ));
     }
 
     #[test]
@@ -250,9 +319,13 @@ mod tests {
         ));
         let outside = Dir::new("named-no-deps-out", None);
         assert_eq!(mode(&outside, request).unwrap(), InstallMode::Additive);
-        let sink = NullSink;
-        let mut env = in_a_project.env(&sink);
-        env.flags.prefix = Some(PathBuf::from("dest"));
-        assert_eq!(install_mode(&env, &request).unwrap(), InstallMode::Additive);
+        let opted_out = InstallRequest {
+            no_project: true,
+            ..request
+        };
+        assert_eq!(
+            mode(&in_a_project, opted_out).unwrap(),
+            InstallMode::Additive
+        );
     }
 }

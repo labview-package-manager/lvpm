@@ -22,29 +22,29 @@ Feature: The current CLI's output is recorded so later changes can be compared a
     Then stdout, stderr and the exit code equal the recording "<name>"
 
     Examples:
-      | setup                                                   | command                                          | files | name                     |
-      | a project using only the loopback feed                  | lvpm search a                                    | -     | search-a                 |
-      | a project using only the loopback feed                  | lvpm search zzz                                  | -     | search-none              |
-      | a project using only the loopback feed                  | lvpm install beta --dry-run --prefix dest        | dest  | install-dry-run          |
-      | a project using only the loopback feed                  | lvpm install beta --prefix dest                  | dest  | install-beta             |
-      | a project using only the loopback feed                  | lvpm install hooked --prefix dest                | dest  | install-hooked           |
-      | beta installed in dest                                  | lvpm list --prefix dest                          | -     | list-beta                |
-      | an empty dest                                           | lvpm list --prefix dest                          | -     | list-empty               |
-      | beta installed in dest                                  | lvpm uninstall beta --keep-deps --prefix dest    | dest  | uninstall-beta           |
-      | an empty dest                                           | lvpm uninstall beta --prefix dest                | dest  | uninstall-missing        |
-      | a project using only the loopback feed                  | lvpm install does_not_exist --prefix dest        | dest  | install-missing          |
-      | no project                                              | lvpm list --labview-version 2026 --prefix dest   | -     | flags-conflict           |
-      | no project                                              | lvpm config set venv.dir .venv                   | -     | config-set               |
-      | venv.dir set to .venv                                   | lvpm config get venv.dir                         | -     | config-get               |
-      | a folder with alpha 1.0                                 | lvpm cache add folder                            | -     | cache-add                |
-      | no project, default feeds via the loopback proxy        | lvpm search a                                    | -     | search-a-noproject       |
-      | no project, default feeds via the loopback proxy        | lvpm install beta --prefix dest                  | dest  | install-beta-noproject   |
-      | no project, beta installed in dest                      | lvpm list --prefix dest                          | -     | list-beta-noproject      |
-      | no project, beta installed in dest                      | lvpm uninstall beta --keep-deps --prefix dest    | dest  | uninstall-beta-noproject |
-      | a project using the faulty feed                         | lvpm install corrupt --prefix dest               | dest  | install-corrupt          |
-      | a project using the faulty feed                         | lvpm install tampered --prefix dest              | dest  | install-tampered         |
-      | a project using the faulty feed                         | lvpm install missing --prefix dest               | dest  | install-archive-404      |
-      | a project using the catalog feed                        | lvpm search bulk                                 | -     | search-over-cap          |
+      | setup                                            | command                                                | files | name                     |
+      | a project using only the loopback feed           | lvpm search a                                          | -     | search-a                 |
+      | a project using only the loopback feed           | lvpm search zzz                                        | -     | search-none              |
+      | a project using only the loopback feed           | lvpm install beta --dry-run --no-project --prefix dest | dest  | install-dry-run          |
+      | a project using only the loopback feed           | lvpm install beta --no-project --prefix dest           | dest  | install-beta             |
+      | a project using only the loopback feed           | lvpm install hooked --no-project --prefix dest         | dest  | install-hooked           |
+      | beta installed in dest                           | lvpm list --prefix dest                                | -     | list-beta                |
+      | an empty dest                                    | lvpm list --prefix dest                                | -     | list-empty               |
+      | beta installed in dest                           | lvpm uninstall beta --keep-deps --prefix dest          | dest  | uninstall-beta           |
+      | an empty dest                                    | lvpm uninstall beta --prefix dest                      | dest  | uninstall-missing        |
+      | a project using only the loopback feed           | lvpm install does_not_exist --no-project --prefix dest | dest  | install-missing          |
+      | no project                                       | lvpm list --labview-version 2026 --prefix dest         | -     | flags-conflict           |
+      | no project                                       | lvpm config set venv.dir .venv                         | -     | config-set               |
+      | venv.dir set to .venv                            | lvpm config get venv.dir                               | -     | config-get               |
+      | a folder with alpha 1.0                          | lvpm cache add folder                                  | -     | cache-add                |
+      | no project, default feeds via the loopback proxy | lvpm search a                                          | -     | search-a-noproject       |
+      | no project, default feeds via the loopback proxy | lvpm install beta --prefix dest                        | dest  | install-beta-noproject   |
+      | no project, beta installed in dest               | lvpm list --prefix dest                                | -     | list-beta-noproject      |
+      | no project, beta installed in dest               | lvpm uninstall beta --keep-deps --prefix dest          | dest  | uninstall-beta-noproject |
+      | a project using the faulty feed                  | lvpm install corrupt --no-project --prefix dest        | dest  | install-corrupt          |
+      | a project using the faulty feed                  | lvpm install tampered --no-project --prefix dest       | dest  | install-tampered         |
+      | a project using the faulty feed                  | lvpm install missing --no-project --prefix dest        | dest  | install-archive-404      |
+      | a project using the catalog feed                 | lvpm search bulk                                       | -     | search-over-cap          |
 
   Scenario: feed progress lines are recorded, first run and unchanged
     Given a project using only the loopback feed and an empty cache

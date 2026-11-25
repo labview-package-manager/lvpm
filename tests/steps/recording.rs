@@ -216,7 +216,7 @@ const ROWS: &[Row] = &[
         ..row(
             "install-dry-run",
             Setup::LoopbackProject,
-            "lvpm install beta --dry-run --prefix dest",
+            "lvpm install beta --dry-run --no-project --prefix dest",
         )
     },
     Row {
@@ -224,7 +224,7 @@ const ROWS: &[Row] = &[
         ..row(
             "install-beta",
             Setup::LoopbackProject,
-            "lvpm install beta --prefix dest",
+            "lvpm install beta --no-project --prefix dest",
         )
     },
     Row {
@@ -232,7 +232,7 @@ const ROWS: &[Row] = &[
         ..row(
             "install-hooked",
             Setup::LoopbackProject,
-            "lvpm install hooked --prefix dest",
+            "lvpm install hooked --no-project --prefix dest",
         )
     },
     Row {
@@ -240,7 +240,7 @@ const ROWS: &[Row] = &[
         ..row(
             "install-missing",
             Setup::LoopbackProject,
-            "lvpm install does_not_exist --prefix dest",
+            "lvpm install does_not_exist --no-project --prefix dest",
         )
     },
     Row {

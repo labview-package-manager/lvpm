@@ -84,8 +84,8 @@ fn install_records_and_uninstall_protects_shared_dependencies() {
     f.package("private", "shared");
     f.package("other", "shared");
     f.package("shared", "");
-    success(&f.run(&["install", "root", "--no-relink"]));
-    success(&f.run(&["install", "other", "--no-relink"]));
+    success(&f.run(&["install", "root", "--no-relink", "--no-project"]));
+    success(&f.run(&["install", "other", "--no-relink", "--no-project"]));
     assert_eq!(
         text(&f.record("root"))["dependencies"],
         serde_json::json!(["private"])
@@ -132,8 +132,8 @@ fn old_records_refuse_a_dependency_removal_instead_of_guessing() {
     f.package("root", "child");
     f.package("child", "");
     f.package("old", "");
-    success(&f.run(&["install", "root", "--no-relink"]));
-    success(&f.run(&["install", "old", "--no-relink"]));
+    success(&f.run(&["install", "root", "--no-relink", "--no-project"]));
+    success(&f.run(&["install", "old", "--no-relink", "--no-project"]));
     let path = f.record("old");
     let mut record = text(&path);
     record.as_object_mut().unwrap().remove("dependencies");
@@ -156,9 +156,9 @@ fn corrupt_installed_dependency_record_fails_the_install_explicitly() {
     let f = Fixture::new("corrupt-record");
     f.package("root", "child");
     f.package("child", "");
-    success(&f.run(&["install", "root", "--no-relink"]));
+    success(&f.run(&["install", "root", "--no-relink", "--no-project"]));
     std::fs::write(f.record("child"), b"invalid json").unwrap();
-    let output = f.run(&["install", "root", "--no-relink"]);
+    let output = f.run(&["install", "root", "--no-relink", "--no-project"]);
     assert!(!output.status.success());
     assert!(f.record("root").exists());
     assert!(String::from_utf8_lossy(&output.stderr).contains("expected value"));

@@ -220,6 +220,16 @@ pub const ADD_PACKAGES: &[FixturePackage] = &[
     text_package("caraya", "1.0", &[], "20.0"),
 ];
 
+/// What the install and uninstall scenarios of #54 publish: alpha 1.0, app 1.0
+/// and app2 1.0 each requiring lib >= 1.0, lib 1.0, and caraya 1.0.
+pub const INSTALL_PACKAGES: &[FixturePackage] = &[
+    text_package("alpha", "1.0", &[], "20.0"),
+    text_package("app", "1.0", &[("lib", "1.0")], "20.0"),
+    text_package("app2", "1.0", &[("lib", "1.0")], "20.0"),
+    text_package("lib", "1.0", &[], "20.0"),
+    text_package("caraya", "1.0", &[], "20.0"),
+];
+
 /// A delta 1.0, which the add scenarios install by hand, outside the lock.
 pub const DELTA_1: FixturePackage = text_package("delta", "1.0", &[], "20.0");
 

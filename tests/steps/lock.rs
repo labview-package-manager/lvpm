@@ -347,6 +347,7 @@ async fn an_archive_is_cached_and_its_source_unreachable(
     world.sandbox.setup_lvpm(&[
         "install",
         &format!("{name}@{version}"),
+        "--no-project",
         "--prefix",
         DEST_DIR,
     ]);
@@ -434,6 +435,7 @@ async fn world_one_has_a_package_installed(world: &mut CliWorld, name: String, v
     world.sandbox.setup_lvpm(&[
         "install",
         &format!("{name}@{version}"),
+        "--no-project",
         "--prefix",
         DEST_DIR,
     ]);

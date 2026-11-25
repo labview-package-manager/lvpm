@@ -49,7 +49,7 @@ fn install_prepares_new_files_by_default_with_an_opt_out() {
             .current_dir(&root)
             // Adapted from upstream: no `--manifest` or `--no-hooks` here; a
             // scratch prefix runs no hooks.
-            .args(["install", "linkfix_fixture"])
+            .args(["install", "linkfix_fixture", "--no-project"])
             .arg("--prefix")
             .arg(&prefix)
             .args(flags)

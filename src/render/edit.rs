@@ -35,13 +35,24 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 required_by.join(", ")
             ),
         ),
-        Event::InstallAddsToProject { package } => r.line(
-            Stream::Out,
-            &format!(
-                "adding {package} to lvpm.toml and syncing the project to lvpm.lock (to install \
-                 it without changing the project, pass --prefix, --global or --labview-version)"
-            ),
-        ),
+        Event::InstallAddsToProject {
+            package,
+            destination,
+        } => {
+            r.line(
+                Stream::Out,
+                &format!("adding {package} to lvpm.toml and syncing the project to lvpm.lock"),
+            );
+            if let Some(flag) = destination {
+                r.line(
+                    Stream::Out,
+                    &format!(
+                        "note: in a project, {flag} picks where the project syncs; lvpm.toml was \
+                         updated. Pass --no-project to install without changing the project."
+                    ),
+                );
+            }
+        }
         Event::UninstalledStillListed { name, dev, group } => {
             let table = DependencyTable::from_flags(*dev, group.as_deref());
             r.line(
@@ -309,15 +320,31 @@ mod tests {
     }
 
     #[test]
-    fn a_named_install_in_a_project_says_it_is_an_add_and_how_to_install_without_one() {
+    fn a_plain_named_install_in_a_project_says_it_is_an_add_and_nothing_of_an_opt_out() {
         let (mut renderer, out, _) = renderer();
         renderer.render(&Event::InstallAddsToProject {
             package: "gamma@1.0".into(),
+            destination: None,
         });
         assert_eq!(
             out.text(),
-            "adding gamma@1.0 to lvpm.toml and syncing the project to lvpm.lock (to install it \
-             without changing the project, pass --prefix, --global or --labview-version)\n"
+            "adding gamma@1.0 to lvpm.toml and syncing the project to lvpm.lock\n"
+        );
+        assert!(!out.text().contains("--no-project"), "{}", out.text());
+    }
+
+    #[test]
+    fn a_named_install_given_a_destination_flag_says_it_only_picks_where_the_project_syncs() {
+        let (mut renderer, out, _) = renderer();
+        renderer.render(&Event::InstallAddsToProject {
+            package: "gamma".into(),
+            destination: Some("--prefix".into()),
+        });
+        assert_eq!(
+            out.text(),
+            "adding gamma to lvpm.toml and syncing the project to lvpm.lock\n\
+             note: in a project, --prefix picks where the project syncs; lvpm.toml was updated. \
+             Pass --no-project to install without changing the project.\n"
         );
     }
 

@@ -117,10 +117,13 @@ Feature: add and remove edit the manifest, then lock and sync
     Examples:
       | project                        | args                         | mode                              |
       | a project                      | gamma                        | Add                               |
-      | a project                      | gamma --prefix dest          | Additive                          |
-      | a project                      | gamma --global               | Additive                          |
-      | a project                      | gamma --labview-version 2026 | Additive                          |
+      | a project                      | gamma --prefix dest          | Add                               |
+      | a project                      | gamma --global               | Add                               |
+      | a project                      | gamma --labview-version 2026 | Add                               |
+      | a project                      | gamma --no-project           | Additive                          |
+      | a project                      | gamma --no-project --prefix dest | Additive                      |
       | a directory without lvpm.toml  | gamma                        | Additive                          |
+      | a directory without lvpm.toml  | gamma --no-project           | Additive                          |
       | a project                      | (none)                       | Sync                              |
       | a project                      | --prefix dest                | Sync                              |
       | a project                      | --global                     | Sync                              |
@@ -134,18 +137,18 @@ Feature: add and remove edit the manifest, then lock and sync
     Then the first output line says gamma is being added to lvpm.toml and the project synced to lvpm.lock
     And both manifests, locks and destinations are identical
 
-  Scenario Outline: install with a name and an explicit destination stays additive
+  Scenario Outline: --no-project keeps a named install additive
     When I run "lvpm install gamma <flag>" inside the project
     Then gamma is installed in that destination
     And lvpm.toml and lvpm.lock are byte-identical to before
 
     Examples:
-      | flag          |
-      | --prefix dest |
+      | flag                         |
+      | --no-project --prefix dest |
 
   Scenario: install flags that make no sense with a lock are rejected
     When I run "lvpm install --no-deps" inside the project
-    Then the command fails saying --no-deps is not supported with a lock
+    Then the command fails saying --no-deps cannot be used in a project, because lvpm.lock decides the dependencies
 
   Scenario: uninstall inside a project hints at remove
     When I run "lvpm uninstall beta --keep-deps --prefix dest"
@@ -179,9 +182,9 @@ Feature: add and remove edit the manifest, then lock and sync
   # `--global` and `--labview-version` mean is covered by the routing table
   # above, and the unit tests of `install_mode`. That such an install leaves
   # lvpm.toml and lvpm.lock alone runs in core's unit tests against a fake
-  # installation (a_named_install_with_a_destination_flag_adds_there_... in
+  # installation (a_no_project_install_with_a_destination_flag_adds_there_... in
   # ops/sync.rs).
   @labview @unsafe
-  Scenario: install with a name and --global stays additive
-    When I run "lvpm install gamma --global --labview-version 2026" inside the project
+  Scenario: install with a name, --no-project and --global stays additive
+    When I run "lvpm install gamma --no-project --global --labview-version 2026" inside the project
     Then gamma is installed into that LabVIEW and lvpm.toml and lvpm.lock are unchanged

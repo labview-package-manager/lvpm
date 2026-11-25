@@ -264,18 +264,24 @@ enum Cmd {
         dry_run: bool,
     },
     /// Install a package by name, or name@version. In a project, a bare
-    /// install is `lvpm sync` and a named install is `lvpm add`, unless
-    /// --global, --prefix or --labview-version say where it goes.
+    /// install is `lvpm sync` and a named install is `lvpm add`, whatever
+    /// --global, --prefix or --labview-version say: they only pick where the
+    /// project syncs. --no-project installs the package alone, leaving the
+    /// project's files as they are.
     Install {
         /// Package to install. Omit it in a project to sync the project.
         #[arg(conflicts_with_all = ["locked", "frozen", "no_locked", "no_dev", "group"])]
         package: Option<String>,
         /// Not supported with a lock: lvpm.lock always holds the full set.
-        #[arg(long, value_name = "FILE", conflicts_with = "package")]
+        #[arg(long, value_name = "FILE")]
         manifest: Option<PathBuf>,
         /// Do not install dependencies.
         #[arg(long)]
         no_deps: bool,
+        /// Install the package alone, as outside a project: lvpm.toml and
+        /// lvpm.lock are left as they are.
+        #[arg(long, requires = "package", conflicts_with = "project")]
+        no_project: bool,
         /// Replace an installed package with an older version. Without this,
         /// resolving to something older than what is installed is refused.
         #[arg(long)]
@@ -1028,6 +1034,7 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
             package,
             manifest,
             no_deps,
+            no_project,
             allow_downgrade,
             apply,
             sync,
@@ -1036,6 +1043,7 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 package: package.as_deref(),
                 manifest: manifest.as_deref(),
                 no_deps: *no_deps,
+                no_project: *no_project,
             };
             let mode = route::install_mode(&env, &request)
                 .map_err(|why| anyhow!(render::sync::route_error(&why)))?;
@@ -1045,6 +1053,7 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 (InstallMode::Add, Some(spec)) => {
                     env.sink.emit(Event::InstallAddsToProject {
                         package: spec.to_string(),
+                        destination: destination_flag(&env.flags),
                     });
                     cmd_add(&env, spec, DependencyTable::Dependencies, None, apply)
                 }
@@ -1324,6 +1333,19 @@ fn dependency_table(dev: bool, group: Option<&str>) -> Result<DependencyTable> {
         lvpm_core::project::valid_group_name(group)?;
     }
     Ok(table)
+}
+
+/// The destination flag a command was given, as typed: the one a named install
+/// in a project tells the user only picks where the project syncs.
+fn destination_flag(flags: &DestinationFlags) -> Option<String> {
+    let typed = [
+        (flags.global, "--global"),
+        (flags.prefix.is_some(), "--prefix"),
+        (flags.labview_version.is_some(), "--labview-version"),
+    ];
+    typed
+        .into_iter()
+        .find_map(|(given, name)| given.then(|| name.to_string()))
 }
 
 fn cmd_add(

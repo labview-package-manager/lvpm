@@ -478,9 +478,15 @@ pub enum Event {
         name: String,
         required_by: Vec<String>,
     },
-    /// `install` with a package name, inside a project and with no destination
-    /// flag, is an `add`. `package` is as it was typed. The first thing it says.
-    InstallAddsToProject { package: String },
+    /// `install` with a package name, inside a project and without
+    /// `--no-project`, is an `add`. `package` is as it was typed;
+    /// `destination` is the destination flag it was given, if any (`--prefix`),
+    /// which only picks where the project syncs. The first thing it says.
+    InstallAddsToProject {
+        package: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
+    },
     /// An `uninstall` took out a package that `lvpm.toml` still lists, in
     /// `[dev-dependencies]` when `dev`, `[dependency-groups.<group>]` when
     /// `group`: the next sync would put it back.

@@ -1539,7 +1539,7 @@ mod tests {
     fn the_file_listing_is_relative_to_the_working_directory_and_normalised() {
         let sandbox = sandbox_with_feed();
         sandbox.use_loopback_project();
-        sandbox.setup_lvpm(&["install", "alpha", "--prefix", DEST_DIR]);
+        sandbox.setup_lvpm(&["install", "alpha", "--no-project", "--prefix", DEST_DIR]);
         let listing = sandbox.list_files(DEST_DIR);
         assert!(listing.starts_with("dest/\n"), "{listing}");
         assert!(
@@ -1558,7 +1558,7 @@ mod tests {
         let listing_of = || {
             let sandbox = sandbox_with_feed();
             sandbox.use_loopback_project();
-            sandbox.setup_lvpm(&["install", "beta", "--prefix", DEST_DIR]);
+            sandbox.setup_lvpm(&["install", "beta", "--no-project", "--prefix", DEST_DIR]);
             sandbox.list_files(DEST_DIR)
         };
         assert_eq!(

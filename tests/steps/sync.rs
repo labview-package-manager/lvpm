@@ -164,7 +164,12 @@ impl CliWorld {
     }
 
     pub(super) fn installed(&self) -> Vec<(String, String)> {
-        installed_in(&self.dest_dir())
+        self.installed_at(&self.dest_dir())
+    }
+
+    /// What is installed in the destination folder `dest`, by name and version.
+    pub(super) fn installed_at(&self, dest: &Path) -> Vec<(String, String)> {
+        installed_in(dest)
             .into_iter()
             .map(|package| (package.name, package.version))
             .collect()
@@ -206,6 +211,7 @@ impl CliWorld {
         self.sandbox.setup_lvpm(&[
             "install",
             &format!("{name}@{version}"),
+            "--no-project",
             "--prefix",
             DEST_DIR,
         ]);
