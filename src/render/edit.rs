@@ -1451,7 +1451,7 @@ mod tests {
                 "x",
                 None
             ),
-            "next: `lvpm uninstall \"O'Brien\" --no-project --prefix 'a b'` uninstalls it from \
+            "next: `lvpm uninstall 'O''Brien' --no-project --prefix 'a b'` uninstalls it from \
              the target without changing the project"
         );
         assert_eq!(

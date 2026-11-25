@@ -10,6 +10,7 @@ use lvpm_core::install::Manifest;
 use lvpm_core::manifest_edit::DependencyTable;
 use lvpm_core::ops::Destination;
 use lvpm_core::ops::add_remove;
+use lvpm_core::ops::env::shell_word;
 use lvpm_core::ops::install::{self, InstallOptions};
 use lvpm_core::ops::query::{self, Catalog, PackageInfo};
 use lvpm_core::target::{LvTarget, Roots};
@@ -223,7 +224,8 @@ fn run(builder: &EnvBuilder, job: Job, send: &Sender<Done>) -> Done {
                         ..
                     })) => Some(format!(
                         "outside a venv the TUI installs nothing into LabVIEW itself; \
-                         run lvpm install {package} {}",
+                         run lvpm install {} {}",
+                        shell_word(&package),
                         global_flags(&target, &builder.targets)
                     )),
                     _ => None,

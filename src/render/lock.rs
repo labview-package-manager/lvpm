@@ -12,6 +12,7 @@ use lvpm_core::events::{Event, LockChange};
 use lvpm_core::index;
 use lvpm_core::lockfile::{FORMAT_VERSION, StaleReason};
 use lvpm_core::manifest_edit::DependencyTable;
+use lvpm_core::ops::env::shell_word;
 use lvpm_core::project::same_name;
 use lvpm_core::released;
 use lvpm_core::solve::{AllHeldBack, Conflict, Fact};
@@ -215,14 +216,16 @@ pub(super) fn error_for(error: &LockError, rerun: &str) -> String {
         LockError::NoSuchVersion { name, .. } => format!(
             "{error}\n\
              next: look for the versions there are with `lvpm search {name}`, then run \
-             `lvpm lock --upgrade-package {name}@<version>` again"
+             `lvpm lock --upgrade-package {name}@VERSION` again",
+            name = shell_word(name)
         ),
         LockError::NeedsNewerLabview {
             name, project_year, ..
         } => format!(
             "{error}\n\
              next: pick a version that runs on LabVIEW {project_year}, or raise labview in \
-             lvpm.toml, then run `lvpm lock --upgrade-package {name}@<version>` again"
+             lvpm.toml, then run `lvpm lock --upgrade-package {name}@VERSION` again",
+            name = shell_word(name)
         ),
         LockError::PinnedNotListed { package, feed, .. } => {
             let searched = index::index_repo(feed)
@@ -343,7 +346,7 @@ fn general_conflict_text(facts: &[&Fact], rerun: &str) -> String {
         false => {
             let searches: Vec<String> = unlisted
                 .iter()
-                .map(|package| format!("`lvpm search {package}`"))
+                .map(|package| format!("`lvpm search {}`", shell_word(package)))
                 .collect();
             text.push_str(&format!(
                 "look for it with {}, or list a repository under [sources] in lvpm.toml, \
@@ -972,7 +975,7 @@ mod tests {
                     version: "9.9".into(),
                 },
                 "no beta 9.9 is in any source",
-                "`lvpm lock --upgrade-package beta@<version>` again",
+                "`lvpm lock --upgrade-package beta@VERSION` again",
             ),
             (
                 LockError::NeedsNewerLabview {
@@ -982,7 +985,7 @@ mod tests {
                     project_year: 2024,
                 },
                 "beta 2.0 requires LabVIEW 2026; this project is locked for 2024",
-                "`lvpm lock --upgrade-package beta@<version>` again",
+                "`lvpm lock --upgrade-package beta@VERSION` again",
             ),
         ] {
             let text = super::error(&error);

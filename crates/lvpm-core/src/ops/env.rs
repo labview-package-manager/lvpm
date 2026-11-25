@@ -70,27 +70,14 @@ impl DestinationFlags {
 
 /// `word` as one word of a command line a user is told to run. Letters, digits
 /// and `_.,@=:/\+-` stay bare; anything else goes in single quotes, which are
-/// literal in POSIX shells and PowerShell. A word with a `'` goes in double
-/// quotes, with `"`, `$` and the backtick escaped.
-// shortcut: a word with ' is quoted for POSIX shells only, cmd.exe is out of scope; upgrade if Windows users hit it
+/// literal in POSIX shells and PowerShell, with a `'` inside doubled. Nothing
+/// in the word ever expands, so a name a feed supplies cannot run a command.
+// shortcut: a doubled ' is PowerShell's escape; a POSIX shell reads it as two quoted parts and drops the apostrophe. Upgrade if a real package name has one.
 pub fn shell_word(word: &str) -> String {
     let bare = |c: char| c.is_ascii_alphanumeric() || r"_.,@=:/\+-".contains(c);
-    match (
-        word.is_empty() || !word.chars().all(bare),
-        word.contains('\''),
-    ) {
-        (false, _) => word.to_string(),
-        (true, false) => format!("'{word}'"),
-        (true, true) => {
-            let mut quoted = String::from("\"");
-            for c in word.chars() {
-                if "\"$`".contains(c) {
-                    quoted.push('\\');
-                }
-                quoted.push(c);
-            }
-            quoted + "\""
-        }
+    match word.is_empty() || !word.chars().all(bare) {
+        false => word.to_string(),
+        true => format!("'{}'", word.replace('\'', "''")),
     }
 }
 
@@ -746,8 +733,9 @@ mod tests {
             ("a$b", "'a$b'"),
             ("x\"y", "'x\"y'"),
             ("", "''"),
-            ("O'Brien", "\"O'Brien\""),
-            (r#"it's "$HOME" `x`"#, r#""it's \"\$HOME\" \`x\`""#),
+            ("O'Brien", "'O''Brien'"),
+            (r#"it's "$HOME" `x`"#, r#"'it''s "$HOME" `x`'"#),
+            (r"x'\$(id)", r"'x''\$(id)'"),
         ] {
             assert_eq!(shell_word(word), said, "{word:?}");
         }
