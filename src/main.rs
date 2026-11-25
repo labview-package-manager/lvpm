@@ -1051,9 +1051,11 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 (InstallMode::Sync, _) => cmd_sync(&env, &sync.options(apply, env.headless)),
                 // A named install in a project is an add, and always names one.
                 (InstallMode::Add, Some(spec)) => {
+                    // A lookup that fails fails the sync after it with the same error.
+                    let venv_wins = env.find_venv().is_ok_and(|venv| venv.is_some());
                     env.sink.emit(Event::InstallAddsToProject {
                         package: spec.to_string(),
-                        destination: destination_flag(&env.flags),
+                        destination: destination_flag(&env.flags, venv_wins),
                     });
                     cmd_add(&env, spec, DependencyTable::Dependencies, None, apply)
                 }
@@ -1335,13 +1337,17 @@ fn dependency_table(dev: bool, group: Option<&str>) -> Result<DependencyTable> {
     Ok(table)
 }
 
-/// The destination flag a command was given, as typed: the one a named install
-/// in a project tells the user only picks where the project syncs.
-fn destination_flag(flags: &DestinationFlags) -> Option<String> {
+/// The destination flag that picked the target, as typed: the one a named
+/// install in a project tells the user only picks where the project syncs.
+/// `--labview-version` picks nothing when a venv wins (see `OpEnv::destination`).
+fn destination_flag(flags: &DestinationFlags, venv_wins: bool) -> Option<String> {
     let typed = [
         (flags.global, "--global"),
         (flags.prefix.is_some(), "--prefix"),
-        (flags.labview_version.is_some(), "--labview-version"),
+        (
+            flags.labview_version.is_some() && !venv_wins,
+            "--labview-version",
+        ),
     ];
     typed
         .into_iter()
@@ -1898,6 +1904,31 @@ fn cmd_vi_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labview_version_is_not_the_destination_flag_when_a_venv_wins() {
+        let version = DestinationFlags {
+            labview_version: Some("2026".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            destination_flag(&version, false).as_deref(),
+            Some("--labview-version")
+        );
+        assert_eq!(destination_flag(&version, true), None);
+        // --prefix and --global win over a venv, so they are still named.
+        let prefix = DestinationFlags {
+            prefix: Some("dest".into()),
+            labview_version: Some("2026".into()),
+            ..Default::default()
+        };
+        assert_eq!(destination_flag(&prefix, true).as_deref(), Some("--prefix"));
+        let global = DestinationFlags {
+            global: true,
+            ..Default::default()
+        };
+        assert_eq!(destination_flag(&global, true).as_deref(), Some("--global"));
+    }
 
     #[test]
     fn lvpm_tui_refuses_every_global_option() {

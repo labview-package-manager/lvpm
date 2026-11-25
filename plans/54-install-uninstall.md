@@ -54,8 +54,8 @@ write into the system Python, as lvpm's writes need `--global`. lvpm already has
 | Real LabVIEW (user's decision 2026-11-25) | `--global` is required for every write into an installation: install, uninstall, sync, relink, add, remove, run-hooks. `--labview-version` picks which one; alone it fails naming `--global`. `--global` without `--labview-version` takes the manifest's `labview` in a project, else the only installation. Reads (`list`, `vi-*`, linkfix, launch), `venv create`, `init`, `refresh` and `start` are unchanged. Headless counts as consent, with or without lvpm.toml. The TUI's no-venv install is refused. |
 | Destination flags | Pick the target only. A named `install`/`uninstall` in a project edits the project whatever the destination flag. |
 | Opt-out | `--no-project` on `install` and `uninstall`: `requires = "package"`, `conflicts_with = "project"`. Outside a project it is accepted and changes nothing. It conflicts with the saving flags (`--dev`, `--index`; `--group` with a package is refused in `install_mode`). |
-| Behaviour change (release note #58, PR body list) | (1) `install x --prefix/--global/--labview-version` inside a project now edits lvpm.toml. (2) `uninstall x` of a package the project lists now takes it out of lvpm.toml. (3) `uninstall x` of a package another locked one requires fails. (4) `uninstall x` in a project, x not listed, fails. (5) `--keep-deps`/`--force` need `--no-project` in a project. (6) `add`/`remove` outside a project install/uninstall directly instead of refusing. (7) `--json` names `add`/`remove` as `install`/`uninstall`. (8) `--labview-version YYYY` alone no longer writes into LabVIEW YYYY; add `--global` (the 0.3.1 README form `lvpm install x --labview-version 2026` fails with that hint). (9) `--global` alone picks the venv's, the manifest's or the only LabVIEW instead of failing. (10) The TUI no longer installs into the newest LabVIEW when there is no venv. |
-| Upgrader signal | When a named project install or uninstall was given a destination flag, it prints: "note: in a project, --prefix picks where the project syncs; lvpm.toml was updated. Pass --no-project to install without changing the project." (flag named as typed). A plain `install x` prints the existing "adding x to lvpm.toml" line without the opt-out. |
+| Behaviour change (release note #58, PR body list) | (1) `install x --prefix/--global/--labview-version` inside a project now edits lvpm.toml. (2) `uninstall x` of a package the project lists now takes it out of lvpm.toml. (3) `uninstall x` of a package another locked one requires fails. (4) `uninstall x` in a project, x not listed, fails. (5) `--keep-deps`/`--force` need `--no-project` in a project. (6) `add`/`remove` outside a project install/uninstall directly instead of refusing. (7) `--json` names `add`/`remove` as `install`/`uninstall`. (8) `--labview-version YYYY` alone no longer writes into LabVIEW YYYY; add `--global` (the 0.3.1 README form `lvpm install x --labview-version 2026` fails with that hint). (9) `--global` alone picks the venv's, the manifest's or the only LabVIEW instead of failing. (10) The TUI no longer installs into the newest LabVIEW when there is no venv. (11) Outside a project `install x --manifest y` fails with "--manifest cannot be used with a package name" (exit 1; clap's `manifest conflicts_with = "package"` was removed, so it is no longer clap's exit 2). |
+| Upgrader signal | When a named project install or uninstall was given a destination flag, it prints: "note: in a project, --prefix picks where the project syncs; lvpm.toml gets x. Pass --no-project to install without changing the project." (flag named as typed; present tense, as it is printed before the add runs, which can still fail, and `--dry-run` writes nothing). `--labview-version` is named only when no venv wins: `OpEnv::destination` lets a venv at or above the cwd beat it. A plain `install x` prints the existing "adding x to lvpm.toml" line without the opt-out. |
 | `uninstall` flags in a project | `--with-deps` is what happens anyway, so it is accepted. `--keep-deps` and `--force` are refused, naming `--no-project`: the lock decides what stays, and a sync would undo either. uv has neither on `uv remove`. |
 | `uninstall` gains `remove`'s flags | `--dev`, `--group` and flattened `ApplyArgs`. On a direct route `--dev`, `--group` and the `ApplyArgs` bools (`--dry-run`, `--no-linkfix`, `--relink`, `--hooks`) are refused ("only a project uninstall takes it"); the `RelinkArgs` values are ignored there, as they cannot be told from their defaults. Direct uninstall takes none of these today, so nothing that works breaks. |
 | `--group` on install | With a package it names the table to save into; without one it keeps meaning "also install this group". The help says both; a wrong use says which meaning applied. #68 may move the second meaning to `--with`. `asks_for_and_against_dev` (main.rs:875) only checks the sync meaning. |
@@ -96,12 +96,15 @@ Feature: install and uninstall are the project commands
     Given fixture packages "alpha" 1.0, "app" 1.0 requiring "lib" >= 1.0, "app2" 1.0 requiring "lib" >= 1.0, "lib" 1.0, "caraya" 1.0
     And a project with labview "2024" depending on "alpha" "*", locked and synced into scratch destination "dest"
 
+  # Every command here that reaches a destination names one: a project with no
+  # venv has none of its own, and the sandbox never writes into a LabVIEW.
+  # "the output does not mention --no-project" is covered by the renderer unit
+  # test in src/render/edit.rs, not here.
   Scenario: a named install edits the project
-    When I run "lvpm install caraya"
+    When I run "lvpm install caraya --prefix dest"
     Then lvpm.toml says "caraya" = ">=1.0"
     And lvpm.lock and dest include "caraya" 1.0
     And the output says "adding caraya to lvpm.toml"
-    And the output does not mention "--no-project"
 
   Scenario: a destination flag picks where the project syncs, and install still edits it
     When I run "lvpm install caraya --prefix other"
@@ -132,8 +135,8 @@ Feature: install and uninstall are the project commands
       | --manifest x.toml |
 
   Scenario: an unknown package changes nothing
-    When I run "lvpm install zeta"
-    Then the command fails saying "zeta" was not found
+    When I run "lvpm install zeta --prefix dest"
+    Then the command fails saying "zeta" is in no configured source
     And nothing changed
 
   Scenario Outline: --no-project needs a package, and is not --project
@@ -144,7 +147,6 @@ Feature: install and uninstall are the project commands
     Examples:
       | args                                  | names        |
       | install --no-project                  | <PACKAGE>    |
-      | uninstall --no-project                | <PACKAGE>    |
       | install caraya --no-project --project . | --project  |
 
   Scenario: --no-project outside a project is a direct install, as without it
@@ -160,7 +162,7 @@ Bare `install` in and outside a project, and a named install outside one, stay c
 #### Step 1.1: Route a named install by --no-project, not by destination flag
 
 **Complexity**: complex (routing change plus a repo-wide migration)
-**IMPLEMENT**: `InstallRequest` gains `no_project: bool`. `install_mode`: a named package is `Add` in a project unless `no_project`; the destination-flag test goes. `Cmd::Install` gets `--no-project` (`requires = "package"`, `conflicts_with = "project"`). `Event::InstallAddsToProject` gains `destination: Option<String>` (the flag as typed); its rendering adds the upgrader note only when it is set. `NotWithLock` text: "{flag} cannot be used in a project, because lvpm.lock decides the dependencies", next line `lvpm install <package> {flag} --no-project ...`. New steps in tests/steps/add_remove.rs: `lvpm.toml says`, `lvpm.lock and <dest> include`, `<dest> includes`/`does not include`, `the output does not mention`, `the error's next line names`, the multi-package fixture with `requiring`; widen `the command fails naming "..."` (add_remove.rs:846) to accept a single token.
+**IMPLEMENT**: `InstallRequest` gains `no_project: bool`. `install_mode`: a named package is `Add` in a project unless `no_project`; the destination-flag test goes. `Cmd::Install` gets `--no-project` (`requires = "package"`, `conflicts_with = "project"`) and loses `manifest conflicts_with = "package"`, so `install_mode` refuses the pair with the same text in a project or outside one. `Event::InstallAddsToProject` gains `destination: Option<String>` (the flag as typed); its rendering adds the upgrader note only when it is set. `NotWithLock` text: "{flag} cannot be used in a project, because lvpm.lock decides the dependencies", next line `lvpm install <package> {flag} --no-project ...`. New steps in tests/steps/add_remove.rs: `lvpm.toml says`, `lvpm.lock and <dest> include`, `<dest> includes`/`does not include`, `the error's next line names`, the multi-package fixture with `requiring`; widen `the command fails naming "..."` (add_remove.rs:846) to accept a single token.
 **TEST**: The scenarios above, file added to `FEATURE_FILES`. `route.rs` unit tests named in the first criterion, plus `no_project` is `Additive` in and outside a project. Then migrate: every scenario, step and sandbox helper that runs a named `install` with a destination flag inside a project to install directly gets `--no-project`. Find them with both orders (`install [a-z_]* .*--(prefix|global|labview-version)` and `install .*--(prefix|global|labview-version).* [a-z_]+`) and the `&["install", ...]` arrays in tests/steps and tests/support. Then a one-off check, not committed: make `InstallMode::Add` panic when a destination flag is set, run the suite, and confirm every panic is a scenario meant to edit the project. Golden outputs keep their bytes; only a recorded command line may change. slice-13's outline "install with a name and an explicit destination stays additive" becomes "--no-project keeps a named install additive", and its `@unsafe` `--global` scenario gets `--no-project`. Full suite green.
 **REFACTOR**: Drop the now unused destination test from `install_mode`.
 **Files**: `src/main.rs`, `crates/lvpm-core/src/ops/route.rs`, `crates/lvpm-core/src/events.rs`, `src/render/edit.rs`, `src/render/sync.rs`, `tests/features/fork-adoption/54-install-uninstall.feature`, `tests/acceptance.rs`, `tests/steps/add_remove.rs`, `tests/features/**/*.feature`, `tests/steps/*.rs`, `tests/support/sandbox.rs`, `tests/golden/**`
@@ -256,6 +258,11 @@ Bare `install` in and outside a project, and a named install outside one, stay c
       | flag        |
       | --keep-deps |
       | --force     |
+
+  Scenario: uninstall --no-project needs a package
+    When I run "lvpm uninstall --no-project"
+    Then the command fails naming "<PACKAGE>"
+    And nothing changed
 
   Scenario Outline: --no-project and --all keep uninstall direct
     When I run "lvpm uninstall <args>"
@@ -653,7 +660,7 @@ See each step.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo fmt --check`
 - [ ] `/dev-team:code-review` passes
-- [ ] PR body lists the ten behaviour changes for the release note (#58)
+- [ ] PR body lists the eleven behaviour changes for the release note (#58)
 
 ## Skipped (low value)
 

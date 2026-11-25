@@ -198,7 +198,7 @@ pub fn install(env: &OpEnv, package: Option<&str>, opts: &InstallOptions) -> Res
     // when a single package is named.
     let found = env.manifest_for(None, bound.as_deref())?;
     let Some(package) = package else {
-        bail!("give a package name, or --manifest <FILE>");
+        bail!("give a package name");
     };
     let wanted = vec![named(package)?];
 

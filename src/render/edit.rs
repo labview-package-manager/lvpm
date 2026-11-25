@@ -47,8 +47,8 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 r.line(
                     Stream::Out,
                     &format!(
-                        "note: in a project, {flag} picks where the project syncs; lvpm.toml was \
-                         updated. Pass --no-project to install without changing the project."
+                        "note: in a project, {flag} picks where the project syncs; lvpm.toml gets \
+                         {package}. Pass --no-project to install without changing the project."
                     ),
                 );
             }
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(
             out.text(),
             "adding gamma to lvpm.toml and syncing the project to lvpm.lock\n\
-             note: in a project, --prefix picks where the project syncs; lvpm.toml was updated. \
+             note: in a project, --prefix picks where the project syncs; lvpm.toml gets gamma. \
              Pass --no-project to install without changing the project.\n"
         );
     }

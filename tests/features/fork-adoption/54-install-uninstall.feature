@@ -46,7 +46,7 @@ Feature: install and uninstall are the project commands
 
   Scenario: an unknown package changes nothing
     When I run "lvpm install zeta --prefix dest"
-    Then the command fails saying "zeta" was not found
+    Then the command fails saying "zeta" is in no configured source
     And nothing changed
 
   Scenario Outline: --no-project needs a package, and is not --project

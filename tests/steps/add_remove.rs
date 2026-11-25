@@ -821,8 +821,8 @@ async fn the_next_line_names(world: &mut CliWorld, flag: String) {
     assert!(next[0].contains(&flag), "{flag:?} is not in: {}", next[0]);
 }
 
-#[then(regex = r#"^the command fails saying "([^"]+)" was not found$"#)]
-async fn fails_saying_it_was_not_found(world: &mut CliWorld, name: String) {
+#[then(regex = r#"^the command fails saying "([^"]+)" is in no configured source$"#)]
+async fn fails_saying_it_is_in_no_configured_source(world: &mut CliWorld, name: String) {
     world.assert_failed();
     let said = format!("{name} is in no configured source");
     assert!(

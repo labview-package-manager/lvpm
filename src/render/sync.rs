@@ -211,7 +211,7 @@ pub(super) fn incomplete_body(done: &[SyncStep], left: &[SyncStep], cause: &str)
 pub fn route_error(error: &RouteError) -> String {
     match error {
         RouteError::NoPackage { searched_from } => format!(
-            "give a package name, or --manifest <FILE>\n\
+            "give a package name\n\
              there is no project to sync: no lvpm.toml found in {} or above\n\
              next: name a package to install, or run this in a project, a directory with an \
              lvpm.toml",
@@ -229,9 +229,15 @@ pub fn route_error(error: &RouteError) -> String {
                     "drop --no-deps, or install the package without changing the project: \
                      `lvpm install <package> --no-deps --no-project --prefix <dir>`",
                 ),
-                (LockIncompatible::Manifest, _) => (
+                (LockIncompatible::Manifest, false) => (
                     "--manifest",
                     "drop --manifest to sync this project, or name a package and install it \
+                     without changing the project: \
+                     `lvpm install <package> --no-project --prefix <dir>`",
+                ),
+                (LockIncompatible::Manifest, true) => (
+                    "--manifest",
+                    "drop --manifest to add <package> to this project, or install the package \
                      without changing the project: \
                      `lvpm install <package> --no-project --prefix <dir>`",
                 ),
@@ -554,15 +560,41 @@ mod tests {
     }
 
     #[test]
+    fn manifest_in_a_project_says_to_sync_or_to_add_by_whether_a_package_is_named() {
+        let said = |adding| {
+            route_error(&RouteError::NotWithLock {
+                option: LockIncompatible::Manifest,
+                adding,
+            })
+        };
+        let syncing = said(false);
+        assert!(
+            syncing.starts_with(
+                "--manifest cannot be used in a project, because lvpm.lock decides the dependencies\nnext: drop --manifest to sync this project, "
+            ),
+            "{syncing}"
+        );
+        let adding = said(true);
+        assert!(
+            adding.contains("next: drop --manifest to add <package> to this project, "),
+            "{adding}"
+        );
+        assert!(!adding.contains("sync this project"), "{adding}");
+        for text in [&syncing, &adding] {
+            assert!(
+                text.ends_with("`lvpm install <package> --no-project --prefix <dir>`"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn nothing_to_install_outside_a_project_starts_with_the_text_it_always_had_and_says_where_it_looked()
      {
         let text = route_error(&RouteError::NoPackage {
             searched_from: PathBuf::from("here"),
         });
-        assert!(
-            text.starts_with("give a package name, or --manifest <FILE>\n"),
-            "{text}"
-        );
+        assert!(text.starts_with("give a package name\n"), "{text}");
         assert!(
             text.contains("no lvpm.toml found in here or above"),
             "{text}"
