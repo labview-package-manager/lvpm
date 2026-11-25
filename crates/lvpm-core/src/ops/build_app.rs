@@ -254,14 +254,11 @@ pub fn build_ready(
     })
 }
 
-/// The wrapper VI, embedded so the executable needs no companion file. It
-/// calls NI's `BuildTargetBuildSpecification.vi`, whose error cluster lvpm
-/// cannot read over VI Server, and flattens its answer into the controls and
-/// indicators below. Saved in LabVIEW 2026.
-const BUILD_VI_BYTES: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/src/lv-src/build-app.vi"
-));
+/// The wrapper VI, `build-app.vi`, shipped beside the executable as the relink
+/// VI is. It calls NI's `BuildTargetBuildSpecification.vi`, whose error
+/// cluster lvpm cannot read over VI Server, and flattens its answer into the
+/// controls and indicators below. Saved in LabVIEW 2026.
+const BUILD_VI_FILE: &str = "build-app.vi";
 
 /// The oldest LabVIEW that opens the wrapper VI: the one it was saved in.
 pub const MIN_LABVIEW_YEAR: u32 = 2026;
@@ -304,9 +301,13 @@ impl AppLauncher for VenvAppLauncher {
     }
 }
 
-/// Write the wrapper VI into `dir`, as the relink VI is.
+/// Copy the shipped wrapper VI into `dir`, as the relink VI is.
 fn materialize(dir: &Path) -> anyhow::Result<PathBuf> {
-    relink::materialize_vi(dir, "lvpm-build-app", BUILD_VI_BYTES)
+    let bytes = relink::shipped_vi(
+        &relink::shipped_vi_candidates(BUILD_VI_FILE),
+        env!("LVPM_BUILD_APP_VI_MD5"),
+    )?;
+    relink::materialize_vi(dir, "lvpm-build-app", &bytes)
 }
 
 /// A LabVIEW lvpm talks to over VI Server. Dropping it closes it, whether the
@@ -1121,9 +1122,10 @@ mod tests {
     }
 
     #[test]
-    fn the_embedded_wrapper_is_a_labview_2026_vi_that_has_every_label_lvpm_uses() {
+    fn the_shipped_wrapper_is_a_labview_2026_vi_that_has_every_label_lvpm_uses() {
         let vi = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lv-src/build-app.vi");
         assert_eq!(crate::ops::resave::saved_major(&vi), Some(26));
+        let bytes = std::fs::read(&vi).unwrap();
         for label in [
             PROJECT_CONTROL,
             BUILD_SPEC_CONTROL,
@@ -1132,7 +1134,7 @@ mod tests {
             MESSAGE_INDICATOR,
             DONE_INDICATOR,
         ] {
-            let found = BUILD_VI_BYTES
+            let found = bytes
                 .windows(label.len())
                 .any(|window| window == label.as_bytes());
             assert!(found, "the wrapper VI has no label {label:?}");
@@ -1140,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wrapper_is_written_where_asked_and_is_the_embedded_one() {
+    fn the_wrapper_is_written_where_asked_and_is_the_shipped_one() {
         let dir = testing::scratch_dir("app-materialize").join("work");
         let vi = materialize(&dir).unwrap();
         assert_eq!(vi.parent(), Some(dir.as_path()));
@@ -1150,7 +1152,8 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("lvpm-build-app-")
         );
-        assert_eq!(std::fs::read(&vi).unwrap(), BUILD_VI_BYTES);
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lv-src/build-app.vi");
+        assert_eq!(std::fs::read(&vi).unwrap(), std::fs::read(shipped).unwrap());
         std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 

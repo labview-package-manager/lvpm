@@ -7,7 +7,7 @@
 //! resolve the links; only saving it persists that.
 //!
 //! The load-resolve-save cycle itself lives in LabVIEW, in
-//! `lv-src/relink-package.vi`, whose whole interface is one string in and one
+//! `lv-src/relink-package.vi` (shipped beside the executable), whose whole interface is one string in and one
 //! boolean out:
 //!
 //! ```text
@@ -100,17 +100,68 @@ pub(crate) fn is_lv_item(p: &Path) -> bool {
         .is_some_and(|e| LV_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
-const RELINK_VI_BYTES: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/src/lv-src/relink-package.vi"
-));
-
-/// Materialize the bundled relink VI in `dir` so LabVIEW can open it by path.
-///
-/// The VI is embedded in the executable at compile time, so the installed
-/// executable does not depend on the source checkout or a companion file.
+/// Copy the relink VI that ships beside lvpm into `dir`, so LabVIEW can open
+/// it by path.
 pub fn locate_vi(dir: &Path) -> Result<PathBuf> {
-    materialize_vi(dir, "lvpm-relink-package", RELINK_VI_BYTES)
+    let bytes = shipped_vi(
+        &shipped_vi_candidates("relink-package.vi"),
+        env!("LVPM_RELINK_VI_MD5"),
+    )?;
+    materialize_vi(dir, "lvpm-relink-package", &bytes)
+}
+
+/// Where a VI lvpm ships may be: beside the executable (a release), beside
+/// the file it resolves to when started through a link, then the checkout
+/// this lvpm was built from (`cargo run`, tests).
+///
+/// The VIs used to be compiled in and written out on use, which is what a
+/// dropper does: Microsoft Defender flagged the unsigned exe for it. The
+/// release archives and the MSI carry them as files beside `lvpm` instead.
+pub(crate) fn shipped_vi_candidates(file: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        // Windows reports the link's own path; Linux already resolves it.
+        for exe in [exe.clone(), std::fs::canonicalize(&exe).unwrap_or(exe)] {
+            if let Some(vi) = exe.parent().map(|d| d.join(file))
+                && !found.contains(&vi)
+            {
+                found.push(vi);
+            }
+        }
+    }
+    found.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lv-src")
+            .join(file),
+    );
+    found
+}
+
+/// The bytes of the first candidate that exists, if its MD5 is `md5`, the
+/// hash build.rs recorded. A VI from another build is refused rather than
+/// passed over, so a stale copy beside lvpm is never hidden by the checkout.
+pub(crate) fn shipped_vi(candidates: &[PathBuf], md5: &str) -> Result<Vec<u8>> {
+    let version = env!("CARGO_PKG_VERSION");
+    let Some((path, bytes)) = candidates
+        .iter()
+        .find_map(|p| std::fs::read(p).ok().map(|b| (p, b)))
+    else {
+        let expected = candidates
+            .first()
+            .map_or_else(String::new, |p| p.display().to_string());
+        bail!(
+            "lvpm's VI {expected} is missing: it is installed beside lvpm.              Reinstall lvpm {version}"
+        );
+    };
+    let found = crate::index::md5_hex(&bytes);
+    if found != md5 {
+        bail!(
+            "{} (md5 {found}) is from another lvpm build; lvpm {version} needs the one              with md5 {md5}. Reinstall lvpm so the executable and its VIs come from the              same release",
+            path.display()
+        );
+    }
+    Ok(bytes)
 }
 
 /// Write `bytes` as `<stem>-<lvpm version>.vi` in `dir`, which is made, so
@@ -532,6 +583,41 @@ mod tests {
         #[allow(clippy::permissions_set_readonly_false)]
         held.set_readonly(false);
         std::fs::set_permissions(&vi, held).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A missing candidate is skipped, the first VI found decides: one from
+    /// another build is refused with its path and the hash this build expects,
+    /// even when a matching one comes later, and the matching one is taken.
+    #[test]
+    fn takes_only_the_vi_this_build_was_made_with() {
+        let dir = crate::ops::testing::scratch_dir("shipped-vi");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.vi");
+        let stale = dir.join("stale.vi");
+        std::fs::write(&stale, b"another build").unwrap();
+        let md5 = env!("LVPM_RELINK_VI_MD5");
+        let checkout = shipped_vi_candidates("relink-package.vi").pop().unwrap();
+        assert_eq!(
+            checkout,
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lv-src/relink-package.vi")
+        );
+
+        let err = shipped_vi(std::slice::from_ref(&missing), md5)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing.vi") && err.contains("Reinstall lvpm"),
+            "{err}"
+        );
+
+        let err = shipped_vi(&[missing.clone(), stale, checkout.clone()], md5)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stale.vi") && err.contains(md5), "{err}");
+
+        let bytes = shipped_vi(&[missing, checkout], md5).unwrap();
+        assert_eq!(crate::index::md5_hex(&bytes), md5);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -17,7 +17,8 @@
     - Files in the user profile cannot be component key paths (ICE38), so
       each component is keyed by a value under HKCU\Software\lvpm, and the
       folders are removed on uninstall (ICE64).
-  Upstream also ships its relink VI beside lvpm.exe; this lvpm embeds it.
+    - Ships relink-package.vi and build-app.vi beside lvpm.exe, which
+      looks for them there (crates/lvpm-core/src/relink.rs).
 
   cargo-wix variables used here: Version, CargoTargetBinDir.
 -->
@@ -69,6 +70,16 @@
                             <RemoveFolder Id='RemoveBin' Directory='Bin' On='uninstall'/>
                             <RemoveFolder Id='RemoveApplicationFolder' Directory='APPLICATIONFOLDER' On='uninstall'/>
                         </Component>
+                        <Component Id='RelinkVi' Guid='4D9788CF-437A-46AE-A4B8-E24872417C1A'>
+                            <File Id='relinkvi' Name='relink-package.vi' DiskId='1' Source='crates\lvpm-core\src\lv-src\relink-package.vi'/>
+                            <RegistryValue Root='HKCU' Key='Software\lvpm' Name='relink-package.vi'
+                                Type='string' Value='[#relinkvi]' KeyPath='yes'/>
+                        </Component>
+                        <Component Id='BuildAppVi' Guid='F2A149B8-A54B-4EAE-8EBC-6DE29EEDE08C'>
+                            <File Id='buildappvi' Name='build-app.vi' DiskId='1' Source='crates\lvpm-core\src\lv-src\build-app.vi'/>
+                            <RegistryValue Root='HKCU' Key='Software\lvpm' Name='build-app.vi'
+                                Type='string' Value='[#buildappvi]' KeyPath='yes'/>
+                        </Component>
                         <Component Id='Path' Guid='5B493AB7-0E84-4A8E-8B3F-A0E99B41FE04'>
                             <Environment
                                 Id='PATH'
@@ -103,6 +114,8 @@
             Absent='disallow'>
 
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='RelinkVi'/>
+            <ComponentRef Id='BuildAppVi'/>
             <ComponentRef Id='Notices'/>
 
             <Feature

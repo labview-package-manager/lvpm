@@ -18,7 +18,8 @@
 //! ```
 //!
 //! On the host, `run` gives each suite a fresh container with a work folder
-//! mounted that holds this executable, lvpm and the suite's fixtures, and
+//! mounted that holds this executable, lvpm (with the VIs that sit next to
+//! it) and the suite's fixtures, and
 //! runs `lvpm-e2e checks <suite>` in it: one line per check (libtest-mimic).
 //! See docs/linux.md for what each check is evidence of.
 //!
@@ -48,6 +49,8 @@ const USAGE: &str = "usage: lvpm-e2e run --image <image> --lvpm <lvpm executable
                      [--suite local|public|all] [--packages <name,...>] \
                      [--isolation <mode>] [--work <dir>] [-- <test arguments>]";
 const EXE: &str = std::env::consts::EXE_SUFFIX;
+/// The VIs lvpm ships next to its executable.
+const SHIPPED_VIS: [&str; 2] = ["relink-package.vi", "build-app.vi"];
 /// Set on the container, so `checks` never runs against a real LabVIEW: it
 /// ends with `lvpm uninstall --all`.
 const MARKER: &str = "LVPM_E2E_CONTAINER";
@@ -218,6 +221,17 @@ fn run_suite(run: &Run, suite: Suite) -> Result<bool> {
         &work.join(format!("lvpm-e2e{EXE}")),
     )?;
     executable(&run.lvpm, &work.join(format!("lvpm{EXE}")))?;
+    // lvpm looks for its VIs beside itself; inside the container there is no
+    // checkout to fall back on.
+    for vi in SHIPPED_VIS {
+        let from = run.lvpm.with_file_name(vi);
+        std::fs::copy(&from, work.join(vi)).with_context(|| {
+            format!(
+                "copying {} (lvpm's VIs must sit next to --lvpm)",
+                from.display()
+            )
+        })?;
+    }
     match suite {
         Suite::Local => fixtures::local(&work)?,
         Suite::Public => fixtures::public(&work, &run.packages)?,

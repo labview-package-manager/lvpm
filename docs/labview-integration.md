@@ -3,8 +3,9 @@
 ## Relinking
 
 Freshly unpacked VIs still declare the paths their build machine wrote.
-`lvpm install` therefore ends with a relink pass: a small relink VI, embedded
-in `lvpm.exe` and written to `%TEMP%` when needed, is driven over every
+`lvpm install` therefore ends with a relink pass: a small relink VI, shipped
+beside `lvpm.exe` as `relink-package.vi` and copied to lvpm's work folder when
+needed, is driven over every
 installed package folder through VI Server. It loads each VI, lets LabVIEW
 resolve the links, saves, and reports the files it actually rewrote. The VI
 is saved for LabVIEW 2020, so any LabVIEW from 2020 on can load it.

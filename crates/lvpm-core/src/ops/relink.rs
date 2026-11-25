@@ -8,7 +8,7 @@ use crate::target::{LvTarget, Roots};
 use crate::venv::Venv;
 use crate::{install, launch, viserver};
 use anyhow::{Context, Result, bail, ensure};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// What the relink pass is asked, without the flags a front end spells them as.
@@ -100,11 +100,13 @@ pub(super) fn relink_in_destination(
     options: &RelinkOptions,
     work: &[(String, Vec<PathBuf>)],
 ) -> Result<()> {
+    // Before LabVIEW starts, so a missing or stale VI costs no start.
+    let vi = relink::locate_vi(&env.work_dir())?;
     match venv {
         Some(v) => {
             let inst =
                 launch::ensure_instance(v, true, launch::CALL_TIMEOUT, env.headless, env.sink)?;
-            let outcome = run_relink(env, store, inst.port, options, work);
+            let outcome = run_relink(env, store, &vi, inst.port, options, work);
             if options.keep_open {
                 env.sink
                     .emit(Event::VenvLabviewLeftOpen { port: inst.port });
@@ -120,7 +122,7 @@ pub(super) fn relink_in_destination(
                 env.headless,
                 env.sink,
             )?;
-            run_relink(env, store, port, options, work)
+            run_relink(env, store, &vi, port, options, work)
         }
     }
 }
@@ -136,11 +138,11 @@ pub(super) fn relink_in_destination(
 pub fn run_relink(
     env: &OpEnv,
     roots: &Roots,
+    vi: &Path,
     port: u16,
     options: &RelinkOptions,
     work: &[(String, Vec<PathBuf>)],
 ) -> Result<()> {
-    let vi = relink::locate_vi(&env.work_dir())?;
     // One walk covers every folder nested under it, so overlapping packages
     // share a run instead of relinking the same tree twice — 18 of the first
     // pass's 109 folders were nested repeats costing 17 of its 61 minutes.
@@ -150,9 +152,9 @@ pub fn run_relink(
     env.sink.emit(Event::RelinkStarted {
         folders: plan.len(),
         covered_by_parent: asked.saturating_sub(plan.len()),
-        vi: vi.clone(),
+        vi: vi.to_path_buf(),
     });
-    let mut r = Relinker::open(port, &vi, Duration::from_secs(options.timeout), env.sink)
+    let mut r = Relinker::open(port, vi, Duration::from_secs(options.timeout), env.sink)
         .with_context(|| {
             format!(
                 "cannot reach LabVIEW to relink on VI Server port {port}\n\

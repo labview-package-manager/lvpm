@@ -109,6 +109,10 @@ if ($BuildLocal) {
         $payload = Join-Path $bundle 'payload'
         New-Item -ItemType Directory -Path $payload | Out-Null
         Copy-Item -LiteralPath $binary -Destination $payload
+        $viDir = Join-Path (Split-Path $manifest -Parent) 'crates\lvpm-core\src\lv-src'
+        foreach ($vi in @('relink-package.vi', 'build-app.vi')) {
+            Copy-Item -LiteralPath (Join-Path $viDir $vi) -Destination $payload
+        }
         foreach ($name in @('README.md', 'LICENSE-MIT', 'LICENSE-APACHE')) {
             Copy-Item -LiteralPath (Join-Path (Split-Path $manifest -Parent) $name) -Destination $payload
         }
