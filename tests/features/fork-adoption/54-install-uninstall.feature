@@ -20,7 +20,18 @@ Feature: install and uninstall are the project commands
     When I run "lvpm install caraya --prefix other"
     Then lvpm.toml says "caraya" = ">=1.0"
     And lvpm.lock and "other" include "caraya" 1.0 and "alpha" 1.0
+    And dest is byte-identical to before
     And the output says "in a project, --prefix picks where the project syncs" and names "--no-project"
+
+  Scenario Outline: --dry-run says what it would do and changes nothing
+    When I run "lvpm <args>"
+    Then the output says "would"
+    And nothing changed
+
+    Examples:
+      | args                                    |
+      | install caraya --dry-run --prefix dest  |
+      | uninstall alpha --dry-run --prefix dest |
 
   Scenario: --no-project installs without touching the project
     When I run "lvpm install caraya --no-project --prefix dest"
@@ -194,7 +205,7 @@ Feature: install and uninstall are the project commands
       | alpha --group test --no-project --prefix dest | --group      |
       | alpha --dry-run --no-project --prefix dest    | --dry-run    |
       | alpha --no-linkfix --no-project --prefix dest | --no-linkfix |
-      | --all --dev --prefix dest                     | --dev        |
+      | --all --dry-run --prefix dest                 | --dry-run    |
 
   Scenario: a direct uninstall of a listed package says it is still listed
     When I run "lvpm uninstall alpha --no-project --prefix dest"

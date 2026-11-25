@@ -141,6 +141,9 @@ fn take_out_and_sync(
     let edit = prepared.take_out(&table, name).map_err(|why| match why {
         // A package the manifest does not list but another one requires is
         // locked and installed all the same: that is what stops it.
+        EditError::NotInGroup { ref name, .. } => (prepared.previous.as_ref())
+            .and_then(|lock| required(lock, &prepared.found.1, name))
+            .unwrap_or(why),
         EditError::NotADependency { name, .. } => prepared
             .previous
             .as_ref()
@@ -1470,6 +1473,28 @@ alpha = \"1.0\"
             "{why:?}"
         );
         assert_eq!(world.lock(), lock);
+    }
+
+    #[test]
+    fn a_package_no_table_lists_but_another_requires_is_required_from_a_group_too() {
+        let manifest = format!(
+            "{PROJECT}
+[dependency-groups.ci]
+"
+        );
+        let world = World::new("unlisted-required-group", &manifest);
+        run_add(&world, "gamma", &InstallOptions::default()).unwrap();
+        let why = remove(
+            &world.env(&Recorder::default()),
+            "alpha",
+            DependencyTable::Group("ci".into()),
+            &InstallOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&why, EditError::Required { name, .. } if name == "alpha"),
+            "{why:?}"
+        );
     }
 
     /// The roots a refused `remove alpha` names, for a manifest that lists

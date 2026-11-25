@@ -169,7 +169,7 @@ Feature: lvpm locks a package from its GitHub repo
       | replace pilot B's line with the short form ">=1.2"         |
       | add github "o/r" to the "labview_open_source_lib_data_manipulation" line |
 
-  Scenario: lvpm add keeps the github line
+  Scenario: lvpm install keeps the github line
     Given the pilot B project with a current lvpm.lock
     When I run "lvpm install labview_open_source_lib_serializer@>=1.2.1 --prefix dest"
     Then the command succeeds
@@ -181,7 +181,7 @@ Feature: lvpm locks a package from its GitHub repo
     When I run "lvpm install labview_open_source_lib_serializer@>=1.3.0 --prefix dest"
     Then lvpm.lock takes "labview_open_source_lib_serializer" at version "1.3.0.1"
 
-  Scenario: lvpm remove drops the github line and its lock input
+  Scenario: lvpm uninstall drops the github line and its lock input
     Given the pilot B project with a current lvpm.lock
     When I run "lvpm uninstall labview_open_source_lib_serializer --prefix dest"
     Then the command succeeds

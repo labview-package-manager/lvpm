@@ -34,10 +34,12 @@ lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refre
   targets                       detected LabVIEW installations
   search <query>                search the indexes
   list                          what lvpm installed into the target
-  install [<pkg>[@ver]] [--no-project] [--manifest FILE] [--dry-run] [--no-deps]
+  install [<pkg>[@ver]] [--no-project] [--dev] [--group NAME] [--index NAME]
+          [--manifest FILE] [--dry-run] [--no-deps]
           [--no-linkfix] [--relink] [--no-hooks | --hooks] [--allow-downgrade]
           [--relink-timeout SECS] [--relink-progress NAME] [--keep-open]
-  uninstall <pkg> [--no-project] [--with-deps | --keep-deps] [--force] | --all
+  uninstall <pkg> [--no-project] [--dev] [--group NAME]
+            [--with-deps | --keep-deps] [--force] | --all
   relink <pkg> | --all          [--relink-timeout] [--relink-progress] [--keep-open]
   linkfix [--tree DIR] [--dry-run] [--verbose] [--keep-compiled-code]
      [--fix owner,paths,qualifiers,source-only,clfn-wildcard] [--report FILE]

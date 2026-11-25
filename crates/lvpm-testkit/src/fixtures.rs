@@ -220,7 +220,7 @@ pub const ADD_PACKAGES: &[FixturePackage] = &[
     text_package("caraya", "1.0", &[], "20.0"),
 ];
 
-/// What the install and uninstall scenarios of #54 publish: alpha 1.0, app 1.0
+/// The packages the install and uninstall scenarios publish: alpha 1.0, app 1.0
 /// and app2 1.0 each requiring lib >= 1.0, lib 1.0, and caraya 1.0.
 pub const INSTALL_PACKAGES: &[FixturePackage] = &[
     text_package("alpha", "1.0", &[], "20.0"),

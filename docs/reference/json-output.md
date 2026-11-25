@@ -13,8 +13,8 @@ Before it edits `lvpm.toml`, and only once the lock is made and the package is
 known to be one to add or remove, the command writes one announce event:
 `install_adds_to_project` or `uninstall_removes_from_project`. `package` is the
 name as typed. `destination` is the destination flag that picked where the project
-syncs (`--prefix`, `--global` or `--labview-version`; the last only when no venv wins), and is left out when there
-was none. `dry_run` is `true` under `--dry-run`, when nothing is written, and is
+syncs (`--prefix`, `--global` or `--labview-version`; the last only when no venv
+wins or `--global` is given too), and is left out when there was none. `dry_run` is `true` under `--dry-run`, when nothing is written, and is
 left out otherwise. A refused removal, an unknown package or a lock that fails
 writes none.
 

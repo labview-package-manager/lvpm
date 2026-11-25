@@ -2783,4 +2783,24 @@ beta = \"*\"
             assert!(install::is_installed(&venv.store(), package), "{package}");
         }
     }
+
+    #[test]
+    fn a_sync_in_a_project_with_no_venv_is_refused_at_a_labview_version_alone_and_changes_nothing()
+    {
+        use crate::ops::testing::{FakeInstallation, Recorded, env_on, scratch_dir, snapshot};
+        let dir = scratch_dir("sync-needs-global");
+        let fake = FakeInstallation::new(&dir);
+        std::fs::write(dir.join(crate::project::FILE_NAME), MANIFEST_HEAD).unwrap();
+        let before = snapshot(&dir);
+
+        let sink = Recorded::default();
+        let mut env = env_on(&sink, &dir);
+        fake.place(&mut env);
+        env.flags.labview_version = Some("2099".into());
+        let why = format!("{:#}", sync(&env, &SyncOptions::default()).unwrap_err());
+        // A manifest is a project, so its refusal comes before the one for `--labview-version` alone.
+        assert!(why.contains("but no venv"), "{why}");
+        assert_eq!(snapshot(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

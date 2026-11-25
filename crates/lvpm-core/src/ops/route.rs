@@ -138,11 +138,11 @@ pub fn uninstall_mode(
     env: &OpEnv,
     request: &UninstallRequest,
 ) -> Result<UninstallMode, RouteError> {
-    let in_a_project = request.package.is_some()
+    let edits_the_project = request.package.is_some()
         && !request.all
         && !request.no_project
         && env.manifest_for(None, None)?.is_some();
-    if in_a_project {
+    if edits_the_project {
         let refused = [
             (request.keep_deps, "--keep-deps"),
             (request.force, "--force"),

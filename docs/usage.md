@@ -64,8 +64,8 @@ hooks of every package for this command, where they are off by default
 (see [Install hooks](#install-hooks); a headless LabVIEW runs none without
 it). `--relink-timeout <SECS>`
 (default 900) bounds one folder's relink; `--keep-open` leaves the LabVIEW
-started for a venv relink running. `sync` and a project `uninstall` take
-`--dry-run` and the relink and hook flags as well.
+started for a venv relink running. `sync`, a project `install <name>` and a
+project `uninstall` take `--dry-run` and the relink and hook flags as well.
 
 lvpm 0.3 had three `install` flags that are gone or refused
 ([labview-package-manager/lvpm#47](https://github.com/labview-package-manager/lvpm/issues/47)):
@@ -431,8 +431,9 @@ keep `dev` and add `group`, and `created_table`, when they apply. An `added` or
 which takes them. `--with-deps` is accepted: it is what a project uninstall does
 anyway. Outside a project, and with `--no-project`, the saving flags `--dev`,
 `--group` and `--index` fail, since there is no `lvpm.toml` to save in; so do
-`uninstall`'s `--dev`, `--group`, `--dry-run`, `--no-linkfix`, `--relink` and
-`--hooks`, which only a project uninstall takes. `--no-project` needs a package
+`uninstall`'s `--dev`, `--group`, `--dry-run`, `--no-linkfix`, `--relink`,
+`--hooks`, `--keep-open` and `--relink-progress`, which only a project uninstall
+takes. `--no-project` needs a package
 and does not combine with `--project`.
 
 **A source pin.** `--index <NAME>` writes a source pin, as the table form

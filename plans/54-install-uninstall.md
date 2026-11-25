@@ -2,7 +2,7 @@
 
 **Created**: 2026-11-25 (revision 4: revision 3 plus Slice 6, a write into LabVIEW itself needs --global)
 **Branch**: slice/54-install-uninstall
-**Status**: approved
+**Status**: implemented
 **Gherkin persistence**: plan-file-only
 **Base**: rebased onto integration/fork f9fda92 (#72, the #53 docs port, landed first; Slice 7 sweeps its new pages too: docs/venvs.md, docs/install.md, docs/labview-integration.md, ...)
 <!-- The project's acceptance features live flat in tests/features/fork-adoption/
@@ -54,7 +54,7 @@ write into the system Python, as lvpm's writes need `--global`. lvpm already has
 | Real LabVIEW (user's decision 2026-11-25) | `--global` is required for every write into an installation: install, uninstall, sync, relink, add, remove, run-hooks. `--labview-version` picks which one; alone it fails naming `--global`. `--global` without `--labview-version` takes the manifest's `labview` in a project, else the only installation. Reads (`list`, `vi-*`, linkfix, launch), `venv create`, `init`, `refresh` and `start` are unchanged. Headless counts as consent, with or without lvpm.toml. The TUI's no-venv install is refused. |
 | Destination flags | Pick the target only. A named `install`/`uninstall` in a project edits the project whatever the destination flag. |
 | Opt-out | `--no-project` on `install` and `uninstall`: `requires = "package"`, `conflicts_with = "project"`. Outside a project it is accepted and changes nothing. It conflicts with the saving flags (`--dev`, `--index`; `--group` with a package is refused in `install_mode`). |
-| Behaviour change (release note #58, PR body list) | (1) `install x --prefix/--global/--labview-version` inside a project now edits lvpm.toml. (2) `uninstall x` of a package the project lists now takes it out of lvpm.toml. (3) `uninstall x` of a package another locked one requires fails. (4) `uninstall x` in a project, x not listed, fails. (5) `--keep-deps`/`--force` need `--no-project` in a project. (6) `add`/`remove` outside a project install/uninstall directly instead of refusing. (7) `--json` names `add`/`remove` as `install`/`uninstall`. (8) `--labview-version YYYY` alone no longer writes into LabVIEW YYYY; add `--global` (the 0.3.1 README form `lvpm install x --labview-version 2026` fails with that hint). (9) `--global` alone picks the venv's, the manifest's or the only LabVIEW instead of failing. (10) The TUI no longer installs into the newest LabVIEW when there is no venv. (11) Outside a project `install x --manifest y` fails with "--manifest cannot be used with a package name" (exit 1; clap's `manifest conflicts_with = "package"` was removed, so it is no longer clap's exit 2). |
+| Behaviour change (release note #58, PR body list) | (1) `install x --prefix/--global/--labview-version` inside a project now edits lvpm.toml. (2) `uninstall x` of a package the project lists now takes it out of lvpm.toml. (3) `uninstall x` of a package another locked one requires fails. (4) `uninstall x` in a project, x not listed, fails. (5) `--keep-deps`/`--force` need `--no-project` in a project. (6) `add`/`remove` outside a project install/uninstall directly instead of refusing. (7) `--json` names `add`/`remove` as `install`/`uninstall`. (8) `--labview-version YYYY` alone no longer writes into LabVIEW YYYY; add `--global` (the 0.3.1 README form `lvpm install x --labview-version 2026` fails with that hint). (9) `--global` alone picks the venv's, the manifest's or the only LabVIEW instead of failing. (10) The TUI no longer installs into the newest LabVIEW when there is no venv. (11) Outside a project `install x --manifest y` fails with "--manifest cannot be used with a package name" (exit 1; clap's `manifest conflicts_with = "package"` was removed, so it is no longer clap's exit 2). (12) `--allow-downgrade` is refused in a project, even for a bare sync: the lock decides. (13) `--dev`, `--group` and `--index` on a named install fail outside a project and with `--no-project`. (14) `--global` with `--prefix` is an error ("mutually exclusive"). |
 | Upgrader signal | When a named project install or uninstall was given a destination flag, it prints: "note: in a project, --prefix picks where the project syncs; lvpm.toml gets x. Pass --no-project to install without changing the project." (flag named as typed; present tense, as it is printed before the add runs, which can still fail, and `--dry-run` writes nothing). `--labview-version` is named only when no venv wins: `OpEnv::destination` lets a venv at or above the cwd beat it. A plain `install x` prints the existing "adding x to lvpm.toml" line without the opt-out. |
 | `uninstall` flags in a project | `--with-deps` is what happens anyway, so it is accepted. `--keep-deps` and `--force` are refused, naming `--no-project`: the lock decides what stays, and a sync would undo either. uv has neither on `uv remove`. |
 | `uninstall` gains `remove`'s flags | `--dev`, `--group` and flattened `ApplyArgs`. On a direct route `--dev`, `--group` and the `ApplyArgs` bools (`--dry-run`, `--no-linkfix`, `--relink`, `--hooks`) are refused ("only a project uninstall takes it"); the `RelinkArgs` values are ignored there, as they cannot be told from their defaults. Direct uninstall takes none of these today, so nothing that works breaks. |
@@ -727,7 +727,7 @@ Unit tests, not scenarios:
 
 - Docs, as built, not as planned: the rule table and a "What a project refuses" paragraph are in docs/usage.md "Adding and removing dependencies"; a new "Writing into LabVIEW itself" section (a table of `--global`, `--labview-version` and `--prefix`, then the reads, headless and TUI exceptions) follows the flags table, and the `--global` and `--labview-version` rows link to it. The alias is one sentence on one line, so the second criterion's grep matches one line. "Uninstalling" says it is the direct route (`--no-project`, `--all`, or outside a project). docs/reference/json-output.md has a section on the announce events (`install_adds_to_project`, `uninstall_removes_from_project`; `destination` and `dry_run` only when set) and says `--json add/remove` report `install`/`uninstall`.
 - Sweep beyond the plan's file list: docs/ci-docker.md (the headless paragraph, and `lock`/`add`/`remove` in its table), docs/cli.md (synopsis `--no-project`, two bullets pointing at usage.md; its proposals and "Missing" table are upstream's record and stay), docs/venvs.md (`uninstall <pkg> --no-project --global`, since `uninstall --global <pkg>` in a project now edits lvpm.toml), docs/labview-integration.md (hooks table rows), docs/roadmap.md (the two `add`/`remove` lines; the measured headless Caraya run stays), docs/tutorial/*.md and README.md (`lvpm add` to `lvpm install`; the Quick start's `list` and `uninstall` lines gained `--labview-version 2026` and `--global`, because without a flag they already failed with "pick a destination").
-- Left, though the second grep matches them: docs/adr/0004-sources-first-wins-and-pinning.md (a decision record) and docs/map/index.html (a generated snapshot of 2026-11-02); `lvpm add` still works as the alias. Scenario titles stay (s4, s12, min-release-age slice-1, s13, s7c), as the plan says.
+- Left, though the second grep matches them: docs/adr/0004-sources-first-wins-and-pinning.md (a decision record) and docs/map/index.html (a generated snapshot of 2026-11-02); `lvpm add` still works as the alias. Scenario titles stayed at first (s4, s12, min-release-age slice-1, s13, s7c); the backstop review renamed them.
 - Scenarios: only commands changed, in s10a, s4, 45-old-dependency-groups, s12, slice-11 (the outline's two rows), slice-16 (the quoted example the usage guide must show, now `lvpm install "gamma@>=0.5"`), slice-17, min-release-age slice-1, s13 and s7c. slice-13 and 54-install-uninstall keep `add`/`remove`, and tests/support/sandbox.rs keeps its two guard tests on the aliases. Comments in tests/steps/add_remove.rs and hooks.rs follow.
 
 ## Parallelization
@@ -764,13 +764,22 @@ See each step.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo fmt --check`
 - [ ] `/dev-team:code-review` passes
-- [ ] PR body lists the eleven behaviour changes for the release note (#58)
+- [ ] PR body lists the fourteen behaviour changes for the release note (#58)
 
 ## Skipped (low value)
 
 - A shared `TableArgs` for `--dev`/`--group`/`--index`: install's `--group` is the repeatable sync flag, so it cannot share the struct.
 - Moving "also install this group" to `--with` now: #68 owns it.
 - A deprecation release before flipping `install x --prefix` in a project: the fork has no released version with this flag meaning to deprecate from (0.3.1 is upstream's); the printed note and release note cover it.
+
+**Built differently after the backstop review** (ten review agents; the diff is the record):
+
+- The `next:` and "still listed" hints repeat `--labview-bitness` when it narrowed a LabVIEW pick, and `--project` when it was given (`DestinationFlags::picked`, `OpEnv::destination_flags_as_typed`). The `destination` event field still names only the flag that picked the target.
+- `uninstall lib --group ci`, with lib in no table but required by a locked package, fails "required by", as the `[dependencies]` form does, instead of "not in [dependency-groups.ci]".
+- The sandbox guard lets an armed fixture `install`/`uninstall` through only with `--no-project`: without it, a named install in a project syncs. The s12 and slice-1 fixture lines and the hooks step gained `--no-project`.
+- The scenario titles that still said `lvpm add`/`lvpm remove` were renamed to the command they run, reversing Step 7.1's "titles stay". Duplicate s7c scenarios were removed.
+- Docs: usage.md's flag lists, cli.md's synopsis and json-output.md's `destination` text match the code.
+- Not done, listed in the PR as follow-ups: a lock that serializes two lvpm processes on one project (lost update and restore clobber, predating this branch, now reached by more commands), the announce event said before the fetch instead of after `begin_unpack`, an atomic lvpm.toml write, an early "required by" refusal before the index load (an offline refused uninstall now fails on the feed), typed flags instead of `&'static str`, one `Intent::Probe` instead of the duplicated precedence in `installed_in_the_target`, and the split of the event field `destination` into two names.
 
 ## Risks & Open Questions
 
@@ -781,6 +790,7 @@ See each step.
 - Two stances in Slice 6 are mine, not the user's: headless counts as consent even with no lvpm.toml, and the TUI refuses a no-venv install.
 - No spec artifacts: the issue is the spec (docs/fork-adoption.md).
 - 0.3.1 compatibility: `lvpm install x --labview-version 2026` inside a folder with lvpm.toml now edits it. Unverified how many users do that; mitigated by the note printed whenever a destination flag routes to the project, and the release note (#58).
+- A named `uninstall` in a project now loads the indexes and locks, so it needs the feed or a warm cache; `--no-project` is the offline way.
 - `uninstall` in a project edits lvpm.toml with no prompt; #55 decides whether its question covers this. The output names what was removed, and `lvpm install x` undoes it.
 - #59 also changes `Cmd::Install`'s flags; if it lands first, this branch rebases.
 - A transitive package can no longer be uninstalled in a project without `--no-project`. The error names it.

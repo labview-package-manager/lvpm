@@ -50,7 +50,7 @@ Feature: Destination, index and queries live in core
       | --labview-version 2025          | anywhere                                 | false    | error naming --global, with a next line      |
       | --labview-version 2026          | a project without a venv                 | false    | error naming lvpm venv create and --global   |
       | --global --labview-version 2026 | anywhere                                 | false    | LabVIEW 2026 itself                          |
-      | --global --labview-version 2026 | a project with a venv                    | false    | LabVIEW 2026 itself                          |
+      | --global --labview-version 2025 | a project with a venv                    | false    | LabVIEW 2025 itself                          |
       | --global --labview-version 1999 | anywhere                                 | false    | error naming the installed LabVIEWs          |
       | --global --prefix x             | anywhere                                 | false    | error "mutually exclusive"                   |
       | --global                        | anywhere                                 | false    | error "which LabVIEW?" naming both           |

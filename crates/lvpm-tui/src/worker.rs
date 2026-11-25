@@ -212,12 +212,10 @@ fn run(builder: &EnvBuilder, job: Job, send: &Sender<Done>) -> Done {
                 ..InstallOptions::default()
             };
             // In a project's venv the install is an add, as `lvpm install <name>`
-            // is. The TUI sets the newest LabVIEW in the flags, so
-            // `route::install_mode` would answer additive: test the venv instead.
+            // is. The TUI names the newest LabVIEW in its flags, which writes
+            // into it only with --global: the TUI has no such flag, so with no
+            // venv it refuses, naming the command that does.
             let destination = env.destination();
-            // The TUI names the newest LabVIEW in its flags, which writes into
-            // it only with --global: the TUI has no such flag, so with no venv
-            // it refuses, naming the command that does.
             let refused = match &destination {
                 Err(_) => match env.read_destination() {
                     Ok(Destination::Global(Roots {

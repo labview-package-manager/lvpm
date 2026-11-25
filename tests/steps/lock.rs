@@ -11,7 +11,7 @@ use crate::support::fixtures::{
 };
 use crate::support::golden::Output;
 use crate::support::project::MANIFEST_FILE;
-use crate::support::sandbox::{DEST_DIR, Sandbox};
+use crate::support::sandbox::Sandbox;
 use cucumber::{given, then, when};
 use lvpm_core::manifest_edit::{self, DependencyTable};
 use regex::Regex;
@@ -349,13 +349,7 @@ async fn an_archive_is_cached_and_its_source_unreachable(
     version: String,
 ) {
     world.use_hosted_fixtures();
-    world.sandbox.setup_lvpm(&[
-        "install",
-        &format!("{name}@{version}"),
-        "--no-project",
-        "--prefix",
-        DEST_DIR,
-    ]);
+    world.install_into_dest(&name, &version);
     let archive = archive_path(PROJECT_FEED_DIR, &format!("{name}-{version}.vip"));
     assert_eq!(world.sandbox.feed().hits(&archive), 1, "fetched once");
     world.sandbox.feed().refuse_archives();
@@ -437,13 +431,7 @@ async fn change_the_manifest_to_a_conflict(world: &mut CliWorld, depends: String
     regex = r#"^world one, under one temp root, has "([^"]+)" (\S+) installed in its destination$"#
 )]
 async fn world_one_has_a_package_installed(world: &mut CliWorld, name: String, version: String) {
-    world.sandbox.setup_lvpm(&[
-        "install",
-        &format!("{name}@{version}"),
-        "--no-project",
-        "--prefix",
-        DEST_DIR,
-    ]);
+    world.install_into_dest(&name, &version);
 }
 
 #[given("world two, under a different temp root, has nothing installed")]

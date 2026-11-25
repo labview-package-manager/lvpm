@@ -131,7 +131,7 @@ Feature: The current CLI's output is recorded so later changes can be compared a
     And the lvpm test fixture in the local package folder
     And the LabVIEW installation is free of the lvpm test fixture
     # S12: hooks are off by default (#76)
-    When I run "lvpm install lvpm_test_fixture --global --labview-version 2026 --hooks"
+    When I run "lvpm install lvpm_test_fixture --no-project --global --labview-version 2026 --hooks"
     Then stdout, stderr and the exit code equal the recording "global-install"
     And the lvpm test fixture is installed on the LabVIEW installation
     And the PostInstall hook ran for "lvpm_test_fixture"
@@ -144,7 +144,7 @@ Feature: The current CLI's output is recorded so later changes can be compared a
     Then stdout, stderr and the exit code equal the recording "global-start"
     When I run "lvpm relink lvpm_test_fixture --global --labview-version 2026"
     Then stdout, stderr and the exit code equal the recording "global-relink"
-    When I run "lvpm uninstall lvpm_test_fixture --global --labview-version 2026"
+    When I run "lvpm uninstall lvpm_test_fixture --no-project --global --labview-version 2026"
     Then stdout, stderr and the exit code equal the recording "global-uninstall"
     And the lvpm test fixture is gone from the LabVIEW installation
 

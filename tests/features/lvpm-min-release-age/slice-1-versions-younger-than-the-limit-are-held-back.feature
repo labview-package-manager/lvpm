@@ -50,7 +50,7 @@ Feature: lvpm does not choose a package version younger than min-age-days
     When I run "lvpm sync --prefix dest"
     Then lvpm.lock takes "alpha" 1.0 from "first"
 
-  Scenario: lvpm add without a version writes the newest eligible version
+  Scenario: lvpm install without a version writes the newest eligible version
     Given the project sets min-age-days to 14
     And "first" lists "alpha" 1.0 released 30 days ago and "alpha" 1.1 released 3 days ago
     When I run "lvpm install alpha --prefix dest"
@@ -100,7 +100,7 @@ Feature: lvpm does not choose a package version younger than min-age-days
     When I run "lvpm lock"
     Then lvpm.lock takes "alpha" 1.1 from "first"
 
-  Scenario: lvpm add with an explicit version is exempt
+  Scenario: lvpm install with an explicit version is exempt
     Given the project sets min-age-days to 14
     And "first" lists "alpha" 1.0 released 30 days ago and "alpha" 1.1 released 3 days ago
     When I run "lvpm install alpha@1.1 --prefix dest"

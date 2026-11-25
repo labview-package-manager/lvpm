@@ -687,6 +687,12 @@ async fn nothing_in_the_project_changed(world: &mut CliWorld) {
     world.assert_nothing_changed();
 }
 
+#[then("dest is byte-identical to before")]
+async fn dest_is_unchanged(world: &mut CliWorld) {
+    world.assert_succeeded();
+    world.assert_dest_unchanged();
+}
+
 #[then("nothing changed")]
 async fn nothing_changed(world: &mut CliWorld) {
     world.assert_nothing_changed();
@@ -1058,6 +1064,7 @@ async fn the_output_says_it_is_an_add(world: &mut CliWorld, name: String) {
 async fn both_worlds_are_identical(world: &mut CliWorld) {
     let twin = world.add_remove.twin.as_ref().expect("a second world");
     let (one, two) = (world.output(), &twin.output);
+    assert_eq!(one.exit_code, 0, "both commands failed alike:\n{one:?}");
     assert_eq!(one.exit_code, two.exit_code, "{one:?}\n{two:?}");
     assert_eq!(one.stdout, two.stdout);
     assert_eq!(one.stderr, two.stderr);

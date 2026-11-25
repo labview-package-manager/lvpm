@@ -43,19 +43,23 @@ pub struct DestinationFlags {
 impl DestinationFlags {
     /// The flags that picked the target, as typed, each with its value: first
     /// the one that decided it, `--prefix`, then `--labview-version`, then
-    /// `--global`. `--labview-version` picks nothing when `venv_wins` and
-    /// `--global` is not there to say otherwise (see [`OpEnv::destination`]).
+    /// `--global`, then the `--labview-bitness` that narrowed a LabVIEW pick.
+    /// `--labview-version` picks nothing when `venv_wins` and `--global` is not
+    /// there to say otherwise (see [`OpEnv::destination`]).
     pub fn picked(&self, venv_wins: bool) -> Vec<(&'static str, Option<String>)> {
         let version = self
             .labview_version
             .as_ref()
             .filter(|_| !venv_wins || self.global);
+        let bitness = (self.labview_bitness)
+            .filter(|_| self.prefix.is_none() && (version.is_some() || self.global));
         [
             self.prefix
                 .as_ref()
                 .map(|p| ("--prefix", Some(p.display().to_string()))),
             version.map(|v| ("--labview-version", Some(v.clone()))),
             self.global.then_some(("--global", None)),
+            bitness.map(|b| ("--labview-bitness", Some(b.to_string()))),
         ]
         .into_iter()
         .flatten()
@@ -206,9 +210,11 @@ impl<'a> OpEnv<'a> {
 
     /// Every destination flag that picked the target, with its value, as one
     /// command-line fragment (`--prefix dest`): what a suggested command needs
-    /// to act on the same target.
+    /// to act on the same target, and the `--project` that picked the project.
     pub fn destination_flags_as_typed(&self) -> Option<String> {
-        let typed: Vec<String> = (self.picked().into_iter())
+        let project =
+            (self.flags.project.as_ref()).map(|p| ("--project", Some(p.display().to_string())));
+        let typed: Vec<String> = (self.picked().into_iter().chain(project))
             .map(|(flag, value)| match value {
                 Some(v) if v.contains(char::is_whitespace) => format!("{flag} \"{v}\""),
                 Some(v) => format!("{flag} {v}"),
@@ -629,6 +635,30 @@ mod tests {
                 ("--global", None)
             ]
         );
+        // --labview-bitness narrowed the LabVIEW pick, so it goes with it.
+        let version_and_bitness = DestinationFlags {
+            labview_version: Some("2026".into()),
+            labview_bitness: Some(32),
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&version_and_bitness, false),
+            [
+                ("--labview-version", Some("2026".to_string())),
+                ("--labview-bitness", Some("32".to_string()))
+            ]
+        );
+        // With --prefix, or a venv that won, no LabVIEW was picked to narrow.
+        assert_eq!(picked(&version_and_bitness, true), []);
+        let prefix_and_bitness = DestinationFlags {
+            prefix: Some("dest".into()),
+            labview_bitness: Some(32),
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&prefix_and_bitness, false),
+            [("--prefix", Some("dest".to_string()))]
+        );
         assert_eq!(picked(&DestinationFlags::default(), false), []);
     }
 
@@ -648,6 +678,14 @@ mod tests {
         assert_eq!(
             env.destination_flags_as_typed().as_deref(),
             Some("--prefix \"my dest\" --global")
+        );
+        // --project picked the project, so a repeated command needs it too, but
+        // it is not the flag that picked the target.
+        env.flags.project = Some(PathBuf::from("my proj"));
+        assert_eq!(env.destination_flag(), Some("--prefix"));
+        assert_eq!(
+            env.destination_flags_as_typed().as_deref(),
+            Some("--prefix \"my dest\" --global --project \"my proj\"")
         );
     }
 

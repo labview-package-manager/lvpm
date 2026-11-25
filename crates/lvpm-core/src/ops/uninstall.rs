@@ -987,4 +987,25 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn an_uninstall_at_a_labview_version_alone_is_refused_and_changes_nothing() {
+        use crate::ops::testing::{FakeInstallation, Recorded, env_on, scratch_dir, snapshot};
+        let dir = scratch_dir("uninstall-needs-global");
+        let fake = FakeInstallation::new(&dir);
+        fake.with_package("alpha");
+        let before = snapshot(&dir);
+
+        let sink = Recorded::default();
+        let mut env = env_on(&sink, &dir);
+        fake.place(&mut env);
+        env.flags.labview_version = Some("2099".into());
+        let why = format!(
+            "{:#}",
+            uninstall(&env, Some("alpha"), false, Dependencies::Keep, false).unwrap_err()
+        );
+        assert!(why.contains("alone does not write"), "{why}");
+        assert_eq!(snapshot(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

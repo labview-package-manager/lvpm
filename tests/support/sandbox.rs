@@ -251,7 +251,11 @@ pub fn real_installation_risk(
         || positional
             .get(1)
             .is_some_and(|package| package.split('@').next() == Some(global::FIXTURE_NAME));
-    if fixture_armed && !SYNCS.contains(&command) && names_only_the_fixture {
+    // A named install or uninstall without `--no-project` edits a project and
+    // syncs it, if the work directory holds one: treat it as a sync.
+    let syncs = SYNCS.contains(&command)
+        || (["install", "uninstall"].contains(&command) && !args.contains(&"--no-project"));
+    if fixture_armed && !syncs && names_only_the_fixture {
         return None;
     }
     let installation = roots
@@ -1116,9 +1120,9 @@ mod tests {
     fn only_the_fixture_may_be_installed_or_uninstalled_and_only_once_the_installation_is_proved_clean()
      {
         for command in [
-            "install lvpm_test_fixture --labview-version 2026",
-            "install lvpm_test_fixture@1.0 --labview-version 2026",
-            "uninstall lvpm_test_fixture --labview-version 2026",
+            "install lvpm_test_fixture --no-project --labview-version 2026",
+            "install lvpm_test_fixture@1.0 --no-project --labview-version 2026",
+            "uninstall lvpm_test_fixture --no-project --labview-version 2026",
         ] {
             assert!(!risky(command, true), "{command}");
             assert!(risky(command, false), "{command} before it is armed");
@@ -1129,6 +1133,9 @@ mod tests {
             "uninstall alpha --labview-version 2026",
             "sync --labview-version 2026",
             "sync lvpm_test_fixture --labview-version 2026",
+            // Without --no-project these edit and sync a project, if there is one.
+            "install lvpm_test_fixture --global --labview-version 2026",
+            "uninstall lvpm_test_fixture --global --labview-version 2026",
         ] {
             assert!(risky(command, true), "{command} while armed");
         }
@@ -1342,7 +1349,13 @@ mod tests {
     fn the_sandbox_lets_the_fixture_scenario_install_the_fixture_once_it_has_proved_the_installation_clean()
      {
         let sandbox = Sandbox::new();
-        let args = ["install", "lvpm_test_fixture", "--labview-version", "2026"];
+        let args = [
+            "install",
+            "lvpm_test_fixture",
+            "--no-project",
+            "--labview-version",
+            "2026",
+        ];
         let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             sandbox.refuse_a_real_installation(&args, &sandbox.work_dir(), &[labview_2026()]);
         }));
