@@ -294,7 +294,8 @@ pub enum Event {
         position: usize,
         total: usize,
     },
-    /// A dry run's packages with LabVIEW files, which a venv install resaves.
+    /// A dry run's packages with LabVIEW files, which a venv install with
+    /// `--resave` resaves.
     ResavePlanned { packages: Vec<String> },
 
     // ---- ops::linkfix ----

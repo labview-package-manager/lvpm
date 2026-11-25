@@ -774,8 +774,15 @@ mod tests {
         };
 
         install(&env_on(&sink, &repo), Some("alpha"), &dry).unwrap();
-
         assert_eq!(planned(&sink.events()), None);
+
+        let asked = Recorded::default();
+        let dry = InstallOptions {
+            resave: true,
+            ..dry
+        };
+        install(&env_on(&asked, &repo), Some("alpha"), &dry).unwrap();
+        assert_eq!(planned(&asked.events()), Some(vec!["alpha".into()]));
     }
 
     #[test]
@@ -802,11 +809,13 @@ mod tests {
         )));
     }
 
-    /// `--relink`: LabVIEW's load-and-save pass instead of linkfix.
+    /// `--relink --resave`: the resave, then LabVIEW's load-and-save pass
+    /// instead of linkfix.
     fn relink() -> InstallOptions {
         InstallOptions {
             force_relink: true,
-            ..resaving()
+            resave: true,
+            ..InstallOptions::default()
         }
     }
 

@@ -1,8 +1,9 @@
 Feature: A venv install resaves each package before it lands, when asked
-  With --resave, a package bound for a venv is staged next to it, resaved in the venv's
-  own LabVIEW, and only then moved into its add-on folder. The scenarios
-  without a LabVIEW are unit tests in lvpm-core (ops/resave.rs); this file
-  holds the ones that need the real LabVIEW 2026.
+  With --resave, a package bound for a venv is staged next to it, resaved
+  in the venv's own LabVIEW, and only then moved into its add-on folder.
+  The scenarios without a LabVIEW are unit tests in lvpm-core
+  (ops/resave.rs and ops/sync.rs); this file holds the ones that need the
+  real LabVIEW 2026.
 
   @labview
   Scenario: the VI fixture lands through staging

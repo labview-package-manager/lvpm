@@ -30,8 +30,8 @@ The order is:
   load/save pass instead when `--relink` is selected.
 3. Run eligible PostInstall hooks, then refresh palettes where applicable.
 
-Linkfix itself does not start LabVIEW. Hooks, a requested `--relink`, and
-palette refresh can still require LabVIEW.
+Linkfix itself does not start LabVIEW. Hooks, a requested `--relink`, a
+requested `--resave`, and palette refresh can still require LabVIEW.
 
 Use `lvpm install --no-linkfix` to leave package files as copied, skipping
 both link repair and source-only preparation. The legacy `--no-relink`

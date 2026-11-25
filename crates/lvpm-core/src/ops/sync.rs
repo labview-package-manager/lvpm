@@ -2825,7 +2825,9 @@ beta = \"*\"
 
         sync(&env, &SyncOptions::default()).unwrap();
 
-        assert_eq!(fake.log().starts + fake.log().resaves.len(), 0, "no resave");
+        let log = fake.log();
+        assert_eq!(log.starts, 0, "LabVIEW started");
+        assert!(log.resaves.is_empty(), "resaved: {:?}", log.resaves);
         assert!(install::is_installed(&venv.store(), "alpha"));
     }
 }

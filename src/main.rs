@@ -2159,6 +2159,20 @@ mod tests {
     }
 
     #[test]
+    fn resave_is_asked_for_by_flag_on_install_sync_and_add() {
+        let resave = |args: &[&str]| match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::Install { apply, .. } | Cmd::Sync { apply, .. } | Cmd::Add { apply, .. } => {
+                apply.options(false, false).resave
+            }
+            _ => unreachable!(),
+        };
+        assert!(resave(&["lvpm", "install", "x", "--resave"]));
+        assert!(resave(&["lvpm", "sync", "--resave", "--relink"]));
+        assert!(resave(&["lvpm", "add", "x", "--resave"]));
+        assert!(!resave(&["lvpm", "install", "x"]));
+    }
+
+    #[test]
     fn a_labview_bitness_of_32_or_64_parses_and_reaches_the_flags() {
         for (value, bits) in [("32", 32), ("64", 64)] {
             let cli = Cli::try_parse_from(["lvpm", "--labview-bitness", value, "targets"]).unwrap();
