@@ -20,10 +20,13 @@
 - [JSON output and exit codes](reference/json-output.md)
 - [linkfix](linkfix.md)
 - [The VI Server protocol](vi-server-protocol.md)
+- [Package notes](package-notes.md)
+- [Known limitations](limitations.md)
 
 # Explanation
 
 - [The OpenG package model](ogpm-model.md)
+- [How a venv works](venvs.md)
 - [What an install does in LabVIEW](labview-integration.md)
 - [Architecture map](architecture-map.md)
 - [Architecture decisions](adr/README.md)

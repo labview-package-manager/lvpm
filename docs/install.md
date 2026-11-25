@@ -1,8 +1,18 @@
 # Install lvpm
 
-Windows 10/11 with LabVIEW 2020 or later. Linux is built and tested in NI's
-LabVIEW Linux images (see
+Windows 10/11 with LabVIEW 2020 or later; venvs need LabVIEW 2024 Q1 or
+later. Linux is built and tested in NI's LabVIEW Linux images (see
 [Continuous integration](https://github.com/ThatsTheEnd/lvpm/blob/main/CONTRIBUTING.md#continuous-integration)).
+
+## Upgrading lvpm
+
+Run the install script again for the newest release, or download and run the
+newer MSI, which upgrades the existing installation in place. For a manual
+installation, replace `lvpm.exe` with the one from the new release.
+
+When a command succeeds in a terminal, lvpm says so if a newer stable release
+is out, but never installs it
+([Update notice](usage.md#update-notice)).
 
 ## With the install script
 
@@ -66,3 +76,24 @@ cargo test
 ```
 
 Toolchain setup is in [CONTRIBUTING.md](https://github.com/ThatsTheEnd/lvpm/blob/main/CONTRIBUTING.md).
+
+## Test a local release installation
+
+From a Windows checkout with the build tools installed:
+
+```powershell
+.\scripts\install.ps1 -BuildLocal
+```
+
+This runs `cargo build --release --locked`, packages the build into a zip and
+installs it with the same verification and extraction as a release, into
+`%LOCALAPPDATA%\lvpm\bin` and on your user `PATH`. It publishes nothing. For
+a test that leaves your installed lvpm and your `PATH` alone:
+
+```powershell
+.\scripts\install.ps1 -BuildLocal -InstallDir "$PWD\sandbox\local-installer\bin" -NoPath
+.\sandbox\local-installer\bin\lvpm.exe --version
+```
+
+`-Archive <FILE> -Sha256 <HASH>` installs a release zip you already have
+instead. Neither can be combined with `-Version` or `-Stable`.
