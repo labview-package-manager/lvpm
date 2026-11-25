@@ -53,7 +53,7 @@ Feature: lvpm does not choose a package version younger than min-age-days
   Scenario: lvpm add without a version writes the newest eligible version
     Given the project sets min-age-days to 14
     And "first" lists "alpha" 1.0 released 30 days ago and "alpha" 1.1 released 3 days ago
-    When I run "lvpm add alpha --prefix dest"
+    When I run "lvpm install alpha --prefix dest"
     Then lvpm.lock takes "alpha" 1.0 from "first"
 
   Scenario: lvpm lock --upgrade does not move to a version younger than the limit
@@ -103,7 +103,7 @@ Feature: lvpm does not choose a package version younger than min-age-days
   Scenario: lvpm add with an explicit version is exempt
     Given the project sets min-age-days to 14
     And "first" lists "alpha" 1.0 released 30 days ago and "alpha" 1.1 released 3 days ago
-    When I run "lvpm add alpha@1.1 --prefix dest"
+    When I run "lvpm install alpha@1.1 --prefix dest"
     Then lvpm.lock takes "alpha" 1.1 from "first"
 
   Scenario: an exact pin stays exempt when another package also requires the package

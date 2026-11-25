@@ -52,7 +52,7 @@ Feature: install hooks run only for allowed packages
   Scenario: lvpm add of a newer version keeps hooks = "run"
     Given "first" lists "alpha" 1.0 and "alpha" 2.0
     And a project that depends on "alpha" "1.0" with hooks set to "run" and lvpm.lock is current
-    When I run "lvpm add alpha@2.0 --prefix dest"
+    When I run "lvpm install alpha@2.0 --prefix dest"
     Then the command succeeds
     And lvpm.toml has exactly the line: alpha = { version = "2.0", hooks = "run" }
 

@@ -34,10 +34,10 @@ lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refre
   targets                       detected LabVIEW installations
   search <query>                search the indexes
   list                          what lvpm installed into the target
-  install [<pkg>[@ver]] [--manifest FILE] [--dry-run] [--no-deps]
+  install [<pkg>[@ver]] [--no-project] [--manifest FILE] [--dry-run] [--no-deps]
           [--no-linkfix] [--relink] [--no-hooks | --hooks] [--allow-downgrade]
           [--relink-timeout SECS] [--relink-progress NAME] [--keep-open]
-  uninstall <pkg> [--with-deps | --keep-deps] [--force] | --all
+  uninstall <pkg> [--no-project] [--with-deps | --keep-deps] [--force] | --all
   relink <pkg> | --all          [--relink-timeout] [--relink-progress] [--keep-open]
   linkfix [--tree DIR] [--dry-run] [--verbose] [--keep-compiled-code]
      [--fix owner,paths,qualifiers,source-only,clfn-wildcard] [--report FILE]
@@ -65,7 +65,12 @@ What works and stays:
 - Names users already know from cargo and npm: `install`, `uninstall`,
   `list`, `search`, `config get|set`, `cache add`.
 - No activation step. A venv at or above the working directory is used;
-  `--global`, `--prefix` and `--project` override it.
+  `--global`, `--prefix` and `--project` override it. In this fork a write into
+  a LabVIEW installation itself needs `--global`, and `--labview-version` only
+  picks which one ([usage.md](usage.md#writing-into-labview-itself)).
+- In this fork, `install <pkg>` and `uninstall <pkg>` change the project in a
+  project (`--no-project` opts out), and `add` and `remove` are their aliases
+  ([usage.md](usage.md#adding-and-removing-dependencies)).
 - `<pkg> | --all` for every bulk command.
 - `RelinkArgs` shared by `install` and `relink`, so the two cannot drift.
 

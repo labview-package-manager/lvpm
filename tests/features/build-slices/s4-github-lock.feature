@@ -171,19 +171,19 @@ Feature: lvpm locks a package from its GitHub repo
 
   Scenario: lvpm add keeps the github line
     Given the pilot B project with a current lvpm.lock
-    When I run "lvpm add labview_open_source_lib_serializer@>=1.2.1 --prefix dest"
+    When I run "lvpm install labview_open_source_lib_serializer@>=1.2.1 --prefix dest"
     Then the command succeeds
     And lvpm.toml's pilot B line has github "LabVIEW-Open-Source/Serializer" and version ">=1.2.1"
 
   Scenario: a cached listing without the release a new constraint asks for is read again
     Given the pilot B project with a current lvpm.lock
     And the repo "LabVIEW-Open-Source/Serializer" has release "1.3.0" with "labview_open_source_lib_serializer-1.3.0.1.vip"
-    When I run "lvpm add labview_open_source_lib_serializer@>=1.3.0 --prefix dest"
+    When I run "lvpm install labview_open_source_lib_serializer@>=1.3.0 --prefix dest"
     Then lvpm.lock takes "labview_open_source_lib_serializer" at version "1.3.0.1"
 
   Scenario: lvpm remove drops the github line and its lock input
     Given the pilot B project with a current lvpm.lock
-    When I run "lvpm remove labview_open_source_lib_serializer --prefix dest"
+    When I run "lvpm uninstall labview_open_source_lib_serializer --prefix dest"
     Then the command succeeds
     And lvpm.toml has no pilot B line
     And lvpm.lock has no [inputs.github] table

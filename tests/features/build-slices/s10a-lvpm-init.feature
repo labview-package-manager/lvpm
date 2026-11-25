@@ -83,7 +83,7 @@ Feature: lvpm init starts a project (S10a)
     When I run "lvpm init --labview-version 2026" in the working directory
     Then it succeeds
     And the folder has a venv bound to LabVIEW 2026
-    When I run "lvpm add labview_open_source_project_lib_labview_open_source_palette" in the working directory
+    When I run "lvpm install labview_open_source_project_lib_labview_open_source_palette" in the working directory
     Then it succeeds
     And the venv holds labview_open_source_project_lib_labview_open_source_palette in its add-on folder and no staging folder
 

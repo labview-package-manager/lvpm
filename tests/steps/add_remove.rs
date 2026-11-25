@@ -1202,7 +1202,7 @@ async fn gone_from_the_group_the_lock_and_dest(world: &mut CliWorld, name: Strin
 }
 
 /// `the command fails saying "beta" is in [a] and [b], with one next line
-/// each: "lvpm remove beta" and "lvpm remove beta --group ci"`.
+/// each: "lvpm uninstall beta" and "lvpm uninstall beta --group ci"`.
 #[then(
     regex = r#"^the command fails saying "([^"]+)" is in (.+), with one next line each: ("[^"]+"(?: and "[^"]+")*)$"#
 )]
@@ -1223,7 +1223,7 @@ async fn fails_listing_every_table_holding_it(
         .collect();
     assert_eq!(next_lines.len(), commands.len(), "{printed}");
     for command in commands {
-        // What follows the command keeps `lvpm remove beta` from matching `... --group ci`.
+        // What follows the command keeps `lvpm uninstall beta` from matching `... --group ci`.
         let hint = format!("next: {command} removes it");
         assert!(
             next_lines.iter().any(|line| line.starts_with(&hint)),

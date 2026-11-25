@@ -38,7 +38,7 @@ labview = ">=2026"   # the oldest LabVIEW the project is meant for
 - `labview` is a minimum, not a pin. lvpm needs it to lock, install and
   add. Write `">=2026"`; a bare `"2026"` is read as that minimum, with a
   warning.
-- `[dependencies]` is empty for now; `lvpm add` fills it in the next step.
+- `[dependencies]` is empty for now; `lvpm install <name>` fills it in the next step.
 
 Any `lvpm` command run in this folder, or below it, now works on this
 project.

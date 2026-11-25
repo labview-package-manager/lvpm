@@ -81,7 +81,7 @@ async fn locked_project_with_hooks(
         &constraint,
         &hooks_key(&hooks),
     );
-    // `lvpm add` installs into a destination: the scratch folder `dest`.
+    // `lvpm install` installs into a destination: the scratch folder `dest`.
     world.sandbox.make_empty_dest();
     world.lock_the_project();
 }

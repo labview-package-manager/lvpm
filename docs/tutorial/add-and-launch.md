@@ -13,10 +13,10 @@ description, requirements and versions.
 ## Add it
 
 ```console
-$ lvpm add oglib_error
+$ lvpm install oglib_error
 ```
 
-That one command does three things:
+In a project that one command does three things:
 
 1. Adds `oglib_error = ">=<the version it locked>"` under `[dependencies]`
    in `lvpm.toml`.
@@ -52,7 +52,7 @@ Save a project (`HelloLvpm.lvproj`) and a VI that uses one of the package's
 VIs into the folder. The VI links to the package by a portable path, so it works on
 any machine with the same LabVIEW version that syncs the same lock.
 
-After a later `lvpm add`, restart with `lvpm launch`: LabVIEW reads the venv
+After a later `lvpm install <name>`, restart with `lvpm launch`: LabVIEW reads the venv
 only when it starts.
 
 Next: [Package and publish a library](build-and-publish.md).

@@ -723,6 +723,13 @@ Unit tests, not scenarios:
 **Files**: `README.md`, `docs/*.md`, `docs/tutorial/*.md`, `docs/reference/json-output.md`, `tests/features/**/*.feature`, `tests/steps/*.rs`
 **Commit**: `docs: name install and uninstall as the project commands, and --global for LabVIEW itself (#54)`
 
+**Built differently in Step 7.1** (decided while building; the diff is the record):
+
+- Docs, as built, not as planned: the rule table and a "What a project refuses" paragraph are in docs/usage.md "Adding and removing dependencies"; a new "Writing into LabVIEW itself" section (a table of `--global`, `--labview-version` and `--prefix`, then the reads, headless and TUI exceptions) follows the flags table, and the `--global` and `--labview-version` rows link to it. The alias is one sentence on one line, so the second criterion's grep matches one line. "Uninstalling" says it is the direct route (`--no-project`, `--all`, or outside a project). docs/reference/json-output.md has a section on the announce events (`install_adds_to_project`, `uninstall_removes_from_project`; `destination` and `dry_run` only when set) and says `--json add/remove` report `install`/`uninstall`.
+- Sweep beyond the plan's file list: docs/ci-docker.md (the headless paragraph, and `lock`/`add`/`remove` in its table), docs/cli.md (synopsis `--no-project`, two bullets pointing at usage.md; its proposals and "Missing" table are upstream's record and stay), docs/venvs.md (`uninstall <pkg> --no-project --global`, since `uninstall --global <pkg>` in a project now edits lvpm.toml), docs/labview-integration.md (hooks table rows), docs/roadmap.md (the two `add`/`remove` lines; the measured headless Caraya run stays), docs/tutorial/*.md and README.md (`lvpm add` to `lvpm install`; the Quick start's `list` and `uninstall` lines gained `--labview-version 2026` and `--global`, because without a flag they already failed with "pick a destination").
+- Left, though the second grep matches them: docs/adr/0004-sources-first-wins-and-pinning.md (a decision record) and docs/map/index.html (a generated snapshot of 2026-11-02); `lvpm add` still works as the alias. Scenario titles stay (s4, s12, min-release-age slice-1, s13, s7c), as the plan says.
+- Scenarios: only commands changed, in s10a, s4, 45-old-dependency-groups, s12, slice-11 (the outline's two rows), slice-16 (the quoted example the usage guide must show, now `lvpm install "gamma@>=0.5"`), slice-17, min-release-age slice-1, s13 and s7c. slice-13 and 54-install-uninstall keep `add`/`remove`, and tests/support/sandbox.rs keeps its two guard tests on the aliases. Comments in tests/steps/add_remove.rs and hooks.rs follow.
+
 ## Parallelization
 
 ```mermaid
@@ -793,8 +800,8 @@ See each step.
   - [x] Step 5.1: Delete Cmd::Add and Cmd::Remove
 - [x] Wave 6 / Slice 6: a write into LabVIEW itself needs --global
   - [x] Step 6.1: --global decides a write into an installation
-- [ ] Wave 7 / Slice 7: docs and scenarios name install/uninstall
-  - [ ] Step 7.1: Sweep
+- [x] Wave 7 / Slice 7: docs and scenarios name install/uninstall
+  - [x] Step 7.1: Sweep
 
 ## Plan Review Summary
 

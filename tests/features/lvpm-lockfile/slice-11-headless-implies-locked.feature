@@ -46,7 +46,7 @@ Feature: On a headless machine a missing or outdated lock fails the job
     Then it succeeds and lvpm.lock is current afterwards
 
     Examples:
-      | command                        |
-      | lvpm lock                      |
-      | lvpm add gamma --prefix dest   |
-      | lvpm remove beta --prefix dest |
+      | command                           |
+      | lvpm lock                         |
+      | lvpm install gamma --prefix dest  |
+      | lvpm uninstall beta --prefix dest |
