@@ -40,8 +40,9 @@ pub struct Package {
 /// What a `.vipc` says.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vipc {
-    /// The year of the LabVIEW it targets: `13.0` is 2013.
-    pub labview_year: u32,
+    /// The year of the LabVIEW it targets: `13.0` is 2013. Only reported, so a
+    /// `<Version>` that is no year, or none, is `None` and refuses nothing.
+    pub labview_year: Option<u32>,
     pub packages: Vec<Package>,
 }
 
@@ -76,14 +77,21 @@ fn read_config(path: &Path) -> Result<String, String> {
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err("config.xml: larger than 1 MiB".to_string());
     }
-    String::from_utf8(bytes).map_err(|_| "config.xml: not UTF-8 text".to_string())
+    Ok(decode(bytes))
+}
+
+/// `config.xml` as text. Some real files carry Windows code page bytes (a
+/// creator's name, say), so bytes that are not UTF-8 are read as Latin-1,
+/// which agrees with Windows-1252 outside 0x80-0x9F.
+fn decode(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| e.into_bytes().iter().map(|&b| b as char).collect())
 }
 
 /// The text of `config.xml` read as a `Vipc`; the error is what is wrong with it.
 fn parse(xml: &str) -> Result<Vipc, String> {
     let target = target(xml)?;
     let (head, mut rest) = target.split_at(target.find("<Package>").unwrap_or(target.len()));
-    let labview_year = year(field(head, "Version", "")?)?;
+    let labview_year = element(head, "Version").and_then(|(value, _)| year(value));
     let mut packages = Vec::new();
     while let Some((block, after)) = element(rest, "Package") {
         // An unclosed `<Package>` would otherwise swallow the next one.
@@ -137,16 +145,21 @@ fn package(block: &str) -> Result<Package, String> {
     })
 }
 
-/// `13.0` is 2013: a two-digit major, a dot, one or more digits, nothing else.
-fn year(value: &str) -> Result<u32, String> {
+/// `13.0` is 2013 and `9.0` is 2009: a major of 9 to 99, a dot, one or more
+/// digits, and then only the ` (32-bit)` or ` (64-bit)` VIPM writes. Anything
+/// else, an older LabVIEW too, is no year.
+fn year(value: &str) -> Option<u32> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    match value.split_once('.') {
-        Some((major, minor)) if major.len() == 2 && digits(major) && digits(minor) => major
-            .parse::<u32>()
-            .map(|major| 2000 + major)
-            .map_err(|e| e.to_string()),
-        _ => Err(format!("<Version> {value} is not N.N")),
+    let number = [" (32-bit)", " (64-bit)"]
+        .iter()
+        .find_map(|bits| value.strip_suffix(bits))
+        .unwrap_or(value);
+    let (major, minor) = number.split_once('.')?;
+    if major.len() > 2 || !digits(major) || !digits(minor) {
+        return None;
     }
+    let major: u32 = major.parse().ok()?;
+    (9..=99).contains(&major).then_some(2000 + major)
 }
 
 /// `<tag>` read as `true` or `false` in any case. `who` leads an error.
@@ -196,7 +209,7 @@ impl Vipc {
     /// twice follows its last listing and counts once.
     pub fn seed(&self) -> Seed {
         let mut seed = Seed {
-            source_labview: Some(self.labview_year),
+            source_labview: self.labview_year,
             ..Seed::default()
         };
         for package in self.listings() {
@@ -405,7 +418,7 @@ mod tests {
             )),
         );
         let vipc = read_xml("sample", &xml).unwrap();
-        assert_eq!(vipc.labview_year, 2013);
+        assert_eq!(vipc.labview_year, Some(2013));
         assert_eq!(
             vipc.packages,
             [
@@ -438,8 +451,18 @@ mod tests {
             ),
             ("a_b-c_d", "1.2.3.4")
         );
-        assert_eq!(one(config_xml("26.3", "")).labview_year, 2026);
-        assert_eq!(one(config_xml("13.10", "")).labview_year, 2013);
+        assert_eq!(one(config_xml("26.3", "")).labview_year, Some(2026));
+        assert_eq!(
+            one(config_xml("26.1 (64-bit)", "")).labview_year,
+            Some(2026)
+        );
+        assert_eq!(
+            one(config_xml("24.3 (32-bit)", "")).labview_year,
+            Some(2024)
+        );
+        assert_eq!(one(config_xml("9.0", "")).labview_year, Some(2009));
+        assert_eq!(one(config_xml("99.0", "")).labview_year, Some(2099));
+        assert_eq!(one(config_xml("13.10", "")).labview_year, Some(2013));
         let any_case = one(demo(&package_xml(
             "demo_lib-1.0.0.1",
             "True",
@@ -502,23 +525,6 @@ mod tests {
             ),
             (demo("    <Package>\r\n"), "<Package> is not closed".into()),
             (
-                config_xml("thirteen", ""),
-                "<Version> thirteen is not N.N".into(),
-            ),
-            (
-                config_xml("13.0.1", ""),
-                "<Version> 13.0.1 is not N.N".into(),
-            ),
-            (config_xml("v13.0", ""), "<Version> v13.0 is not N.N".into()),
-            (
-                config_xml("2013.0", ""),
-                "<Version> 2013.0 is not N.N".into(),
-            ),
-            (config_xml("13.", ""), "<Version> 13. is not N.N".into()),
-            (config_xml("1.0", ""), "<Version> 1.0 is not N.N".into()),
-            (config_xml("+3.0", ""), "<Version> +3.0 is not N.N".into()),
-            ("<Target></Target>".into(), "Version is missing".into()),
-            (
                 demo("    <!-- hidden -->\r\n"),
                 "unsupported XML (comment)".into(),
             ),
@@ -541,6 +547,35 @@ mod tests {
                 format!("{}: config.xml: {what}", path.display()),
                 "for {xml}"
             );
+        }
+    }
+
+    #[test]
+    fn a_version_that_is_no_year_is_not_reported_and_the_packages_still_read() {
+        let package = chosen("demo_lib-1.0.0.1");
+        let no_version = config_xml("", &package).replace("<Version></Version>", "");
+        assert!(!no_version.contains("<Version>"));
+        let versions = [
+            "",
+            "thirteen",
+            "13.0.1",
+            "v13.0",
+            "2013.0",
+            "13.",
+            "8.6",
+            "1.0",
+            "100.0",
+            "13.0(64-bit)",
+            "13.0 (64-bit) ",
+            "13.0 (16-bit)",
+            "+3.0",
+        ];
+        let configs = versions.iter().map(|v| config_xml(v, &package));
+        for xml in configs.chain([no_version]) {
+            let vipc = read_xml("no-year", &xml).unwrap();
+            assert_eq!(vipc.labview_year, None, "for {xml}");
+            assert_eq!(vipc.packages[0].name, "demo_lib", "for {xml}");
+            assert_eq!(vipc.seed().source_labview, None, "for {xml}");
         }
     }
 
@@ -593,12 +628,21 @@ mod tests {
             read(&path, &shown.to_string()).unwrap_err().to_string(),
             format!("{shown}: config.xml is missing")
         );
+    }
 
-        dir.vipc(&[("config.xml", &[0xff, 0xfe])]);
-        assert_eq!(
-            read(&path, &shown.to_string()).unwrap_err().to_string(),
-            format!("{shown}: config.xml: not UTF-8 text")
-        );
+    #[test]
+    fn a_config_in_the_windows_code_page_still_reads() {
+        let mut xml = demo(&chosen("demo_lib-1.0.0.1")).into_bytes();
+        let at = "<VI_Package_Configuration ".len();
+        xml.splice(at..at, b"Creator=\"J\xfcrgen\" ".iter().copied());
+        assert!(std::str::from_utf8(&xml).is_err());
+        let dir = Dir::new("code-page");
+        let path = dir.vipc(&[("config.xml", &xml)]);
+        let vipc = read(&path, "p.vipc").unwrap();
+        assert_eq!(vipc.packages[0].name, "demo_lib");
+        assert_eq!(decode(b"J\xfcrgen".to_vec()), "Jürgen");
+        // UTF-8 stays UTF-8, and is not read again as Latin-1.
+        assert_eq!(decode("Jürgen".as_bytes().to_vec()), "Jürgen");
     }
 
     #[test]
