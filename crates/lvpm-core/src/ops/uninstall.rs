@@ -576,7 +576,11 @@ mod tests {
                     dev,
                     group,
                     // The command that removes it for good acts on the same target.
-                    destination: Some(format!("--prefix {}", dir.display())),
+                    // Quoted as the hint quotes it: a CI temp dir like RUNNER~1 has a `~`.
+                    destination: Some(format!(
+                        "--prefix {}",
+                        super::super::env::shell_word(&dir.display().to_string())
+                    )),
                 }),
                 "{table}: {events:?}"
             );
