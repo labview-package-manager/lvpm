@@ -66,11 +66,13 @@ manifest a command uses is chosen in this order, first match wins:
 3. `--project <DIR>`: `<DIR>/lvpm.toml`, if it exists.
 4. The nearest `lvpm.toml` at or above the working directory.
 
-No manifest is fine: `lvpm install <name>` works without a project. When a
+No manifest is fine: `lvpm install <name> --prefix <DIR>` and
+`lvpm install <name> --global` work without a project. With no destination
+flag, `install` fails and names `--global`. When a
 manifest is found, its `[sources]` apply to every command that reads indexes
 (`search`, single-package `install`, full `install`), not only to a
 manifest-driven install. `min-age-days` is the exception: a single-package
-install that is not an `lvpm add` never applies it (see
+install that does not add to a project (`--no-project`, or outside one) never applies it (see
 [A minimum release age](#a-minimum-release-age)).
 
 Only the file name `lvpm.toml` is discovered. A `vipm.toml` is read only
@@ -86,7 +88,7 @@ the manifest's `labview`.
 | --------- | ------ | ---------------------------------------------------------------------------------------------- |
 | `name`    | string | Shown in the install banner. Optional.                                                         |
 | `version` | string | Recorded, not acted on. Optional.                                                              |
-| `labview` | string | The **minimum** LabVIEW year the project supports, written `">=YYYY"`, for example `">=2025"`. **Required**: `lvpm lock`, `sync`, `add` and `remove` fail without it and print the line to add. A bare year, `"2025"`, the lvpm 0.3 form, is read as `">=2025"` with a warning. |
+| `labview` | string | The **minimum** LabVIEW year the project supports, written `">=YYYY"`, for example `">=2025"`. **Required**: `lvpm lock`, `sync`, a named `install` and `uninstall` fail without it and print the line to add. A bare year, `"2025"`, the lvpm 0.3 form, is read as `">=2025"` with a warning. |
 
 `labview` is a floor, not a pin:
 
@@ -97,7 +99,9 @@ the manifest's `labview`.
   manifest, `lvpm install` targets the LabVIEW `labview` names, or a newer
   installed one, instead of refusing (see the README's
   [CI in a container](ci-docker.md)).
-- A global install still takes its target from `--labview-version`.
+- A write into a LabVIEW installation itself takes `--global`;
+  `--labview-version` only picks which one (`--global` alone takes `labview`'s
+  LabVIEW). On a headless machine no `--global` is needed.
 
 ## `[sources]`
 
@@ -187,7 +191,7 @@ offset without a sign, a feed quirk beyond RFC 2822, is read as positive.
   first whole UTC day on which the version is eligible. A release date in the future counts
   as too new.
 - Pinning matters: an exact pin is exempt from min-age-days, so `alpha = "1.1"` locks 1.1 even
-  when it is three days old. So is a version named on `lvpm add alpha@1.1`
+  when it is three days old. So is a version named on `lvpm install alpha@1.1`
   or `lvpm lock --upgrade-package alpha@1.1`. When the manifest's constraint
   already admits that version, the upgrade flag pins only for that run. When
   it excludes it, lvpm rewrites the entry and keeps its kind: an exact entry
@@ -207,19 +211,18 @@ offset without a sign, a feed quirk beyond RFC 2822, is read as positive.
   eligible.
 - `lvpm.lock` records the limit, so changing it makes the lock out of date.
   Time passing does not: the limit takes effect at the next `lvpm lock`,
-  `lvpm lock --upgrade`, `lvpm add`, `lvpm remove` or `lvpm sync` that
+  `lvpm lock --upgrade`, a named `lvpm install` or `lvpm uninstall` in a project, or `lvpm sync` that
   resolves again, and an up-to-date `lvpm.lock` is not resolved again.
   `lvpm sync --locked` and `--frozen` never resolve, so they never apply it.
-- A plain install never applies the limit: `lvpm install --global <name>`, or
-  `lvpm install <name>` with `--prefix` or `--labview-version`, or outside a
-  project. Inside a project it uses the project's `[sources]` but not its
-  `min-age-days`; outside one it reads the indexes alone. In a project,
-  `lvpm install <name>` with none of those flags is an `lvpm add`, which does
-  apply it. An install from `lvpm tui` into a project's venv is an
-  `lvpm add` too and applies it. Without a project venv the TUI makes a plain
-  install into the newest LabVIEW installation, without the limit.
-  `--labview-version` in a project with a venv writes into that venv and does
-  not apply it.
+- A plain install never applies the limit: `lvpm install --global <name>`
+  or `lvpm install <name> --prefix <DIR>` outside a project, or
+  `lvpm install <name> --no-project` in one. With `--no-project` it uses the
+  project's `[sources]` but not its `min-age-days`; outside a project it reads
+  the indexes alone. In a project, `lvpm install <name>` adds the package to
+  `lvpm.toml` whatever destination flag it has, and that does apply the limit.
+  An install from `lvpm tui` into a project's venv is the same
+  `lvpm install <name>` and applies it. Without a project venv the TUI installs
+  nothing into LabVIEW itself.
 
 ## `[dependencies]`
 
@@ -338,7 +341,7 @@ Here is what the index key does:
   and `min-age-days` are settings, not sources, so they are refused too.
 - A name pinned to two sources.
 
-`lvpm add <name> --index <NAME>` writes the line
+`lvpm install <name> --index <NAME>` writes the line
 ([usage.md](usage.md#adding-and-removing-dependencies)).
 
 ### Allowing install hooks
@@ -364,9 +367,9 @@ pilot_a = { version = "*", hooks = "run" }
   `[dependencies] pilot_a: hooks must be "run" or "skip" (leave the key out to keep hooks off), got "yes"`.
   `"Run"` is refused too.
 - `hooks` is not part of the lock: changing it leaves `lvpm.lock` current.
-  `lvpm add pilot_a@<newer>` keeps it.
+  `lvpm install pilot_a@<newer>` keeps it.
 - It applies to installs into a LabVIEW installation, from `lvpm sync` and
-  `lvpm add`. A venv runs no hooks, and a headless LabVIEW runs them only
+  a named `lvpm install`. A venv runs no hooks, and a headless LabVIEW runs them only
   with `--hooks`.
 
 What a hook is, and all the rules, are in
@@ -377,7 +380,7 @@ What a hook is, and all the rules, are in
 Linkfix repairs a package's links without LabVIEW. A few packages need
 LabVIEW itself to re-resolve their VIs, such as .NET invoke nodes that store a
 member index from another build of the assembly. Give such a line
-`relink = true`, and `lvpm sync` and `lvpm add` load and save that package in
+`relink = true`, and `lvpm sync` and a named `lvpm install` load and save that package in
 LabVIEW after linkfix, the pass `--relink` runs for every package:
 
 ```toml
@@ -411,12 +414,17 @@ pass:
   and skipped.
 - An empty selection is an error for a manifest-driven install.
 
-In this fork, `lvpm install <name>[@<version>]` inside a project is `lvpm add`:
-it writes the package into `lvpm.toml`, locks and syncs. `--global`,
-`--prefix` or `--labview-version` install it without touching the manifest.
-A bare `lvpm install` in a project is `lvpm sync`: the venv is made to match
-`lvpm.lock`, and what the lock does not list is uninstalled. Outside a
-project, `install` stays additive. See [usage.md](usage.md#the-lock-file).
+In this fork, `lvpm install <name>[@<version>]` inside a project writes the
+package into `lvpm.toml`, locks and syncs; `--prefix`, `--global` and
+`--labview-version` only pick where the project syncs. `--no-project` installs
+it without touching the manifest. A bare `lvpm install` in a project is
+`lvpm sync`: the venv is made to match `lvpm.lock`, and what the lock does not
+list is uninstalled. Outside a project, `install` stays additive. See
+[usage.md](usage.md#adding-and-removing-dependencies).
+
+In a project, `lvpm uninstall <name>` takes the package out of `lvpm.toml`,
+locks and syncs, and refuses a package another one requires. The rest of this
+section is the direct uninstall (`--no-project`, `--all`, or outside a project).
 
 Uninstall can also remove unshared dependencies after confirmation; use
 `--with-deps` or `--keep-deps` for non-interactive use. It warns about
@@ -477,14 +485,14 @@ defined groups (`dev` is always one). A package that `[dependencies]` needs is
 installed whatever the flags; one that only unselected groups need is
 uninstalled, and the plan names those groups.
 
-`lvpm add <pkg> --group ci` writes the package under `[dependency-groups.ci]`,
-creating the table when it is missing and saying so; `lvpm remove <pkg> --group ci`
+`lvpm install <pkg> --group ci` writes the package under `[dependency-groups.ci]`,
+creating the table when it is missing and saying so; `lvpm uninstall <pkg> --group ci`
 takes it out. `--dev` is `--group dev`; `--dev` with `--group` is refused.
 If the package is in other tables than the one asked for, the error names every
-table that holds it, with the flag for each. `add` and `remove` install
-`[dependencies]`, dev and the edited group, and never uninstall a package the new
+table that holds it, with the flag for each. A project `install <name>` and
+`uninstall <name>` install `[dependencies]`, dev and the edited group, and never uninstall a package the new
 lock still lists, so tooling installed by `lvpm sync --group ci` survives a later
-`lvpm add x`. Plain `lvpm sync` is the exact one.
+`lvpm install x`. Plain `lvpm sync` is the exact one.
 
 ### Groups written the lvpm 0.3 way
 
@@ -503,12 +511,12 @@ warning: [dependencies.test] in lvpm.toml is read as a group: write [dependency-
 - **One form per group.** `[dependencies.test]` beside
   `[dependency-groups.test]` (or `[dependencies.dev]` beside a non-empty
   `[dev-dependencies]`) is refused, naming both.
-- **Edits refuse it.** `lvpm add`, `lvpm remove`, `lvpm import` and
+- **Edits refuse it.** `lvpm install <name>`, `lvpm uninstall <name>`, `lvpm import` and
   `lvpm lock --upgrade-package` write only the current form, so an edit to a
   group still written the old way (`--group test`, `--dev`, or an upgrade that
   rewrites a constraint in it) fails before anything changes, with the header
   to rename. So does an entry in `[dependencies]` named like the group, such
-  as `lvpm add test` beside `[dependencies.test]`.
+  as `lvpm install test` beside `[dependencies.test]`.
 - **A table with a line's key is a package.** `[dependencies.test]` with
   `version = "*"` is the package `test`, as before. An empty
   `[dependencies.test]` is a package line too, and refused as one.
@@ -738,7 +746,7 @@ unaffected.
 
 Tracked in [roadmap.md](roadmap.md#the-manifest-and-the-lockfile):
 
-- `lvpm.lock`, `lvpm sync` and `lvpm add` / `lvpm remove` are built in this
+- `lvpm.lock`, `lvpm sync`, and `lvpm install <name>` / `lvpm uninstall <name>` (also named `add` and `remove`) are built in this
   fork (see [usage.md](usage.md#the-lock-file)); upstream still lists them here.
 - **Future constraint grammar (Cargo)**, one for every dependency table:
 
@@ -760,9 +768,9 @@ Tracked in [roadmap.md](roadmap.md#the-manifest-and-the-lockfile):
     say so once, when it reads a bare version that a caret would widen.
   - Python's `==` is not accepted: `=` is the one spelling for exact, and
     `==` fails with a hint to use it.
-  - `name@version` stays a CLI shorthand for exact (`lvpm install`,
-    `lvpm add`), as in `cargo add`; it is not written in the manifest.
-    `lvpm add` writes `=x` when given a version and a caret on the resolved
+  - `name@version` stays a CLI shorthand for exact (`lvpm install`), as in
+    `cargo add`; it is not written in the manifest.
+    `lvpm install` writes `=x` when given a version and a caret on the resolved
     version otherwise, as `cargo add` does.
 - **More group controls**: `include-groups`, `--only-group`, `--all-groups`, a
   configurable default set (`[project] default-groups`), and groups on a global

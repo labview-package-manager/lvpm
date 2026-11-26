@@ -459,7 +459,7 @@ pub enum Event {
         from: String,
         to: String,
     },
-    /// `add` or `remove` changed one entry of the manifest. `dev`: the entry
+    /// `install` or `uninstall` changed one entry of the manifest. `dev`: the entry
     /// is in `[dev-dependencies]`; `group`: in `[dependency-groups.<group>]`.
     /// `created_table`: that group's table is new. `dry_run`: it is shown and
     /// not written.
@@ -472,23 +472,45 @@ pub enum Event {
         created_table: bool,
         dry_run: bool,
     },
-    /// A package `remove` took out of the manifest stays locked and installed:
-    /// these locked packages still require it.
-    PackageStillRequired {
-        name: String,
-        required_by: Vec<String>,
+    /// `install` with a package name, inside a project and without
+    /// `--no-project`, adds the package to `lvpm.toml`. `package` is as it was typed;
+    /// `destination` is the destination flag it was given, if any (`--prefix`),
+    /// which only picks where the project syncs. Said once the lock is made, so
+    /// a package no source lists never gets it; `dry_run`: nothing is written,
+    /// so it is what would be added.
+    InstallAddsToProject {
+        package: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
     },
-    /// `install` with a package name, inside a project and with no destination
-    /// flag, is an `add`. `package` is as it was typed. The first thing it says.
-    InstallAddsToProject { package: String },
+    /// `uninstall` with a package name, inside a project and without
+    /// `--no-project`, removes the package from `lvpm.toml`. `package` is as it was typed;
+    /// `destination` is the destination flag that picked the target, if any,
+    /// which only says where the project syncs. Said once the package is known
+    /// to be in the table `lvpm.toml` is edited in, the lock is made and no
+    /// locked package requires it; `dry_run`: nothing is written, so it is what
+    /// would be removed.
+    UninstallRemovesFromProject {
+        package: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+    },
     /// An `uninstall` took out a package that `lvpm.toml` still lists, in
     /// `[dev-dependencies]` when `dev`, `[dependency-groups.<group>]` when
-    /// `group`: the next sync would put it back.
+    /// `group`: the next sync would put it back. `destination` is the
+    /// destination flags the uninstall was given, as typed, with their values:
+    /// the command that removes it for good needs them to act on the same target.
     UninstalledStillListed {
         name: String,
         dev: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
     },
     /// The lock on disk still represents the manifest, so it was left alone.
     LockUpToDate { path: PathBuf },

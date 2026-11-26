@@ -424,9 +424,32 @@ pub enum EditError {
     /// A package was written `name@` with nothing after the `@`.
     #[error("a constraint is expected after \"@\" in \"{name}@\"")]
     EmptyConstraint { name: String },
-    /// `remove` names a package that is in no dependency table.
-    #[error("{name} is not in lvpm.toml")]
-    NotADependency { name: String },
+    /// `remove` names a package that is in no dependency table. `installed`:
+    /// it is installed in the target all the same.
+    #[error("{name} is not a dependency of this project")]
+    NotADependency { name: String, installed: bool },
+    /// `remove` names a package that locked packages require, so it cannot go:
+    /// `required_by` requires it directly, and `roots` are the packages the
+    /// project lists that need it, which are to go first, each with every table
+    /// of `lvpm.toml` that lists it (none for a direct `uninstall`, which has
+    /// no project). Nothing was changed. A direct `uninstall` says the same
+    /// when its installed records do.
+    #[error("{name} is required by installed packages: {}", .required_by.join(", "))]
+    Required {
+        name: String,
+        required_by: Vec<String>,
+        roots: Vec<(String, Vec<DependencyTable>)>,
+    },
+    /// With `--global`, the project would sync into a LabVIEW installation
+    /// itself, and the sync would uninstall `packages` (name and version) besides
+    /// the one the edit takes away: other projects, or the user, may have put
+    /// them there. Nothing was changed.
+    // Temporary until #55 asks before a sync removes.
+    #[error(
+        "the sync would uninstall packages from LabVIEW that you did not name: {}",
+        names_and_versions(.packages)
+    )]
+    ForeignInInstallation { packages: Vec<(String, String)> },
     /// `remove` names a package that is not in the table asked for, `[dependency-groups.<group>]`.
     #[error("{name} is not in [dependency-groups.{group}]")]
     NotInGroup { name: String, group: String },
@@ -487,7 +510,7 @@ pub enum CheckError {
     Other(#[from] anyhow::Error),
 }
 
-/// Why an install request could not be routed to a mode.
+/// Why an install or uninstall request could not be routed to a mode.
 #[derive(Debug, thiserror::Error)]
 pub enum RouteError {
     /// There is no project to sync, and no package to install: no `lvpm.toml`
@@ -502,9 +525,45 @@ pub enum RouteError {
         option: LockIncompatible,
         adding: bool,
     },
+    /// In a project a named uninstall takes the package out of `lvpm.toml` and
+    /// the lock decides what stays, so `flag` (`--keep-deps`, `--force`) asks for
+    /// what the sync would undo.
+    #[error("{flag} cannot be used in a project, because lvpm.lock decides what stays")]
+    UninstallNotWithLock { flag: &'static str },
+    /// A direct uninstall was given `flag`, which only an uninstall in a project
+    /// takes: `--dev`, `--group`, `--dry-run`, `--no-linkfix`, `--relink`, `--hooks`.
+    /// `because` is why the uninstall is direct.
+    #[error("{flag} can only be used when uninstalling a package from a project")]
+    OnlyInAProject {
+        flag: &'static str,
+        because: DirectBecause,
+    },
+    /// A named install that would not edit `lvpm.toml` was given `flags` (`--dev`,
+    /// `--group`, `--index`, each one given), which say where in it to save the
+    /// package. `no_project`: it is `--no-project` that makes the install
+    /// direct, else there is no project.
+    #[error(
+        "{} can only be used when installing a package into a project, which saves it in lvpm.toml",
+        .flags.join(" and ")
+    )]
+    SaveOnlyInAProject {
+        flags: Vec<&'static str>,
+        no_project: bool,
+    },
     /// Anything else that went wrong: its own text.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// Why an uninstall is direct, which decides how it is told to be a project's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectBecause {
+    /// No package is named (`--all`, or nothing): naming one is the way in.
+    NoPackage,
+    /// `--no-project` was given.
+    NoProject,
+    /// No `lvpm.toml` was found at or above the current directory.
+    NotInAProject,
 }
 
 /// What a request asks for that a sync from a lock cannot give.
@@ -512,6 +571,9 @@ pub enum RouteError {
 pub enum LockIncompatible {
     /// Leaving out the dependencies of the packages.
     NoDeps,
+    /// Letting a package go to an older version: a sync installs the lock's
+    /// version, older or newer, so there is nothing to allow.
+    AllowDowngrade,
     /// Reading the dependencies from another manifest.
     Manifest,
 }
@@ -622,6 +684,14 @@ fn not_found(token_source: Option<TokenSource>) -> String {
         Some(source) => format!("not found, or the token from {source} cannot see it"),
         None => format!("not found. If it is private, {SIGN_IN}"),
     }
+}
+
+/// `name version`, comma-separated.
+fn names_and_versions(packages: &[(String, String)]) -> String {
+    (packages.iter())
+        .map(|(name, version)| format!("{name} {version}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The tables as their headers read, in a sentence: `[a]`, `[a] and [b]`,

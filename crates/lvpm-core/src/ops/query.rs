@@ -221,7 +221,7 @@ pub struct PackageInfo {
 /// What lvpm has installed into the selected destination.
 /// Also says whether they are a venv's, whose list shows fewer hooks.
 pub fn list(env: &OpEnv) -> Result<(Vec<Manifest>, bool)> {
-    let destination = env.destination()?;
+    let destination = env.read_destination()?;
     let in_venv = matches!(destination, Destination::Venv(_));
     Ok((install::list_installed(&destination.store())?, in_venv))
 }
@@ -667,5 +667,21 @@ mod tests {
             .count();
         assert_eq!(selected, 1, "one destination() call");
         std::fs::remove_dir_all(&repo).ok();
+    }
+    #[test]
+    fn a_list_at_a_labview_version_alone_reads_the_installation() {
+        use crate::ops::testing::{FakeInstallation, Recorded, env_on, scratch_dir};
+        let dir = scratch_dir("list-version-alone");
+        let fake = FakeInstallation::new(&dir);
+        fake.with_package("alpha");
+        let sink = Recorded::default();
+        let mut env = env_on(&sink, &dir);
+        fake.place(&mut env);
+        env.flags.labview_version = Some("2099".into());
+
+        let (installed, in_venv) = list(&env).unwrap();
+        assert_eq!(installed.len(), 1);
+        assert!(!in_venv);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

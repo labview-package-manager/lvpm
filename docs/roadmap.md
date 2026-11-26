@@ -136,13 +136,13 @@ Done:
   written by `lvpm lock`; `lvpm sync` makes a venv hold exactly that, and
   `lvpm lock --upgrade[-package]` is the only thing that moves it. A real
   solver replaces the greedy resolver when a project is locked.
-- **`lvpm add <pkg>[@constraint]` / `lvpm remove <pkg>`** — edit the manifest,
+- **`lvpm install <pkg>[@constraint]` / `lvpm uninstall <pkg>`** in a project (also `add` and `remove`) — edit the manifest,
   lock and sync in one step.
 - **`[dev-dependencies]`** — test and CI tooling, synced by default and
   skipped with `--no-dev`.
 - **Named dependency groups** (`[dependency-groups.<name>]`, with
   `[dev-dependencies]` as the group `dev`) — `lvpm sync --group <name>` and
-  `lvpm add/remove --group <name>`; the lock records each package's groups.
+  `lvpm install/uninstall --group <name>`; the lock records each package's groups.
   Slice S11 in [vision/build-slices.md](vision/build-slices.md).
 - Headless machines act as `--locked`: a missing or stale lock fails the job.
 - **`vipm.toml` conversion** — for `lvpm venv create --manifest vipm.toml`

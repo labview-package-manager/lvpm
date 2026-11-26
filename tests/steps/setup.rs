@@ -54,7 +54,7 @@ pub(super) async fn beta_installed_in_loopback_project(world: &mut CliWorld) {
     world.sandbox.use_loopback_project();
     world
         .sandbox
-        .setup_lvpm(&["install", "beta", "--prefix", DEST_DIR]);
+        .setup_lvpm(&["install", "beta", "--no-project", "--prefix", DEST_DIR]);
 }
 
 #[given("an empty dest")]

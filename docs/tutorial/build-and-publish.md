@@ -1,7 +1,7 @@
 # 3. Package and publish a library
 
 Now turn code of your own into a package that other projects install with
-`lvpm add`.
+`lvpm install <name>`.
 
 ## A library to package
 
@@ -26,7 +26,7 @@ vendor       = "Hello Inc"
 display-name = "Hello"
 
 [dependencies]
-oglib_error = ">=6.0.1"   # what lvpm add wrote; yours may differ
+oglib_error = ">=6.0.1"   # what lvpm install wrote; yours may differ
 ```
 
 The package installs below `vi.lib/<vendor>/<display-name>`, here
@@ -74,7 +74,7 @@ Then, in another project with its own `lvpm.toml` and venv (steps 1 and 2
 again, in a new folder):
 
 ```console
-$ lvpm add hello_lvpm
+$ lvpm install hello_lvpm
 ```
 
 `hello_lvpm` and its `oglib_error` land in that project's venv.

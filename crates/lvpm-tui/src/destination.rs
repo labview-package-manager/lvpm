@@ -67,7 +67,7 @@ impl EnvBuilder {
 
     /// The destination at start, or why there is none.
     pub fn destination(&self) -> Result<Destination, String> {
-        self.env(&Quiet, false).destination().map_err(|error| {
+        self.env(&Quiet, false).read_destination().map_err(|error| {
             let error = format!("{error:#}");
             // shortcut: core's "pick a destination" error names CLI flags the
             // TUI has none of; matched by its text until core types it.

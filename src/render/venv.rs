@@ -109,7 +109,7 @@ fn shadow_warning(year: u32, shadowed: &[Shadowed]) -> String {
     for p in by_lvpm {
         out += &format!(
             "  fix: lvpm uninstall {} --global --labview-version {year}\n",
-            p.name
+            lvpm_core::ops::env::shell_word(&p.name)
         );
     }
     out

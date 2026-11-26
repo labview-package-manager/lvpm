@@ -44,13 +44,13 @@ Feature: a group written [dependencies.<group>] is still read
 
   Scenario: an edit to another table leaves an old-style group as it is
     Given lvpm.toml has [dependencies.test] "ci_tools" "*"
-    When I run "lvpm add beta --prefix dest"
+    When I run "lvpm install beta --prefix dest"
     Then lvpm.toml differs from before by exactly the "beta" line
     And [dependencies] itself has the "beta" line
 
   Scenario: a package named like an old-style group is refused with the fix
     Given lvpm.toml has [dependencies.test] "ci_tools" "*"
-    When I run "lvpm add test --prefix dest"
+    When I run "lvpm install test --prefix dest"
     Then the command fails with: [dependencies.test] is the lvpm 0.3 form of a group; rename the header to [dependency-groups.test], then run this again
     And nothing changed
 
@@ -67,7 +67,7 @@ Feature: a group written [dependencies.<group>] is still read
 
   Scenario: an edit to an old-style dev group is refused with the fix
     Given lvpm.toml has [dependencies.dev] "ci_tools" "*"
-    When I run "lvpm add beta --dev --prefix dest"
+    When I run "lvpm install beta --dev --prefix dest"
     Then the command fails with: [dependencies.dev] is the lvpm 0.3 form of a group; rename the header to [dev-dependencies], then run this again
     And nothing changed
 

@@ -72,12 +72,11 @@ Feature: add and remove edit the manifest, then lock and sync
     When I run "lvpm remove gamma --prefix dest"
     Then "gamma" is gone from lvpm.toml, lvpm.lock and dest
 
-  Scenario: remove keeps a package another one still requires
+  Scenario: remove refuses a package another one requires
     Given the project also depends on "alpha" ">=1.0", locked and synced
     When I run "lvpm remove alpha --prefix dest"
-    Then "alpha" is gone from lvpm.toml
-    And "alpha" stays in lvpm.lock and dest
-    And the output says "alpha" is still required by "beta"
+    Then the command fails with: alpha is required by installed packages: beta
+    And nothing changed
 
   Scenario: remove --dev removes from [dev-dependencies]
     Given dev dependency "caraya" ">=1.0", locked and synced
@@ -96,7 +95,7 @@ Feature: add and remove edit the manifest, then lock and sync
 
   Scenario: removing a name that is not a dependency fails
     When I run "lvpm remove zeta --prefix dest"
-    Then the command fails saying "zeta" is not in lvpm.toml
+    Then the command fails with: zeta is not a dependency of this project
     And nothing changed
 
   @core
@@ -117,10 +116,13 @@ Feature: add and remove edit the manifest, then lock and sync
     Examples:
       | project                        | args                         | mode                              |
       | a project                      | gamma                        | Add                               |
-      | a project                      | gamma --prefix dest          | Additive                          |
-      | a project                      | gamma --global               | Additive                          |
-      | a project                      | gamma --labview-version 2026 | Additive                          |
+      | a project                      | gamma --prefix dest          | Add                               |
+      | a project                      | gamma --global               | Add                               |
+      | a project                      | gamma --labview-version 2026 | Add                               |
+      | a project                      | gamma --no-project           | Additive                          |
+      | a project                      | gamma --no-project --prefix dest | Additive                      |
       | a directory without lvpm.toml  | gamma                        | Additive                          |
+      | a directory without lvpm.toml  | gamma --no-project           | Additive                          |
       | a project                      | (none)                       | Sync                              |
       | a project                      | --prefix dest                | Sync                              |
       | a project                      | --global                     | Sync                              |
@@ -131,26 +133,26 @@ Feature: add and remove edit the manifest, then lock and sync
   Scenario: install with a name in a project is add, and says so
     Given a project with a venv
     When I run "lvpm install gamma", and "lvpm add gamma" in an identical world
-    Then the first output line says gamma is being added to lvpm.toml and the project synced to lvpm.lock
-    And both manifests, locks and destinations are identical
+    Then the output says gamma is being added to lvpm.toml and the project synced to lvpm.lock
+    And both manifests, locks, destinations and outputs are identical
 
-  Scenario Outline: install with a name and an explicit destination stays additive
+  Scenario Outline: --no-project keeps a named install additive
     When I run "lvpm install gamma <flag>" inside the project
     Then gamma is installed in that destination
     And lvpm.toml and lvpm.lock are byte-identical to before
 
     Examples:
-      | flag          |
-      | --prefix dest |
+      | flag                         |
+      | --no-project --prefix dest |
 
   Scenario: install flags that make no sense with a lock are rejected
     When I run "lvpm install --no-deps" inside the project
-    Then the command fails saying --no-deps is not supported with a lock
+    Then the command fails saying --no-deps cannot be used in a project, because lvpm.lock decides the dependencies
 
-  Scenario: uninstall inside a project hints at remove
-    When I run "lvpm uninstall beta --keep-deps --prefix dest"
+  Scenario: uninstall --no-project inside a project leaves lvpm.toml and says it still lists the package
+    When I run "lvpm uninstall beta --no-project --keep-deps --prefix dest"
     Then "beta" is uninstalled
-    And the output says "beta" is still in lvpm.toml and "lvpm remove beta" removes it for good
+    And the output says "beta" is still in lvpm.toml and "lvpm uninstall beta" removes it for good
 
   Scenario Outline: lock-editing commands outside a project are refused
     Given a directory without lvpm.toml
@@ -159,8 +161,6 @@ Feature: add and remove edit the manifest, then lock and sync
 
     Examples:
       | command          |
-      | lvpm add gamma   |
-      | lvpm remove beta |
       | lvpm lock         |
       | lvpm lock --check |
       | lvpm sync         |
@@ -179,9 +179,9 @@ Feature: add and remove edit the manifest, then lock and sync
   # `--global` and `--labview-version` mean is covered by the routing table
   # above, and the unit tests of `install_mode`. That such an install leaves
   # lvpm.toml and lvpm.lock alone runs in core's unit tests against a fake
-  # installation (a_named_install_with_a_destination_flag_adds_there_... in
+  # installation (a_no_project_install_with_a_destination_flag_adds_there_... in
   # ops/sync.rs).
   @labview @unsafe
-  Scenario: install with a name and --global stays additive
-    When I run "lvpm install gamma --global --labview-version 2026" inside the project
+  Scenario: install with a name, --no-project and --global stays additive
+    When I run "lvpm install gamma --no-project --global --labview-version 2026" inside the project
     Then gamma is installed into that LabVIEW and lvpm.toml and lvpm.lock are unchanged

@@ -10,8 +10,10 @@ use lvpm_core::install::Manifest;
 use lvpm_core::manifest_edit::DependencyTable;
 use lvpm_core::ops::Destination;
 use lvpm_core::ops::add_remove;
+use lvpm_core::ops::env::shell_word;
 use lvpm_core::ops::install::{self, InstallOptions};
 use lvpm_core::ops::query::{self, Catalog, PackageInfo};
+use lvpm_core::target::{LvTarget, Roots};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -211,10 +213,27 @@ fn run(builder: &EnvBuilder, job: Job, send: &Sender<Done>) -> Done {
                 ..InstallOptions::default()
             };
             // In a project's venv the install is an add, as `lvpm install <name>`
-            // is. The TUI sets the newest LabVIEW in the flags, so
-            // `route::install_mode` would answer additive: test the venv instead.
-            let outcome = match env.destination() {
-                Ok(Destination::Venv(_)) => {
+            // is. The TUI names the newest LabVIEW in its flags, which writes
+            // into it only with --global: the TUI has no such flag, so with no
+            // venv it refuses, naming the command that does.
+            let destination = env.destination();
+            let refused = match &destination {
+                Err(_) => match env.read_destination() {
+                    Ok(Destination::Global(Roots {
+                        target: Some(target),
+                        ..
+                    })) => Some(format!(
+                        "outside a venv the TUI installs nothing into LabVIEW itself; \
+                         run lvpm install {} {}",
+                        shell_word(&package),
+                        global_flags(&target, &builder.targets)
+                    )),
+                    _ => None,
+                },
+                Ok(_) => None,
+            };
+            let outcome = match (destination, refused) {
+                (Ok(Destination::Venv(_)), _) => {
                     // A bare name: core writes the floor at the version it locks.
                     let spec = match exact {
                         true => package.as_str(),
@@ -232,7 +251,8 @@ fn run(builder: &EnvBuilder, job: Job, send: &Sender<Done>) -> Done {
                         )),
                     }
                 }
-                _ => match install::install(&env, Some(&package), &opts) {
+                (_, Some(refusal)) => Outcome::Failed(refusal),
+                (_, None) => match install::install(&env, Some(&package), &opts) {
                     Ok(()) => Outcome::Done,
                     Err(error) if error.chain().any(|cause| cause.is::<Cancelled>()) => {
                         Outcome::Cancelled
@@ -242,5 +262,93 @@ fn run(builder: &EnvBuilder, job: Job, send: &Sender<Done>) -> Done {
             };
             Done::Installed { dry_run, outcome }
         }
+    }
+}
+
+/// The flags that make `lvpm install` write into `target`: its year, and its
+/// bitness when another detected installation has the same year.
+fn global_flags(target: &LvTarget, detected: &[LvTarget]) -> String {
+    let year = target.year();
+    let shared = detected
+        .iter()
+        .any(|other| other.year() == year && other.bitness != target.bitness);
+    match shared {
+        true => format!(
+            "--global --labview-version {year} --labview-bitness {}",
+            target.bitness
+        ),
+        false => format!("--global --labview-version {year}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lvpm_core::config::Config;
+    use lvpm_core::target::LvTarget;
+
+    /// The install job's answer where the TUI has no venv, and whether it
+    /// started anything, with `targets` detected (the newest first).
+    fn install_without_a_venv(targets: &[(f64, u8)]) -> (Outcome, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            log_dir: Default::default(),
+            venv_title: Default::default(),
+            cache: dir.path().join("cache"),
+            hooks_run: Vec::new(),
+            local_sources: Vec::new(),
+            venv_dir: ".lv-venv".into(),
+        };
+        let targets = targets
+            .iter()
+            .map(|&(version, bitness)| LvTarget {
+                version,
+                bitness,
+                path: dir.path().join(format!("LabVIEW {version} {bitness}")),
+            })
+            .collect::<Vec<_>>();
+        let builder = EnvBuilder::new(config, targets.clone(), dir.path().join("work"));
+        let job = Job::Install {
+            package: "alpha".into(),
+            exact: false,
+            dry_run: false,
+            allow_downgrade: false,
+            cancel: CancelToken::default(),
+        };
+        let (send, receive) = mpsc::channel();
+        let Done::Installed { outcome, .. } = run(&builder, job, &send) else {
+            panic!("an install job ends with its result");
+        };
+        let wrote = receive.try_recv().is_ok()
+            || dir.path().join("cache").exists()
+            || targets.iter().any(|target| target.path.exists());
+        (outcome, wrote)
+    }
+
+    #[test]
+    fn an_install_with_no_venv_is_refused_and_writes_nothing_into_labview() {
+        let (outcome, wrote) = install_without_a_venv(&[(26.3, 64)]);
+        assert_eq!(
+            outcome,
+            Outcome::Failed(
+                "outside a venv the TUI installs nothing into LabVIEW itself; \
+                 run lvpm install alpha --global --labview-version 2026"
+                    .into()
+            )
+        );
+        assert!(!wrote, "nothing was started or created");
+    }
+
+    #[test]
+    fn the_refusal_names_the_bitness_when_another_installation_shares_the_year() {
+        let (outcome, _) = install_without_a_venv(&[(26.3, 64), (26.3, 32), (25.3, 64)]);
+        assert_eq!(
+            outcome,
+            Outcome::Failed(
+                "outside a venv the TUI installs nothing into LabVIEW itself; \
+                 run lvpm install alpha --global --labview-version 2026 --labview-bitness 64"
+                    .into()
+            )
+        );
     }
 }

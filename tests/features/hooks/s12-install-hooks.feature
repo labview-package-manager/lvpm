@@ -49,10 +49,10 @@ Feature: install hooks run only for allowed packages
     When the manifest is read
     Then it is accepted with the github source and hooks allowed for "pkg"
 
-  Scenario: lvpm add of a newer version keeps hooks = "run"
+  Scenario: lvpm install of a newer version keeps hooks = "run"
     Given "first" lists "alpha" 1.0 and "alpha" 2.0
     And a project that depends on "alpha" "1.0" with hooks set to "run" and lvpm.lock is current
-    When I run "lvpm add alpha@2.0 --prefix dest"
+    When I run "lvpm install alpha@2.0 --prefix dest"
     Then the command succeeds
     And lvpm.toml has exactly the line: alpha = { version = "2.0", hooks = "run" }
 
@@ -94,7 +94,7 @@ Feature: install hooks run only for allowed packages
     And a LabVIEW 2026 installation
     And the lvpm test fixture in the local package folder
     And the LabVIEW installation is free of the lvpm test fixture
-    When I run "lvpm install lvpm_test_fixture --labview-version 2026"
+    When I run "lvpm install lvpm_test_fixture --no-project --global --labview-version 2026"
     Then the exit code is 0
     And stderr says "lvpm_test_fixture: skipped install hook PostInstall (hooks are off by default"
     And stdout does not say "skipped install hook"
@@ -107,7 +107,7 @@ Feature: install hooks run only for allowed packages
   @labview @unsafe
   Scenario: a global install of the hook fixture skips it and says how to allow it
     Given the hook fixture package is not installed
-    When I run "lvpm install lvpm_test_fixture --global"
+    When I run "lvpm install lvpm_test_fixture --no-project --global"
     Then the command succeeds
     And the PostInstall hook did not run
     And stderr says "lvpm_test_fixture: skipped install hook PostInstall"
@@ -124,7 +124,7 @@ Feature: install hooks run only for allowed packages
   Scenario: following the always-run-it line runs the hook on the next install
     Given the hook fixture package is not installed
     And the user config has hooks.run "lvpm_test_fixture"
-    When I run "lvpm install lvpm_test_fixture --global"
+    When I run "lvpm install lvpm_test_fixture --no-project --global"
     Then the PostInstall hook ran for "lvpm_test_fixture"
     And stderr does not say "skipped install hook"
 

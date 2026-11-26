@@ -8,12 +8,14 @@
 //! `dest` or the project's venv, and the sandbox refuses a command that would
 //! do otherwise (`real_installation_risk`).
 
+use super::lock::name_and_version_pairs;
 use super::sync::{printed_plain, quoted};
 use crate::CliWorld;
 use crate::support::events::RecordingSink;
 use crate::support::feed::BROKEN_FEED_DIR;
 use crate::support::fixtures::{
-    ADD_PACKAGES, DELTA_1, FixturePackage, OMEGA_NEEDING_ALPHA_2, OMEGA_NEEDING_LABVIEW_2026,
+    ADD_PACKAGES, DELTA_1, FixturePackage, INSTALL_PACKAGES, OMEGA_NEEDING_ALPHA_2,
+    OMEGA_NEEDING_LABVIEW_2026,
 };
 use crate::support::golden::Output;
 use crate::support::project::{MANIFEST_FILE, ProjectManifest};
@@ -44,7 +46,24 @@ pub struct AddRemoveState {
     failure: Option<EditError>,
     /// What routing an install request gave.
     routed: Option<Result<InstallMode, RouteError>>,
+    /// What built this world, for the twin of a scenario that compares two.
+    setup: Vec<Setup>,
     twin: Option<Twin>,
+}
+
+/// One step of building a world, which its twin repeats.
+#[derive(Debug)]
+enum Setup {
+    /// The fixture packages in the sandbox's local folder.
+    Packages(&'static [FixturePackage]),
+    /// The project, locked and synced into `dest`.
+    Project { name: String, constraint: String },
+    /// A dependency added to a table afterwards, locked and synced.
+    Also {
+        table: DependencyTable,
+        name: String,
+        constraint: String,
+    },
 }
 
 #[derive(Debug)]
@@ -53,18 +72,16 @@ struct Twin {
     output: Output,
 }
 
-/// What the `Background` gives a world: the fixture packages, and a project
-/// that depends on `beta`, locked and synced into `dest`.
-fn set_up_project(sandbox: &Sandbox) {
-    for package in ADD_PACKAGES {
-        sandbox.put_local_package(package);
-    }
+/// What the `Background` gives a world, once its fixture packages are in the
+/// sandbox's local folder: a project that depends on `name`, locked and synced
+/// into `dest`.
+fn set_up_project(sandbox: &Sandbox, name: &str, constraint: &str) {
     sandbox.use_local_project(Some(PROJECT_LABVIEW));
     manifest_edit::set_file(
         &sandbox.work_dir().join(MANIFEST_FILE),
         &DependencyTable::Dependencies,
-        "beta",
-        ">=1.0",
+        name,
+        constraint,
     )
     .expect("edit the manifest");
     sandbox.make_empty_dest();
@@ -167,13 +184,35 @@ async fn fixture_packages(world: &mut CliWorld) {
         "the feature and the fixture table disagree"
     );
     world.publish(&ADD_PACKAGES.iter().collect::<Vec<_>>());
+    world.add_remove.setup.push(Setup::Packages(ADD_PACKAGES));
 }
 
 #[given(
-    r#"a project with labview "2024" depending on "beta" ">=1.0", locked and synced into scratch destination "dest""#
+    r#"fixture packages "alpha" 1.0, "app" 1.0 requiring "lib" >= 1.0, "app2" 1.0 requiring "lib" >= 1.0, "lib" 1.0, "caraya" 1.0"#
 )]
-async fn the_project(world: &mut CliWorld) {
-    set_up_project(&world.sandbox);
+async fn install_fixture_packages(world: &mut CliWorld) {
+    let ids: Vec<String> = INSTALL_PACKAGES.iter().map(FixturePackage::id).collect();
+    assert_eq!(
+        ids,
+        ["alpha-1.0", "app-1.0", "app2-1.0", "lib-1.0", "caraya-1.0"],
+        "the feature and the fixture table disagree"
+    );
+    world.publish(&INSTALL_PACKAGES.iter().collect::<Vec<_>>());
+    world
+        .add_remove
+        .setup
+        .push(Setup::Packages(INSTALL_PACKAGES));
+}
+
+#[given(
+    regex = r#"^a project with labview "2024" depending on "([^"]+)" "([^"]*)", locked and synced into scratch destination "dest"$"#
+)]
+async fn the_project(world: &mut CliWorld, name: String, constraint: String) {
+    set_up_project(&world.sandbox, &name, &constraint);
+    world
+        .add_remove
+        .setup
+        .push(Setup::Project { name, constraint });
     world.note_state();
 }
 
@@ -208,9 +247,40 @@ async fn every_version_needs_a_newer_labview(world: &mut CliWorld, name: String,
 
 #[given(regex = r#"^the project also depends on "([^"]+)" "([^"]*)", locked and synced$"#)]
 async fn the_project_also_depends_on(world: &mut CliWorld, name: String, constraint: String) {
-    world.depend(DependencyTable::Dependencies, &name, &constraint);
+    also_depend_on(world, DependencyTable::Dependencies, name, constraint);
+}
+
+/// The project depends on `name` in `table` too, locked and synced; a twin does the same.
+fn also_depend_on(world: &mut CliWorld, table: DependencyTable, name: String, constraint: String) {
+    world.depend(table.clone(), &name, &constraint);
     world.lock_the_project();
     world.sync_into_dest();
+    world.note_state();
+    world.add_remove.setup.push(Setup::Also {
+        table,
+        name,
+        constraint,
+    });
+}
+
+#[given(regex = r#"^the project is also synced into scratch destination "([^"]+)"$"#)]
+async fn the_project_is_also_synced_into(world: &mut CliWorld, folder: String) {
+    world.sandbox.setup_lvpm(&["sync", "--prefix", &folder]);
+    world.note_state();
+}
+
+/// `"caraya" 1.0 is installed in dest with "lvpm install caraya --no-project --prefix dest"`
+#[given(regex = r#"^"([^"]+)" (\S+) is installed in dest with "lvpm ([^"]+)"$"#)]
+async fn installed_in_dest_with(
+    world: &mut CliWorld,
+    name: String,
+    version: String,
+    arguments: String,
+) {
+    let arguments: Vec<&str> = arguments.split_whitespace().collect();
+    world.sandbox.setup_lvpm(&arguments);
+    let pair = (name, version);
+    assert!(world.installed().contains(&pair), "{pair:?} is not in dest");
     world.note_state();
 }
 
@@ -220,10 +290,7 @@ async fn a_dev_dependency_locked_and_synced(
     name: String,
     constraint: String,
 ) {
-    world.depend(DependencyTable::DevDependencies, &name, &constraint);
-    world.lock_the_project();
-    world.sync_into_dest();
-    world.note_state();
+    also_depend_on(world, DependencyTable::DevDependencies, name, constraint);
 }
 
 #[given(regex = r#"^dev dependency "([^"]+)" "([^"]*)"$"#)]
@@ -322,10 +389,28 @@ async fn run_inside_the_project(world: &mut CliWorld, command_line: String) {
 #[when(regex = r#"^I run "([^"]+)", and "([^"]+)" in an identical world$"#)]
 async fn run_in_two_worlds(world: &mut CliWorld, first: String, second: String) {
     let twin = Sandbox::new();
-    set_up_project(&twin);
-    twin.detect_labview();
-    twin.use_loopback_project_for_labview(LABVIEW_YEAR);
-    twin.setup_lvpm(&["venv", "create", "--labview-version", LABVIEW_YEAR]);
+    for step in &world.add_remove.setup {
+        match step {
+            Setup::Packages(packages) => packages
+                .iter()
+                .for_each(|package| twin.put_local_package(package)),
+            Setup::Project { name, constraint } => set_up_project(&twin, name, constraint),
+            Setup::Also {
+                table,
+                name,
+                constraint,
+            } => {
+                crate::steps::lock::add_dependency(&twin, table.clone(), name, constraint);
+                twin.setup_lvpm(&["lock"]);
+                twin.setup_lvpm(&["sync", "--prefix", DEST_DIR]);
+            }
+        }
+    }
+    if world.sandbox.work_dir().join(VENV_DIR).exists() {
+        twin.detect_labview();
+        twin.use_loopback_project_for_labview(LABVIEW_YEAR);
+        twin.setup_lvpm(&["venv", "create", "--labview-version", LABVIEW_YEAR]);
+    }
     world.run(&first, None);
     let mut words = second.split_whitespace();
     assert_eq!(words.next(), Some("lvpm"), "{second}");
@@ -397,12 +482,13 @@ async fn core_routes(world: &mut CliWorld, command_line: String) {
     );
     let sink = RecordingSink::default();
     let mut env = world.plain_env(&sink);
-    let (mut package, mut no_deps) = (None, false);
+    let (mut package, mut no_deps, mut no_project) = (None, false, false);
     while let Some(word) = words.next() {
         match word {
             "(none)" => {}
             "--global" => env.flags.global = true,
             "--no-deps" => no_deps = true,
+            "--no-project" => no_project = true,
             "--prefix" => env.flags.prefix = words.next().map(PathBuf::from),
             "--labview-version" => env.flags.labview_version = words.next().map(str::to_string),
             named => package = Some(named),
@@ -412,6 +498,9 @@ async fn core_routes(world: &mut CliWorld, command_line: String) {
         package,
         manifest: None,
         no_deps,
+        allow_downgrade: false,
+        no_project,
+        saving_flags: &[],
     };
     world.add_remove.routed = Some(route::install_mode(&env, &request));
 }
@@ -446,6 +535,67 @@ async fn the_lock_and_dest_include(world: &mut CliWorld, name: String, version: 
         world.installed().contains(&pair),
         "{pair:?} is not installed"
     );
+}
+
+/// `dest` or `"other"`: a destination folder of the work directory.
+fn folder_named(world: &CliWorld, said: &str) -> PathBuf {
+    world.sandbox.work_dir().join(said.trim_matches('"'))
+}
+
+/// `lvpm.lock and "other" include "caraya" 1.0 and "alpha" 1.0`
+#[then(regex = r#"^lvpm\.lock and ("[^"]+") include ("[^"]+" \S+(?: and "[^"]+" \S+)*)$"#)]
+async fn the_lock_and_a_folder_include(world: &mut CliWorld, folder: String, packages: String) {
+    world.assert_succeeded();
+    let installed = world.installed_at(&folder_named(world, &folder));
+    for pair in name_and_version_pairs(&packages) {
+        assert!(
+            world.locked_versions().contains(&pair),
+            "{pair:?} is not locked"
+        );
+        assert!(
+            installed.contains(&pair),
+            "{pair:?} is not in {folder}: {installed:?}"
+        );
+    }
+}
+
+#[then(regex = r#"^(dest|"[^"]+") includes "([^"]+)" (\S+)$"#)]
+async fn a_folder_includes(world: &mut CliWorld, folder: String, name: String, version: String) {
+    world.assert_succeeded();
+    let pair = (name, version);
+    let installed = world.installed_at(&folder_named(world, &folder));
+    assert!(
+        installed.contains(&pair),
+        "{pair:?} is not in {folder}: {installed:?}"
+    );
+}
+
+#[then(regex = r#"^dest does not include "([^"]+)"$"#)]
+async fn dest_does_not_include(world: &mut CliWorld, name: String) {
+    world.assert_succeeded();
+    assert!(!world.is_installed(&name), "{name} is installed in dest");
+}
+
+#[then(regex = r#"^(dest|"[^"]+") still includes "([^"]+)" (\S+)$"#)]
+async fn a_folder_still_includes(
+    world: &mut CliWorld,
+    folder: String,
+    name: String,
+    version: String,
+) {
+    a_folder_includes(world, folder, name, version).await;
+}
+
+#[then(regex = r#"^the output says "([^"]+)" and names "([^"]+)"$"#)]
+async fn the_output_says_and_names(world: &mut CliWorld, said: String, named: String) {
+    world.assert_succeeded();
+    for part in [said, named] {
+        assert!(
+            world.printed().contains(&part),
+            "{part:?} is not in:\n{}",
+            world.printed()
+        );
+    }
 }
 
 #[then(
@@ -537,6 +687,12 @@ async fn nothing_in_the_project_changed(world: &mut CliWorld) {
     world.assert_nothing_changed();
 }
 
+#[then("dest is byte-identical to before")]
+async fn dest_is_unchanged(world: &mut CliWorld) {
+    world.assert_succeeded();
+    world.assert_dest_unchanged();
+}
+
 #[then("nothing changed")]
 async fn nothing_changed(world: &mut CliWorld) {
     world.assert_nothing_changed();
@@ -588,6 +744,44 @@ async fn gone_from_everywhere(world: &mut CliWorld, name: String) {
     assert!(!world.is_installed(&name), "{name} is still installed");
 }
 
+#[then(regex = r#"^"([^"]+)" is gone from lvpm\.toml, lvpm\.lock and ("[^"]+")$"#)]
+async fn gone_from_the_manifest_the_lock_and_a_folder(
+    world: &mut CliWorld,
+    name: String,
+    folder: String,
+) {
+    gone_from_the_manifest(world, name.clone()).await;
+    assert!(!world.is_locked(&name), "{name} is still locked");
+    let installed = world.installed_at(&folder_named(world, &folder));
+    assert!(
+        installed.iter().all(|(entry, _)| *entry != name),
+        "{name} is still in {folder}: {installed:?}"
+    );
+}
+
+#[then(regex = r#"^"([^"]+)" and "([^"]+)" are gone from lvpm\.toml, lvpm\.lock and dest$"#)]
+async fn both_are_gone_from_everywhere(world: &mut CliWorld, first: String, second: String) {
+    gone_from_everywhere(world, first).await;
+    gone_from_everywhere(world, second).await;
+}
+
+#[then(regex = r#"^"([^"]+)" is gone from lvpm\.lock and dest$"#)]
+async fn gone_from_the_lock_and_dest(world: &mut CliWorld, name: String) {
+    world.assert_succeeded();
+    assert!(!world.is_locked(&name), "{name} is still locked");
+    assert!(!world.is_installed(&name), "{name} is still installed");
+}
+
+#[then(regex = r#"^"([^"]+)" is gone from \[dev-dependencies\]$"#)]
+async fn gone_from_the_dev_table(world: &mut CliWorld, name: String) {
+    world.assert_succeeded();
+    let entries = entries_of(&world.manifest_text(), "dev-dependencies");
+    assert!(
+        entries.iter().all(|(entry, _)| *entry != name),
+        "{entries:?}"
+    );
+}
+
 #[then(regex = r#"^"([^"]+)" is gone from \[dev-dependencies\], lvpm\.lock and dest$"#)]
 async fn gone_from_the_dev_table_the_lock_and_dest(world: &mut CliWorld, name: String) {
     world.assert_succeeded();
@@ -604,15 +798,6 @@ async fn gone_from_the_dev_table_the_lock_and_dest(world: &mut CliWorld, name: S
 async fn stays_in_the_lock_and_dest(world: &mut CliWorld, name: String) {
     assert!(world.is_locked(&name), "{name} is no longer locked");
     assert!(world.is_installed(&name), "{name} is no longer installed");
-}
-
-#[then(regex = r#"^the output says "([^"]+)" is still required by "([^"]+)"$"#)]
-async fn the_output_says_it_is_still_required(
-    world: &mut CliWorld,
-    name: String,
-    required_by: String,
-) {
-    world.assert_said(&format!("{name} is still required by {required_by}"));
 }
 
 #[then(
@@ -713,10 +898,23 @@ async fn fails_pointing_to_dev(world: &mut CliWorld, name: String) {
     assert!(printed.contains("use --dev"), "{printed}");
 }
 
-#[then(regex = r#"^the command fails saying "([^"]+)" is not in lvpm\.toml$"#)]
-async fn fails_saying_it_is_not_a_dependency(world: &mut CliWorld, name: String) {
+#[then(regex = r#"^the command fails saying "([^"]+)" is in (\[[^\]]+\])$"#)]
+async fn fails_saying_it_is_in_another_table(world: &mut CliWorld, name: String, table: String) {
     world.assert_failed();
-    let said = format!("{name} is not in lvpm.toml");
+    let said = format!("{name} is in {table}");
+    let printed = printed_plain(world);
+    assert!(printed.contains(&said), "{said:?} is not in:\n{printed}");
+}
+
+/// `flag` is the option's name: what follows it on the command line (the
+/// `x.toml` of `--manifest x.toml`) is not part of the message.
+#[then(
+    regex = r"^the command fails saying (--[\w-]+)(?: \S+)? cannot be used in a project, because lvpm\.lock decides the dependencies$"
+)]
+async fn fails_saying_the_lock_decides(world: &mut CliWorld, flag: String) {
+    world.assert_failed();
+    let said =
+        format!("{flag} cannot be used in a project, because lvpm.lock decides the dependencies");
     assert!(
         world.printed().contains(&said),
         "{said:?} is not in:\n{}",
@@ -724,12 +922,78 @@ async fn fails_saying_it_is_not_a_dependency(world: &mut CliWorld, name: String)
     );
 }
 
-#[then("the command fails saying --no-deps is not supported with a lock")]
-async fn fails_saying_no_deps_is_refused(world: &mut CliWorld) {
+/// The one `next: ` line the failed command printed.
+fn the_one_next_line(world: &CliWorld) -> String {
     world.assert_failed();
-    let said = "--no-deps is not supported with a lock";
+    let printed = printed_plain(world);
+    let next: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.starts_with("next: "))
+        .collect();
+    assert_eq!(next.len(), 1, "one next line in:\n{printed}");
+    next[0].to_string()
+}
+
+#[then(regex = r#"^the error's next line names "([^"]+)"$"#)]
+async fn the_next_line_names(world: &mut CliWorld, flag: String) {
+    let next = the_one_next_line(world);
+    assert!(next.contains(&flag), "{flag:?} is not in: {next}");
+}
+
+/// `commands` is every command the line names, in order, as `"a" and "b"`; the
+/// plain text of the line is `next: run a ... and b ... first`, each command
+/// followed by the delimiter or by space-separated flags, never by more of its
+/// own name (`lvpm uninstall app` is not `lvpm uninstall app2`).
+#[then(regex = r#"^the error's next line says to run ("[^"]+"(?: and "[^"]+")*) first$"#)]
+async fn the_next_line_says_to_run_first(world: &mut CliWorld, commands: String) {
+    let next = the_one_next_line(world);
+    let wanted: Vec<&str> = commands
+        .split(" and ")
+        .map(|c| c.trim_matches('"'))
+        .collect();
+    let mut rest = next
+        .strip_prefix("next: run ")
+        .unwrap_or_else(|| panic!("not a run line: {next}"));
+    for (at, command) in wanted.iter().enumerate() {
+        rest = rest
+            .strip_prefix(command)
+            .unwrap_or_else(|| panic!("{command:?} is not next in: {next}"));
+        let end = if at + 1 < wanted.len() {
+            " and "
+        } else {
+            " first"
+        };
+        assert!(
+            rest.starts_with(end) || rest.starts_with(" -"),
+            "{command:?} is followed by more than flags in: {next}"
+        );
+        let flags_end = rest
+            .find(end)
+            .unwrap_or_else(|| panic!("{end:?} does not follow {command:?} in: {next}"));
+        rest = &rest[flags_end + end.len()..];
+    }
+}
+
+#[then("the error's next line says to check the name")]
+async fn the_next_line_says_to_check_the_name(world: &mut CliWorld) {
+    let next = the_one_next_line(world);
+    assert!(next.contains("check the name"), "{next}");
+}
+
+#[then(regex = r#"^the error does not mention "([^"]+)"$"#)]
+async fn the_error_does_not_mention(world: &mut CliWorld, said: String) {
+    world.assert_failed();
+    // Stderr only: a destination flag makes stdout say what --no-project is for.
+    let error = world.output().stderr.clone();
+    assert!(!error.contains(&said), "{said:?} is in:\n{error}");
+}
+
+#[then(regex = r#"^the command fails saying "([^"]+)" is in no configured source$"#)]
+async fn fails_saying_it_is_in_no_configured_source(world: &mut CliWorld, name: String) {
+    world.assert_failed();
+    let said = format!("{name} is in no configured source");
     assert!(
-        world.printed().contains(said),
+        world.printed().contains(&said),
         "{said:?} is not in:\n{}",
         world.printed()
     );
@@ -758,6 +1022,11 @@ async fn uninstalled(world: &mut CliWorld, name: String) {
     assert!(!world.is_installed(&name), "{name} is still installed");
 }
 
+#[then(regex = r#"^"([^"]+)" is uninstalled from dest$"#)]
+async fn uninstalled_from_dest(world: &mut CliWorld, name: String) {
+    uninstalled(world, name).await;
+}
+
 #[then(
     regex = r#"^the output says "([^"]+)" is still in lvpm\.toml and "([^"]+)" removes it for good$"#
 )]
@@ -773,30 +1042,30 @@ async fn says_it_is_still_listed(world: &mut CliWorld, name: String, command: St
 }
 
 #[then(
-    regex = r"^the first output line says (\w+) is being added to lvpm\.toml and the project synced to lvpm\.lock$"
+    regex = r"^the output says (\w+) is being added to lvpm\.toml and the project synced to lvpm\.lock$"
 )]
-async fn the_first_line_says_it_is_an_add(world: &mut CliWorld, name: String) {
-    let first = world.output().stdout.lines().next().unwrap_or_default();
-    for said in [
+async fn the_output_says_it_is_an_add(world: &mut CliWorld, name: String) {
+    let stdout = &world.output().stdout;
+    let said = [
         format!("adding {name} to lvpm.toml"),
         "syncing the project to lvpm.lock".to_string(),
-    ] {
-        assert!(first.contains(&said), "{said:?} is not in: {first:?}");
-    }
+    ];
+    assert!(
+        stdout
+            .lines()
+            .any(|line| said.iter().all(|part| line.contains(part))),
+        "{said:?} is not on one line of:\n{stdout}"
+    );
 }
 
-/// `install` says it is an add first; what follows is `add`'s own output.
-#[then("both manifests, locks and destinations are identical")]
+/// `add` is `install` and `remove` is `uninstall`, so what each prints is the same.
+#[then("both manifests, locks, destinations and outputs are identical")]
 async fn both_worlds_are_identical(world: &mut CliWorld) {
     let twin = world.add_remove.twin.as_ref().expect("a second world");
     let (one, two) = (world.output(), &twin.output);
+    assert_eq!(one.exit_code, 0, "both commands failed alike:\n{one:?}");
     assert_eq!(one.exit_code, two.exit_code, "{one:?}\n{two:?}");
-    let after_the_first_line: Vec<&str> = one.stdout.lines().skip(1).collect();
-    assert_eq!(
-        after_the_first_line,
-        two.stdout.lines().collect::<Vec<_>>(),
-        "what they print after install's first line"
-    );
+    assert_eq!(one.stdout, two.stdout);
     assert_eq!(one.stderr, two.stderr);
     // Each world has a feed of its own, so its address is in both files.
     let text_of = |sandbox: &Sandbox, file: &str| {
@@ -810,11 +1079,41 @@ async fn both_worlds_are_identical(world: &mut CliWorld) {
             "{file}"
         );
     }
-    assert_eq!(
-        world.sandbox.list_files(VENV_DIR),
-        twin.sandbox.list_files(VENV_DIR),
-        "the venvs"
-    );
+    for folder in [VENV_DIR, DEST_DIR, "other"] {
+        assert_eq!(
+            world.sandbox.list_files(folder),
+            twin.sandbox.list_files(folder),
+            "{folder}"
+        );
+    }
+}
+
+/// The help item of `command`: its line and the ones that continue it.
+fn help_item(help: &str, command: &str) -> String {
+    let mut lines = help.lines().skip_while(|line| {
+        line.strip_prefix("  ")
+            .and_then(|rest| rest.split_whitespace().next())
+            != Some(command)
+    });
+    let first = lines.next().unwrap_or_default();
+    let rest = lines.take_while(|line| line.starts_with("    "));
+    std::iter::once(first)
+        .chain(rest)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[then(
+    regex = r#"^the install line names alias "([^"]+)" and the uninstall line names alias "([^"]+)"$"#
+)]
+async fn help_names_the_aliases(world: &mut CliWorld, install: String, uninstall: String) {
+    world.assert_succeeded();
+    let help = world.output().stdout.clone();
+    for (command, alias) in [("install", install), ("uninstall", uninstall)] {
+        let item = help_item(&help, command);
+        let said = format!("[alias: {alias}]");
+        assert!(item.contains(&said), "{said} is not in {item:?}\n{help}");
+    }
 }
 
 // ---- dependency groups ----
@@ -841,9 +1140,10 @@ fn group_entries(manifest: &str, group: &str) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// One quoted phrase, as a sentence: the other steps of this name take several
-/// parts, a manifest line, or a single word (`first`).
-#[then(regex = r#"^the command fails naming "([^"\[][^"]* [^"]*)"$"#)]
+/// One quoted phrase, as a sentence, or one flag or `<PLACEHOLDER>` as clap
+/// prints it: the other steps of this name take several parts, a manifest
+/// line, or a single word (`first`).
+#[then(regex = r#"^the command fails naming "(<[A-Z_]+>|--[\w-]+|[^"\[][^"]* [^"]*)"$"#)]
 async fn fails_naming_a_phrase(world: &mut CliWorld, said: String) {
     world.assert_failed();
     let printed = world.printed();
@@ -908,7 +1208,7 @@ async fn gone_from_the_group_the_lock_and_dest(world: &mut CliWorld, name: Strin
 }
 
 /// `the command fails saying "beta" is in [a] and [b], with one next line
-/// each: "lvpm remove beta" and "lvpm remove beta --group ci"`.
+/// each: "lvpm uninstall beta" and "lvpm uninstall beta --group ci"`.
 #[then(
     regex = r#"^the command fails saying "([^"]+)" is in (.+), with one next line each: ("[^"]+"(?: and "[^"]+")*)$"#
 )]
@@ -929,7 +1229,7 @@ async fn fails_listing_every_table_holding_it(
         .collect();
     assert_eq!(next_lines.len(), commands.len(), "{printed}");
     for command in commands {
-        // What follows the command keeps `lvpm remove beta` from matching `... --group ci`.
+        // What follows the command keeps `lvpm uninstall beta` from matching `... --group ci`.
         let hint = format!("next: {command} removes it");
         assert!(
             next_lines.iter().any(|line| line.starts_with(&hint)),

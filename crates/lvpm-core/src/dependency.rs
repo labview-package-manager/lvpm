@@ -60,6 +60,63 @@ pub fn package_dependency_names(
     names
 }
 
+/// The packages that need `name`, walked up `dependents_of` to the top: those
+/// nothing requires, which are the ones to remove first. A package that is
+/// required and also listed is passed over for what requires it, since removing
+/// it would be refused too. Each direct dependent is climbed on its own: one
+/// whose climb reaches no top, because it is in a cycle, is named itself.
+///
+/// A package passed over that `listed` says the project lists is named too: the
+/// user can remove it, and has to before `name` can go. The result is in the
+/// order to remove them: a package comes after everything that requires it.
+pub fn roots_above(
+    name: &str,
+    dependents_of: impl Fn(&str) -> Vec<String>,
+    listed: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut roots = Vec::new();
+    for dependent in dependents_of(name) {
+        let mut seen = HashSet::from([key(name), key(&dependent)]);
+        let mut queue = vec![dependent.clone()];
+        let mut tops = Vec::new();
+        let mut passed_over = Vec::new();
+        while let Some(package) = queue.pop() {
+            match dependents_of(&package) {
+                above if above.is_empty() => tops.push(package),
+                above => {
+                    if listed(&package) {
+                        passed_over.push(package.clone());
+                    }
+                    queue.extend(above.into_iter().filter(|up| seen.insert(key(up))));
+                }
+            }
+        }
+        roots.extend(if tops.is_empty() {
+            vec![dependent]
+        } else {
+            tops
+        });
+        roots.extend(passed_over);
+    }
+    // What requires a package, and what requires that: more of them means
+    // nearer the bottom, so fewer first is top-down.
+    let above = |package: &str| {
+        let mut seen = HashSet::from([key(package)]);
+        let mut queue = vec![package.to_string()];
+        while let Some(next) = queue.pop() {
+            queue.extend(
+                dependents_of(&next)
+                    .into_iter()
+                    .filter(|up| seen.insert(key(up))),
+            );
+        }
+        seen.len()
+    };
+    roots.sort_by_cached_key(|root| (above(root), key(root)));
+    roots.dedup_by(|a, b| key(a) == key(b));
+    roots
+}
+
 /// Plan a removal from the installed graph, without changing it.
 ///
 /// `project_roots` contains all project declarations, including groups not
@@ -215,6 +272,82 @@ mod tests {
             skipped_groups: vec![],
             archive_sha256: None,
         }
+    }
+
+    /// `edges` as (package, what it requires).
+    fn dependents_in<'a>(
+        edges: &'a [(&'a str, &'a [&'a str])],
+    ) -> impl Fn(&str) -> Vec<String> + 'a {
+        move |name| {
+            (edges.iter())
+                .filter(|(_, requires)| requires.iter().any(|r| key(r) == key(name)))
+                .map(|(package, _)| package.to_string())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn the_roots_above_a_package_are_the_top_of_what_requires_it() {
+        let edges: &[(&str, &[&str])] = &[
+            ("app", &["mid"]),
+            ("mid", &["lib"]),
+            ("Other", &["lib"]),
+            ("lib", &[]),
+        ];
+        assert_eq!(
+            roots_above("lib", dependents_in(edges), |_| false),
+            ["app", "Other"],
+            "a package that is required itself is passed over for its requirer"
+        );
+        assert_eq!(
+            roots_above("app", dependents_in(edges), |_| false),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_listed_package_that_is_passed_over_is_named_and_the_order_is_top_down() {
+        // zeta -> mid -> lib, and the project lists all three: both go first.
+        let edges: &[(&str, &[&str])] = &[("zeta", &["mid"]), ("mid", &["lib"]), ("lib", &[])];
+        assert_eq!(
+            roots_above("lib", dependents_in(edges), |_| true),
+            ["zeta", "mid"]
+        );
+        let unlisted_middle = |name: &str| name != "mid";
+        assert_eq!(
+            roots_above("lib", dependents_in(edges), unlisted_middle),
+            ["zeta"]
+        );
+    }
+
+    #[test]
+    fn a_diamond_names_its_one_root_once_and_a_cycle_names_its_dependents() {
+        let diamond: &[(&str, &[&str])] = &[
+            ("app", &["left", "right"]),
+            ("left", &["lib"]),
+            ("right", &["lib"]),
+        ];
+        assert_eq!(
+            roots_above("lib", dependents_in(diamond), |_| false),
+            ["app"]
+        );
+        let cycle: &[(&str, &[&str])] = &[("a", &["b"]), ("b", &["a"])];
+        assert_eq!(roots_above("a", dependents_in(cycle), |_| false), ["b"]);
+    }
+
+    #[test]
+    fn a_dependent_whose_climb_ends_in_a_cycle_is_named_beside_the_roots_other_climbs_find() {
+        // The project lists app and x; x and y require each other.
+        let edges: &[(&str, &[&str])] = &[
+            ("app", &["lib"]),
+            ("x", &["lib", "y"]),
+            ("y", &["x"]),
+            ("lib", &[]),
+        ];
+        assert_eq!(
+            roots_above("lib", dependents_in(edges), |_| false),
+            ["app", "x"]
+        );
     }
 
     #[test]

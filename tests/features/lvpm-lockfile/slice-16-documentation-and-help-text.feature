@@ -15,4 +15,4 @@ Feature: The lock workflow is documented where users look
 
   Scenario: the usage guide shows how to quote constraints
     When the usage guide's add section is read
-    Then it shows a quoted example "lvpm add \"gamma@>=0.5\"" for PowerShell and cmd
+    Then it shows a quoted example "lvpm install \"gamma@>=0.5\"" for PowerShell and cmd

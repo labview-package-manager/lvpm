@@ -142,7 +142,7 @@ So the LabVIEW installation should hold as few packages as possible:
   calls into them.
 
 To move an existing machine over, uninstall the libraries from LabVIEW (with
-VIPM, or `lvpm uninstall --global <pkg>` for ones lvpm installed), then run
+VIPM, or `lvpm uninstall <pkg> --no-project --global` for ones lvpm installed), then run
 `lvpm sync` in each project. `lvpm venv status` lists any venv package the
 installation still has a copy of.
 

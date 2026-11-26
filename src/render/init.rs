@@ -249,7 +249,7 @@ pub fn error(error: &InitError) -> String {
         InitError::DragonFile { .. } => error.to_string(),
         InitError::ManifestExists { .. } => format!(
             "{error}; lvpm init does not overwrite it\n  \
-             this folder is already an lvpm project: lvpm add puts packages in it, \
+             this folder is already an lvpm project: lvpm install puts packages in it, \
              lvpm venv create makes its venv"
         ),
         InitError::Other(cause) => format!("{cause:#}"),
@@ -640,7 +640,7 @@ mod tests {
             error(&InitError::ManifestExists { path: path.clone() }),
             format!(
                 "{} already exists; lvpm init does not overwrite it\n  \
-                 this folder is already an lvpm project: lvpm add puts packages in it, \
+                 this folder is already an lvpm project: lvpm install puts packages in it, \
                  lvpm venv create makes its venv",
                 path.display()
             )

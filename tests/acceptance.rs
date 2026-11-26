@@ -90,6 +90,7 @@ const FEATURE_FILES: &[&str] = &[
     "tests/features/fork-adoption/44-bare-labview-year.feature",
     "tests/features/fork-adoption/45-old-dependency-groups.feature",
     "tests/features/fork-adoption/47-sync-into-a-folder.feature",
+    "tests/features/fork-adoption/54-install-uninstall.feature",
 ];
 const TEST_LABVIEW_ENV_VAR: &str = "LVPM_TEST_LABVIEW";
 const ONLY_LABVIEW_ENV_VAR: &str = "LVPM_TEST_ONLY_LABVIEW";

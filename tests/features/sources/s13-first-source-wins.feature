@@ -60,10 +60,10 @@ Feature: a package name comes only from the first source that lists it
     Then the command succeeds
     And lvpm.lock takes "alpha" 1.0 from "local"
 
-  Scenario: lvpm add writes a constraint from the first source's newest version
+  Scenario: lvpm install writes a constraint from the first source's newest version
     Given "first" lists "alpha" 1.0
     And "second" lists "alpha" 2.0
-    When I run "lvpm add alpha --prefix dest"
+    When I run "lvpm install alpha --prefix dest"
     Then the command succeeds
     And lvpm.toml depends on "alpha" ">=1.0"
 

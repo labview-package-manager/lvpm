@@ -99,7 +99,7 @@ Feature: Installing from an explicit OCI source
   Scenario: install words a name the OCI source does not list as lock does
     Given the registry holds nothing for "team/gamma"
     And the project depends on gamma = { version = "*", index = "team" }
-    When I run "lvpm install gamma --prefix dest"
+    When I run "lvpm install gamma --no-project --prefix dest"
     Then it fails saying 'gamma: source "team" (oci://<registry>/team) does not list it; check the name, or publish it with lvpm publish --to oci://<registry>/team'
     And gamma is not installed
 

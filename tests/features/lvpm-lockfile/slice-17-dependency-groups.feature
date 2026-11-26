@@ -140,39 +140,41 @@ Feature: Dependency groups
     Then dest's lvpm-installed packages are exactly alpha and ci_tools
     And lvpm.lock is byte-identical to before
 
-  Scenario: --group is refused with a package argument
+  Scenario: --group with a package saves it in that group, as install --group does
     When I run "lvpm install beta --group ci --prefix dest"
-    Then the command fails as a usage error naming "--group"
+    Then [dependency-groups.ci] says "beta" = ">=1.0"
+    And lvpm.lock gives "beta" groups ["ci"]
+    And "beta" 1.0 is installed
 
   # AC6, AC7
-  Scenario: add --group writes the group's table and installs it
-    When I run "lvpm add ci_tools --group ci --prefix dest"
+  Scenario: install --group writes the group's table and installs it
+    When I run "lvpm install ci_tools --group ci --prefix dest"
     Then [dependency-groups.ci] says "ci_tools" = ">=2.0"
     And the output says "created [dependency-groups.ci], a new group"
     And lvpm.lock gives "ci_tools" groups ["ci"]
     And "ci_tools" 2.0 is installed
 
   # AC11
-  Scenario: add --group reports the group in JSON
-    When I run "lvpm add ci_tools --group ci --json --prefix dest"
+  Scenario: install --group reports the group in JSON
+    When I run "lvpm install ci_tools --group ci --json --prefix dest"
     Then the manifest-edited event has "dev": false and "group": "ci"
 
   # AC10
-  Scenario: a later add keeps what a group installed
+  Scenario: a later install keeps what a group installed
     Given lvpm.toml has [dependency-groups.ci] "ci_tools" "*", a current lvpm.lock, and dest synced with "--group ci"
-    When I run "lvpm add beta --prefix dest"
+    When I run "lvpm install beta --prefix dest"
     Then dest's lvpm-installed packages are exactly alpha, beta, ci_tools
 
   # AC10
-  Scenario: a later remove keeps what a group installed
+  Scenario: a later uninstall keeps what a group installed
     Given lvpm.toml has [dependencies] "beta" "*"; [dependency-groups.ci] "ci_tools" "*", a current lvpm.lock, and dest synced with "--group ci"
-    When I run "lvpm remove beta --prefix dest"
+    When I run "lvpm uninstall beta --prefix dest"
     Then dest's lvpm-installed packages are exactly alpha, ci_tools
 
   # AC10
-  Scenario: add does not install another group
+  Scenario: install of a package does not install another group
     Given lvpm.toml has [dependency-groups.ci] "ci_tools" "*" and a current lvpm.lock
-    When I run "lvpm add beta --prefix dest"
+    When I run "lvpm install beta --prefix dest"
     Then dest's lvpm-installed packages are exactly alpha, beta
 
   # AC6
@@ -188,19 +190,19 @@ Feature: Dependency groups
       | remove  | --group dev | lvpm.toml has [dev-dependencies] "caraya" "*" and a current lvpm.lock |
 
   # AC6
-  Scenario: remove --group removes from the group
+  Scenario: uninstall --group removes from the group
     Given lvpm.toml has [dependency-groups.ci] "ci_tools" "*", a current lvpm.lock, and dest synced with "--group ci"
-    When I run "lvpm remove ci_tools --group ci --prefix dest"
+    When I run "lvpm uninstall ci_tools --group ci --prefix dest"
     Then "ci_tools" is gone from [dependency-groups.ci], lvpm.lock and dest
 
-  Scenario: remove from the wrong table lists every table holding it
+  Scenario: uninstall from the wrong table lists every table holding it
     Given lvpm.toml has [dependencies] "beta" "*"; [dependency-groups.ci] "beta" "*"
-    When I run "lvpm remove beta --dev --prefix dest"
-    Then the command fails saying "beta" is in [dependencies] and [dependency-groups.ci], with one next line each: "lvpm remove beta" and "lvpm remove beta --group ci"
+    When I run "lvpm uninstall beta --dev --prefix dest"
+    Then the command fails saying "beta" is in [dependencies] and [dependency-groups.ci], with one next line each: "lvpm uninstall beta --prefix dest" and "lvpm uninstall beta --group ci --prefix dest"
 
-  Scenario Outline: remove --group of something that is not there fails
+  Scenario Outline: uninstall --group of something that is not there fails
     Given lvpm.toml has [dependency-groups.ci] "ci_tools" "*"
-    When I run "lvpm remove <name> --group <group> --prefix dest"
+    When I run "lvpm uninstall <name> --group <group> --prefix dest"
     Then the command fails naming <named>
     And lvpm.toml and lvpm.lock are byte-identical to before
 
@@ -209,8 +211,8 @@ Feature: Dependency groups
       | beta     | ci    | "beta" and "[dependency-groups.ci]"             |
       | ci_tools | nope  | "unknown group 'nope'; defined groups: ci, dev" |
 
-  Scenario Outline: a bad --group on add is refused before any change
-    When I run "lvpm add beta <flags> --prefix dest"
+  Scenario Outline: a bad --group on install is refused before any change
+    When I run "lvpm install beta <flags> --prefix dest"
     Then the command fails naming <named>
     And lvpm.toml is byte-identical to before
 

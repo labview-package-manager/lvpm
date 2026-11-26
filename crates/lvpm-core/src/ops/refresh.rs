@@ -11,7 +11,7 @@ use std::time::Duration;
 /// `lvpm refresh`: rebuild the palettes and menus of the LabVIEW the
 /// destination flags select.
 pub fn refresh(env: &OpEnv, timeout_secs: u64) -> Result<()> {
-    let Some(target) = env.roots()?.target else {
+    let Some(target) = env.flagged_roots()?.target else {
         bail!("refresh needs a real LabVIEW target, not --prefix");
     };
     refresh_palettes_and_menus(env, &target, timeout_secs);
@@ -70,5 +70,20 @@ mod tests {
         env.flags.prefix = Some(PathBuf::from("dest"));
         let why = refresh(&env, 1).unwrap_err().to_string();
         assert_eq!(why, "refresh needs a real LabVIEW target, not --prefix");
+    }
+
+    #[test]
+    fn a_global_alone_settles_as_it_does_for_a_write_and_says_which_labview_when_several() {
+        let mut env = testing::env(Path::new("."));
+        let mut older = testing::labview_2026();
+        older.version = 25.3;
+        older.path = PathBuf::from("LabVIEW 2025");
+        env.targets.push(older);
+        env.flags.global = true;
+        let why = refresh(&env, 1).map(|_| ()).unwrap_err().to_string();
+        assert!(
+            why.starts_with("which LabVIEW? pass --labview-version <YYYY>"),
+            "{why}"
+        );
     }
 }

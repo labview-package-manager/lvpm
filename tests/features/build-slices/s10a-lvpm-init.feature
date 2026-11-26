@@ -28,7 +28,7 @@ Feature: lvpm init starts a project (S10a)
     Given a folder with an lvpm.toml
     When I run "lvpm init --labview-version 2023" in it
     Then it fails with "<path of lvpm.toml> already exists; lvpm init does not overwrite it"
-    And the output says "lvpm add puts packages in it"
+    And the output says "lvpm install puts packages in it"
     And lvpm.toml is unchanged
     And the folder has no .git and no .lv-venv
 
@@ -83,7 +83,7 @@ Feature: lvpm init starts a project (S10a)
     When I run "lvpm init --labview-version 2026" in the working directory
     Then it succeeds
     And the folder has a venv bound to LabVIEW 2026
-    When I run "lvpm add labview_open_source_project_lib_labview_open_source_palette" in the working directory
+    When I run "lvpm install labview_open_source_project_lib_labview_open_source_palette" in the working directory
     Then it succeeds
     And the venv holds labview_open_source_project_lib_labview_open_source_palette in its add-on folder and no staging folder
 

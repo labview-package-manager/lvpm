@@ -9,6 +9,7 @@ use crate::events::{Event, EventSink, NullSink};
 use crate::target::{LvTarget, Roots};
 use crate::venv::{self, Venv};
 use crate::viserver;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -66,6 +67,40 @@ impl FakeInstallation {
     pub(crate) fn roots(&self) -> Roots {
         Roots::labview_on(&self.target, Some(&self.machine))
     }
+
+    /// Record `name` 1.0 as installed here, with one file in `vi.lib`.
+    pub(crate) fn with_package(&self, name: &str) {
+        let file = self.target.path.join("vi.lib").join(format!("{name}.txt"));
+        std::fs::write(&file, name).unwrap();
+        let store = self.roots().store_dir();
+        std::fs::create_dir_all(&store).unwrap();
+        let record = serde_json::json!({
+            "name": name, "version": "1.0", "display_name": null, "installed_at": 0,
+            "target": "LabVIEW 2099", "files": [file.to_string_lossy().replace('\\', "/")],
+            "skipped_hooks": [],
+        });
+        std::fs::write(store.join(format!("{name}.json")), record.to_string()).unwrap();
+    }
+}
+
+/// Every file under `dir` with its bytes: what a test compares to see that
+/// nothing was written.
+pub(crate) fn snapshot(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(folder) = todo.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            match path.is_dir() {
+                true => todo.push(path),
+                false => {
+                    let bytes = std::fs::read(&path).unwrap();
+                    files.insert(path, bytes);
+                }
+            }
+        }
+    }
+    files
 }
 
 /// An empty directory of its own, which the caller removes.

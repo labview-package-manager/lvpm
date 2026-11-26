@@ -44,7 +44,7 @@ pub fn launch(env: &OpEnv, lvproj: Option<&Path>, ini: &[String], check: bool) -
         .iter()
         .map(|kv| ini_override(kv))
         .collect::<Result<Vec<_>>>()?;
-    let Destination::Venv(venv) = env.destination()? else {
+    let Destination::Venv(venv) = env.read_destination()? else {
         bail!("launch needs a venv: run it inside a project that has one, or pass --project <DIR>");
     };
     if check {
@@ -220,7 +220,8 @@ fn problems(
         if project.relink_for(&m.name) && !m.relinked {
             found.push(format!(
                 "{}: relink = true but the relink pass has not completed (run `lvpm relink {}`)",
-                m.name, m.name
+                m.name,
+                super::env::shell_word(&m.name)
             ));
         }
     }

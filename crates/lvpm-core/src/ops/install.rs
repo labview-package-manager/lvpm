@@ -198,7 +198,7 @@ pub fn install(env: &OpEnv, package: Option<&str>, opts: &InstallOptions) -> Res
     // when a single package is named.
     let found = env.manifest_for(None, bound.as_deref())?;
     let Some(package) = package else {
-        bail!("give a package name, or --manifest <FILE>");
+        bail!("give a package name");
     };
     let wanted = vec![named(package)?];
 
@@ -1330,5 +1330,25 @@ mod tests {
         apply_plan(&scratch, &scratch.plan(None)).unwrap();
         let roots = Roots::scratch(&scratch.root.join("dest"));
         assert!(install::is_installed(&roots, "alpha"));
+    }
+
+    #[test]
+    fn an_install_at_a_labview_version_alone_is_refused_and_changes_nothing() {
+        use crate::ops::testing::{FakeInstallation, Recorded, env_on, scratch_dir, snapshot};
+        let dir = scratch_dir("install-needs-global");
+        let fake = FakeInstallation::new(&dir);
+        let before = snapshot(&dir);
+
+        let sink = Recorded::default();
+        let mut env = env_on(&sink, &dir);
+        fake.place(&mut env);
+        env.flags.labview_version = Some("2099".into());
+        let why = format!(
+            "{:#}",
+            install(&env, Some("alpha"), &InstallOptions::default()).unwrap_err()
+        );
+        assert!(why.contains("alone does not write"), "{why}");
+        assert_eq!(snapshot(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

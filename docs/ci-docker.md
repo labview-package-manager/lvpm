@@ -46,10 +46,10 @@ except with `--relink` or for a package marked `relink = true`):
 
 |                                    | developer's machine                                                                 | headless (`LV_RTE_HEADLESS`)                                                                                                         | override                         |
 | ---------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------- |
-| `lvpm.toml` with no venv beside it | refused: a developer inside a project must not install into the machine by accident | the machine is the sandbox: install into the LabVIEW the manifest's `labview` names (a newer one may stand in, an older one may not) | `--labview-version`, `--project` |
+| `lvpm.toml` with no venv beside it | refused: a developer inside a project must not install into the machine by accident | the machine is the sandbox: install into the LabVIEW the manifest's `labview` names (a newer one may stand in, an older one may not) | `--global` (with `--labview-version YYYY` to pick the year), `--project` |
 | install hooks                      | run only for packages allowed by `hooks = "run"` or `hooks.run`; the rest are skipped with a warning | skipped, and `lvpm list` says so: the hooks measured write a marker file and add a palette entry, IDE furniture                      | `--hooks`                        |
 | palettes and menus                 | rebuilt after the install                                                           | not rebuilt: no one sees a palette                                                                                                   | `lvpm refresh`                   |
-| `lvpm sync` or bare `lvpm install` | a missing or out-of-date `lvpm.lock` is locked again first                          | acts as `--locked`: a missing or out-of-date `lvpm.lock` fails, after a note saying so. `--frozen` still applies. `lock`, `add` and `remove` are not affected | `--no-locked`                    |
+| `lvpm sync` or bare `lvpm install` | a missing or out-of-date `lvpm.lock` is locked again first                          | acts as `--locked`: a missing or out-of-date `lvpm.lock` fails, after a note saying so. `--frozen` still applies. `lock`, a named `install` and a named `uninstall` are not affected | `--no-locked`                    |
 
 Together those mean a headless `lvpm install` into the LabVIEW installation
 never starts LabVIEW: it is downloads, MD5 checks, file copies and linkfix,
@@ -58,6 +58,11 @@ package in a headless LabVIEW; see [The resave](usage.md#the-resave).)
 Earlier timings on a DQMH project, from before linkfix was the default: two
 minutes with hooks, twelve with relink as well, and the mass compile
 afterwards reported nothing wrong either way.
+
+A headless machine needs no `--global` to write into a LabVIEW installation,
+with or without an `lvpm.toml`: the container's LabVIEW is the sandbox, and
+nobody is there to type the flag. A developer's machine does need it
+([Writing into LabVIEW itself](usage.md#writing-into-labview-itself)).
 
 The hook skip is the one with a caveat. A hook is arbitrary LabVIEW code,
 and a few packages do real setup in theirs. The one hook measured as needed,

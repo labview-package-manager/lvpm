@@ -95,7 +95,7 @@ Feature: OCI registry credentials
     And the registry holds "beta" 1.0.0 under "team"
     And the project depends on beta = { version = "*", index = "team" }
     And a Docker config whose auths entry gives user "u9" and secret "wrong-5d2e7a-secret" for "<registry>"
-    When I run "lvpm install alpha --prefix dest"
+    When I run "lvpm install alpha --no-project --prefix dest"
     Then it fails saying "registry <registry> refused the login from auths; run docker login <registry>"
     And the output has the text "registry <registry> refused the login from auths; run docker login <registry>" once
 

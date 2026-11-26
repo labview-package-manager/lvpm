@@ -88,15 +88,17 @@ in [docs/install.md](docs/install.md).
 ```console
 $ lvpm targets                              # which LabVIEW installations lvpm sees
 $ lvpm search error                         # find packages in the public indexes
-$ lvpm install oglib_error --labview-version 2026
-$ lvpm list                                 # what lvpm has installed there
-$ lvpm uninstall oglib_error
+$ lvpm install oglib_error --global --labview-version 2026
+$ lvpm list --labview-version 2026          # what lvpm has installed there
+$ lvpm uninstall oglib_error --global --labview-version 2026
 ```
 
 Or browse and install in a terminal UI: `lvpm tui`.
 
-`--labview-version` picks the target when more than one LabVIEW is
-installed. Relinking, hooks and a venv's resave need LabVIEW's VI Server (TCP) enabled, which
+`--global` writes into the LabVIEW installation itself, which changes every
+project that uses it, so lvpm asks for it; `--labview-version` picks which LabVIEW
+when more than one is installed, and `--global` alone takes the only one.
+Relinking, hooks and a venv's resave need LabVIEW's VI Server (TCP) enabled, which
 is its default setting (Tools » Options » VI Server). lvpm starts LabVIEW
 itself when it is not running, and says so.
 
@@ -108,7 +110,7 @@ It writes an `lvpm.toml` and a `.gitignore`, makes a git repository and binds a 
 $ cd C:\Git\MyProject
 $ lvpm init --labview-version 2026         # lvpm.toml, .gitignore, git and .lv-venv/ in one go
 $ lvpm install                              # locks lvpm.toml into lvpm.lock, installs exactly that into .lv-venv
-$ lvpm add oglib_error                      # one more dependency: lvpm.toml, lvpm.lock and .lv-venv together
+$ lvpm install oglib_error                  # one more dependency: lvpm.toml, lvpm.lock and .lv-venv together
 $ lvpm launch MyProject.lvproj              # a LabVIEW that sees the venv
 ```
 
@@ -204,7 +206,7 @@ below as one book, starting with a tutorial; CONTRIBUTING.md stays in the repo.
 | Document | What is in it |
 | --- | --- |
 | [docs/install.md](docs/install.md) | Install script options, manual and Linux install, building from source |
-| [docs/usage.md](docs/usage.md) | Commands and flags, `lvpm.toml`, `lvpm.lock`, add/remove/upgrade, venvs, package sources, configuration |
+| [docs/usage.md](docs/usage.md) | Commands and flags, `lvpm.toml`, `lvpm.lock`, install/uninstall/upgrade, venvs, package sources, configuration |
 | [docs/venvs.md](docs/venvs.md) | How a venv works: the overlay, its palettes, keeping the LabVIEW installation clean |
 | [docs/labview-integration.md](docs/labview-integration.md) | What an install does inside LabVIEW: linkfix, relinking, install hooks, VI Server |
 | [docs/package-notes.md](docs/package-notes.md) | Commonly used packages in a venv: which hooks they need, which don't work yet |

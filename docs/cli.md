@@ -34,10 +34,12 @@ lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refre
   targets                       detected LabVIEW installations
   search <query>                search the indexes
   list                          what lvpm installed into the target
-  install [<pkg>[@ver]] [--manifest FILE] [--dry-run] [--no-deps]
+  install [<pkg>[@ver]] [--no-project] [--dev] [--group NAME] [--index NAME]
+          [--manifest FILE] [--dry-run] [--no-deps]
           [--no-linkfix] [--relink] [--no-hooks | --hooks] [--allow-downgrade]
           [--relink-timeout SECS] [--relink-progress NAME] [--keep-open]
-  uninstall <pkg> [--with-deps | --keep-deps] [--force] | --all
+  uninstall <pkg> [--no-project] [--dev] [--group NAME]
+            [--with-deps | --keep-deps] [--force] | --all
   relink <pkg> | --all          [--relink-timeout] [--relink-progress] [--keep-open]
   linkfix [--tree DIR] [--dry-run] [--verbose] [--keep-compiled-code]
      [--fix owner,paths,qualifiers,source-only,clfn-wildcard] [--report FILE]
@@ -65,7 +67,12 @@ What works and stays:
 - Names users already know from cargo and npm: `install`, `uninstall`,
   `list`, `search`, `config get|set`, `cache add`.
 - No activation step. A venv at or above the working directory is used;
-  `--global`, `--prefix` and `--project` override it.
+  `--global`, `--prefix` and `--project` override it. In this fork a write into
+  a LabVIEW installation itself needs `--global`, and `--labview-version` only
+  picks which one ([usage.md](usage.md#writing-into-labview-itself)).
+- In this fork, `install <pkg>` and `uninstall <pkg>` change the project in a
+  project (`--no-project` opts out), and `add` and `remove` are their aliases
+  ([usage.md](usage.md#adding-and-removing-dependencies)).
 - `<pkg> | --all` for every bulk command.
 - `RelinkArgs` shared by `install` and `relink`, so the two cannot drift.
 
@@ -100,10 +107,11 @@ alias until 1.0. Breaking: no, through the alias.
 ### 3. `--labview-version` is described as an install flag
 
 It selects the LabVIEW for every command (`venv create`, `start`,
-`launch`, `vi-*`), but its help says "Install into this LabVIEW version".
+`launch`, `vi-*`), but its help read "Install into this LabVIEW version". It
+now says "Which LabVIEW version, e.g. 2026; a write into LabVIEW itself also
+needs --global. See `lvpm targets`." That fixes the help text.
 
-Proposed: help text "The LabVIEW to use, e.g. 2026"; add the short alias
-`--lv`. Settle the manifest key at the same time: `lvpm.toml` says
+Proposed: add the short alias `--lv`. Settle the manifest key at the same time: `lvpm.toml` says
 `labview = "2025"` while the `venv create` help says "the manifest's
 `labview-version`". Keep `labview` and fix the help. Breaking: no.
 
@@ -232,7 +240,7 @@ Proposed:
 
 | Command | What | Where it is planned |
 |---|---|---|
-| `add <pkg>[@constraint]` / `remove <pkg>` | edit `lvpm.toml` and install or uninstall in one step | roadmap, manifest |
+| ~~`add <pkg>[@constraint]` / `remove <pkg>`~~ | Done: aliases of `install` and `uninstall`, which edit `lvpm.toml` in a project ([usage.md](usage.md#adding-and-removing-dependencies)) | done |
 | `update [<pkg>]` | re-resolve and rewrite `lvpm.lock` | roadmap, lockfile |
 | `outdated` | installed versions against the newest the constraints allow | new; needs the lockfile |
 | `info <pkg>` | versions, dependencies, source, license, description before installing | new; the TUI's Browse details need the same |
@@ -253,9 +261,17 @@ Proposed:
    manifest does not declare and the lockfile could not reproduce.
    Recommendation: inside a project, `install <pkg>` refuses and points to
    `add`; outside a project it installs as today.
+
+   **Decided, the other way.** Inside a project, `install <pkg>` adds to the
+   manifest, as in npm. `--no-project` keeps the direct install. See
+   [usage.md](usage.md#adding-and-removing-dependencies).
 2. **Names for `add` / `remove`.** `remove` next to `uninstall` is
    confusing. Alternative: `add` / `drop`, or keep `uninstall` for both and
    have it edit the manifest inside a project.
+
+   **Decided.** `uninstall` edits the manifest inside a project, and `add` and
+   `remove` stay as aliases of `install` and `uninstall`. See
+   [usage.md](usage.md#adding-and-removing-dependencies).
 3. **`start` and `launch`** (item 5): one command, or two with a clear
    split.
 4. **Short flags.** Today only `-y`. Candidates: `-n` for `--dry-run`, `-q`,

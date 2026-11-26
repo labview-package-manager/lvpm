@@ -69,7 +69,7 @@ pub fn trials() -> Vec<Trial> {
             uninstall_shared_dependencies,
         ),
         (
-            "uninstall: warn before removing a required package",
+            "uninstall: refuse a required package unless forced",
             uninstall_required_package,
         ),
         (
@@ -420,12 +420,15 @@ fn uninstall_setup() -> Check {
 }
 
 fn uninstall_keep_dependencies() -> Check {
-    let failed = lvpm(&venv(), &["uninstall", "lvpm_e2e_root"])
+    let failed = lvpm(&venv(), &["uninstall", "lvpm_e2e_root", "--no-project"])
         .try_failure()
         .map_err(fail)?;
     contains(&failed, "--with-deps or --keep-deps")?;
     exists(&record("lvpm_e2e_root")?)?;
-    ok(&venv(), &["uninstall", "lvpm_e2e_root", "--keep-deps"])?;
+    ok(
+        &venv(),
+        &["uninstall", "lvpm_e2e_root", "--keep-deps", "--no-project"],
+    )?;
     absent(&record("lvpm_e2e_root")?)?;
     absent(&addon("lvpm_e2e_root")?)?;
     exists(&record("lvpm_e2e_private")?)?;
@@ -434,7 +437,10 @@ fn uninstall_keep_dependencies() -> Check {
 }
 
 fn uninstall_shared_dependencies() -> Check {
-    let result = ok(&venv(), &["uninstall", "lvpm_e2e_root", "--with-deps"])?;
+    let result = ok(
+        &venv(),
+        &["uninstall", "lvpm_e2e_root", "--with-deps", "--no-project"],
+    )?;
     contains(
         &result,
         "keeping lvpm_e2e_shared: still required by lvpm_e2e_other",
@@ -449,8 +455,33 @@ fn uninstall_shared_dependencies() -> Check {
 }
 
 fn uninstall_required_package() -> Check {
-    let result = ok(&venv(), &["uninstall", "lvpm_e2e_shared", "--keep-deps"])?;
-    contains(&result, "required by installed packages: lvpm_e2e_other")?;
+    // A package another one requires is refused, naming how to force it; only
+    // --force removes it, and says it did.
+    let refused = lvpm(
+        &venv(),
+        &[
+            "uninstall",
+            "lvpm_e2e_shared",
+            "--keep-deps",
+            "--no-project",
+        ],
+    )
+    .try_failure()
+    .map_err(fail)?;
+    contains(&refused, "required by installed packages: lvpm_e2e_other")?;
+    contains(&refused, "--force")?;
+    exists(&record("lvpm_e2e_shared")?)?;
+    let forced = ok(
+        &venv(),
+        &[
+            "uninstall",
+            "lvpm_e2e_shared",
+            "--keep-deps",
+            "--no-project",
+            "--force",
+        ],
+    )?;
+    contains(&forced, "required by installed packages: lvpm_e2e_other")?;
     absent(&record("lvpm_e2e_shared")?)?;
     exists(&record("lvpm_e2e_other")?)
 }
@@ -467,9 +498,12 @@ fn uninstall_legacy_records() -> Check {
         std::fs::write(&path, serde_json::to_vec_pretty(&data).map_err(fail)?).map_err(fail)?;
         // This fork reads old records; only a removal that needs their
         // dependency list refuses them.
-        let failed = lvpm(&venv(), &["uninstall", "lvpm_e2e_root", "--with-deps"])
-            .try_failure()
-            .map_err(fail)?;
+        let failed = lvpm(
+            &venv(),
+            &["uninstall", "lvpm_e2e_root", "--with-deps", "--no-project"],
+        )
+        .try_failure()
+        .map_err(fail)?;
         contains(&failed, "dependency list required")?;
         ok(&venv(), &["list"])?;
         exists(&record("lvpm_e2e_root")?)?;
@@ -509,7 +543,10 @@ fn uninstall_project_dependencies() -> Check {
             };
             std::fs::write(&path, manifest).map_err(fail)?;
             ok(&venv(), &["install", "lvpm_e2e_root", "--no-relink"])?;
-            let result = ok(&venv(), &["uninstall", "lvpm_e2e_root", "--with-deps"])?;
+            let result = ok(
+                &venv(),
+                &["uninstall", "lvpm_e2e_root", "--with-deps", "--no-project"],
+            )?;
             contains(&result, "keeping lvpm_e2e_private: declared in lvpm.toml")?;
             contains(
                 &result,
@@ -518,7 +555,15 @@ fn uninstall_project_dependencies() -> Check {
             absent(&record("lvpm_e2e_root")?)?;
             exists(&record("lvpm_e2e_private")?)?;
             exists(&record("lvpm_e2e_shared")?)?;
-            let result = ok(&venv(), &["uninstall", "lvpm_e2e_private", "--keep-deps"])?;
+            let result = ok(
+                &venv(),
+                &[
+                    "uninstall",
+                    "lvpm_e2e_private",
+                    "--keep-deps",
+                    "--no-project",
+                ],
+            )?;
             contains(&result, "lvpm_e2e_private is declared in lvpm.toml")?;
             exists(&record("lvpm_e2e_shared")?)?;
             ok(&venv(), &["uninstall", "--all"])?;
@@ -541,7 +586,10 @@ fn uninstall_vipm_manifest() -> Check {
     ok(&dir, &["venv", "create", "--manifest", "vipm.toml"])?;
     // This fork's install has no --manifest: the venv bound to vipm.toml is the destination.
     ok(&dir, &["install", "lvpm_e2e_root", "--no-relink"])?;
-    let result = ok(&dir, &["uninstall", "lvpm_e2e_root", "--with-deps"])?;
+    let result = ok(
+        &dir,
+        &["uninstall", "lvpm_e2e_root", "--with-deps", "--no-project"],
+    )?;
     contains(&result, "keeping lvpm_e2e_private: declared in vipm.toml")?;
     contains(
         &result,

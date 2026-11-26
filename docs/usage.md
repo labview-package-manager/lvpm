@@ -8,18 +8,18 @@
 | `lvpm init --from <file.vipc>`                       | The same, with the packages VIPM chose in a `.vipc` as dependencies ([From a .vipc](#from-a-vipc))                                           |
 | `lvpm init --from vipm.toml`                         | The same, with the project and packages of a VIPM 2026 `vipm.toml` ([From a vipm.toml](#from-a-vipmtoml))                                    |
 | `lvpm import <file>`                                 | Write the packages of a `.vipc` or `vipm.toml` into an existing (or new) `lvpm.toml`; installs nothing ([Importing into a project](#importing-into-a-project)) |
-| `lvpm install <name>[@<version>]`                    | Outside a project, or with `--global`, `--prefix` or `--labview-version`: resolve the package and its dependencies, download, verify MD5, unpack, run linkfix, run the hooks of packages you allowed ([Install hooks](#install-hooks)). In a project it is `lvpm add` |
+| `lvpm install <name>[@<version>]`                    | In a project: add the package to `lvpm.toml`, lock and sync ([Adding and removing dependencies](#adding-and-removing-dependencies)). Outside a project, or with `--no-project`: resolve the package and its dependencies, download, verify MD5, unpack, run linkfix, run the hooks of packages you allowed ([Install hooks](#install-hooks)), and leave `lvpm.toml` and `lvpm.lock` as they are. Into a LabVIEW installation itself, only with `--global` |
 | `lvpm install`                                       | Inside a project: the same as `lvpm sync`                                                                                                    |
 | `lvpm sync`                                          | Make the destination hold exactly what `lvpm.lock` lists, one plan with one linkfix pass ([The lock file](#the-lock-file))                    |
-| `lvpm add <name>[@<constraint>]` / `--dev` / `--group <name>` / `--index <NAME>` | Add a dependency to `lvpm.toml`, lock and sync                                                                                      |
-| `lvpm remove <name>` / `--dev` / `--group <name>`    | Remove a dependency from `lvpm.toml`, lock and sync                                                                                          |
+| `lvpm install <name>[@<constraint>]` / `--dev` / `--group <name>` / `--index <NAME>` | In a project: add a dependency to `lvpm.toml`, lock and sync                                                                  |
 | `lvpm lock` / `--check` / `--upgrade`                | Write `lvpm.lock`, check it, or move packages to newer versions                                                                              |
-| `lvpm uninstall <name>` / `--all` / `--with-deps` / `--keep-deps` / `--force` | Remove exactly the files that were installed and prune empty folders. A named package can take the dependencies nothing else needs with it: it asks, and a script passes `--with-deps` or `--keep-deps`. A package other installed packages require needs `--force` ([Uninstalling](#uninstalling)) |
+| `lvpm uninstall <name>` / `--dev` / `--group <name>`  | In a project: remove a dependency from `lvpm.toml`, lock and sync; a package another one requires is refused ([Adding and removing dependencies](#adding-and-removing-dependencies)) |
+| `lvpm uninstall <name> --no-project` / `--all` / `--with-deps` / `--keep-deps` / `--force` | Outside a project, with `--no-project`, or with `--all`: remove exactly the files that were installed and prune empty folders, and leave `lvpm.toml` and `lvpm.lock` as they are. A named package can take the dependencies nothing else needs with it: it asks, and a script passes `--with-deps` or `--keep-deps`. A package other installed packages require needs `--force` ([Uninstalling](#uninstalling)) |
 | `lvpm list`                                          | What lvpm has installed into the selected target, and which hooks it did not run                                                             |
 | `lvpm search <query>` / `--all [query]`              | Search the package indexes; `--all` lists every version of every package and its source                                                      |
 | `lvpm info <package>[@<version>]`                    | Show a package's description, requirements, files and versions, from its archive (downloaded, then cached)                                   |
 | `lvpm targets`                                       | Detected LabVIEW installations                                                                                                               |
-| `lvpm tui`                                           | Browse the catalog and install packages in a terminal UI; in a project's venv an install is `lvpm add`: a pick from the list adds a floor (`>=version`) to `lvpm.toml`, a version picked in the details is pinned exactly; takes no options |
+| `lvpm tui`                                           | Browse the catalog and install packages in a terminal UI; in a project's venv an install is `lvpm install <name>`: a pick from the list adds a floor (`>=version`) to `lvpm.toml`, a version picked in the details is pinned exactly. With no venv it installs nothing into LabVIEW itself and says to run `lvpm install <name> --global`. Takes no options |
 | `lvpm linkfix` / `--tree <DIR>` / `--dry-run` / `--verbose` / `--fix <methods>` / `--keep-compiled-code` / `--report <file>` / `--bitness <32\|64>` | Repair the links and separate the compiled code of every LabVIEW file in the venv, or under `--tree`, without LabVIEW ([Linkfix](#linkfix)) |
 | `lvpm relink <name>` / `--all`                       | Rerun the relink pass from the install manifests, without reinstalling                                                                       |
 | `lvpm run-hooks <name>` / `--all`                    | Run a package's PostInstall hook now, for one that failed or was skipped during install ([Install hooks](#install-hooks))                    |
@@ -41,9 +41,9 @@ Flags that apply to every command:
 
 | Flag                       | Meaning                                                                                                   |
 | -------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `--labview-version <YYYY>` | Install into this LabVIEW version (see `lvpm targets`)                                                    |
+| `--labview-version <YYYY>` | Which LabVIEW version (see `lvpm targets`). It only picks: a write into LabVIEW itself also needs `--global` |
 | `--project <DIR>`          | Use that project's venv instead of looking upwards from the current directory; for `init`, the folder to write the project into |
-| `--global`                 | Use the LabVIEW installation itself, even from inside a project that has a venv                           |
+| `--global`                 | Write into the LabVIEW installation itself, even from inside a project that has a venv. Alone, it picks the project's LabVIEW, the venv's, or the only installation; not with `--prefix` ([Writing into LabVIEW itself](#writing-into-labview-itself)) |
 | `--prefix <DIR>`           | Install into a scratch directory instead of LabVIEW (files and linkfix only; nothing to relink or run hooks with) |
 | `--refresh`                | Ask each index whether it changed (a conditional request) instead of trusting the cache in `%LOCALAPPDATA%\lvpm\cache` |
 | `--yes` / `-y`             | Answer yes to every prompt (`venv remove`, and `uninstall` about dependencies). `LVPM_YES` does the same; `0`, `false`, `no`, `off` or empty leaves it off |
@@ -53,7 +53,9 @@ Flags that apply to every command:
 `install` flags: `--dry-run` shows every file, relink folder and hook and
 changes nothing; `--no-deps` skips dependencies and `--allow-downgrade`
 permits replacing an installed package with an older version (both only for
-an install that is not a sync or an `add`: a lock always holds the full set);
+an install that is not a sync or an add to a project, so with `--no-project`
+or outside a project: a lock always holds the full set, and in a project they
+are refused, naming `--no-project`);
 linkfix runs over the LabVIEW files the install wrote and `--no-linkfix`
 skips it ([Linkfix](#linkfix)); `--relink` runs LabVIEW's load-and-save relink
 pass instead of linkfix (the hidden `--no-relink` is accepted and ignored);
@@ -62,8 +64,8 @@ hooks of every package for this command, where they are off by default
 (see [Install hooks](#install-hooks); a headless LabVIEW runs none without
 it). `--relink-timeout <SECS>`
 (default 900) bounds one folder's relink; `--keep-open` leaves the LabVIEW
-started for a venv relink running. `sync`, `add` and `remove` take `--dry-run`
-and the relink and hook flags as well.
+started for a venv relink running. `sync`, a project `install <name>` and a
+project `uninstall` take `--dry-run` and the relink and hook flags as well.
 
 lvpm 0.3 had three `install` flags that are gone or refused
 ([labview-package-manager/lvpm#47](https://github.com/labview-package-manager/lvpm/issues/47)):
@@ -71,8 +73,32 @@ lvpm 0.3 had three `install` flags that are gone or refused
 | lvpm 0.3                                   | Now                                                                                              |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------ |
 | `install --no-hooks`                       | Nothing to pass: hooks are off unless turned on ([Install hooks](#install-hooks)). A package with `hooks = "run"` cannot be held back for one command |
-| `install <name> --no-save` in a venv       | No equivalent: the next `sync` would remove the package. `--prefix`, `--global` or `--labview-version` install without writing `lvpm.toml` |
+| `install <name> --no-save` in a venv       | No equivalent: the next `sync` would remove the package. `install <name> --no-project` installs without writing `lvpm.toml` |
 | `install --manifest <FILE> --prefix <DIR>` | `sync --prefix <DIR>`, run in the folder of `lvpm.toml` (`--project` and `--prefix` do not combine); the manifest must be named `lvpm.toml` |
+
+### Writing into LabVIEW itself
+
+An install into a LabVIEW installation changes every project that uses that
+LabVIEW, so lvpm does it only when you pass `--global`. `--labview-version`
+only says which LabVIEW. This holds for every command that writes there:
+`install`, `uninstall`, `sync`, `relink` and `run-hooks`.
+
+| You pass                                  | Result                                                                                   |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `--global --labview-version 2026`         | Writes into LabVIEW 2026 itself                                                          |
+| `--global`                                | Picks the project's LabVIEW (the venv's, or the manifest's `labview` with no venv), else the only installation. With several it asks "which LabVIEW?": add `--labview-version` |
+| `--labview-version 2026` alone, no venv   | Fails and changes nothing: "does not write into LabVIEW 2026 itself", `next: add --global, or --prefix <DIR> for a scratch tree` |
+| nothing, outside a project, no venv       | Fails and changes nothing: "pick a destination", naming `--global [--labview-version YYYY]`, `--prefix <DIR>` or a project with a venv |
+| `--labview-version 2026` in a project with a venv | Writes into the venv, as before: the venv wins                                    |
+| `--global --prefix <DIR>`                 | Fails: they are mutually exclusive                                                        |
+| `--prefix <DIR>`                          | Writes into that scratch tree; no `--global`                                              |
+
+Reading needs no `--global`: `list`, `launch`, `linkfix`, `vi-probe`, `vi-save`
+and `vi-run` take `--labview-version` alone. `venv create`, `init`,
+`refresh` and `start` are unchanged too. On a headless machine
+(`LV_RTE_HEADLESS`) `--global` is not needed either: the container's LabVIEW is
+the sandbox ([CI in a container](ci-docker.md)). `lvpm tui` installs nothing
+into LabVIEW itself outside a venv; it says to run `lvpm install <name> --global`.
 
 ## Install hooks
 
@@ -236,8 +262,8 @@ indexes to use; `lvpm init` writes the first one ([Starting a project](#starting
 Local package folders are configured globally instead. Any
 `lvpm` command run at or below it picks it up; hosted `[sources]` apply to
 `search` and to a single-package `install` as much as to a full one.
-`min-age-days` is the exception: a single-package `install` that is not an
-`lvpm add` never applies it (see
+`min-age-days` is the exception: a single-package `install` that does not add to a project
+(`--no-project`, or outside a project) never applies it (see
 [A minimum release age](https://github.com/ThatsTheEnd/lvpm/blob/main/docs/manifest.md#a-minimum-release-age)).
 
 ```toml
@@ -316,8 +342,8 @@ with the reason on one line. It reads no source, so it is cheap.
 Before groups, a dev-only package was marked
 `dev = true`. Such a lock, format 1, is out of date: `lvpm lock --check`,
 `lvpm sync --locked` (the default on a headless machine) and `lvpm sync --frozen`
-refuse it and name `lvpm lock`. `lvpm lock`, a plain `lvpm sync`, `add` and
-`remove` write it again as format 2; commit the result.
+refuse it and name `lvpm lock`. `lvpm lock`, a plain `lvpm sync`, and a named
+`install` and `uninstall` write it again as format 2; commit the result.
 
 **Syncing.** `lvpm sync` installs what is missing, replaces what is at another
 version, and uninstalls the lvpm-installed packages the lock does not list. It
@@ -354,50 +380,95 @@ refuse that instead:
 
 ### Adding and removing dependencies
 
+In a project, `lvpm install <name>` and `lvpm uninstall <name>` are the
+commands that change the project: both edit `lvpm.toml`, lock and sync. A
+direct install that leaves the project alone takes `--no-project`.
+`lvpm add` and `lvpm remove` are aliases of `lvpm install` and `lvpm uninstall`: the same flags and the same result, in a project and outside one.
+
 ```console
-$ lvpm add oglib_error              # writes oglib_error = ">=<the version it locked>"
-$ lvpm add "gamma@>=0.5"            # with a constraint
-$ lvpm add --dev jki_lib_caraya     # into [dev-dependencies]
-$ lvpm add --group ci ci_tools      # into [dependency-groups.ci], made if it is new
-$ lvpm add gamma --index mirror     # a source pin: gamma comes only from the [sources] entry mirror
-$ lvpm remove gamma                 # --dev or --group ci if it is in another table
+$ lvpm install oglib_error              # writes oglib_error = ">=<the version it locked>"
+$ lvpm install "gamma@>=0.5"            # with a constraint
+$ lvpm install --dev jki_lib_caraya     # into [dev-dependencies]
+$ lvpm install --group ci ci_tools      # into [dependency-groups.ci], made if it is new
+$ lvpm install gamma --index mirror     # a source pin: gamma comes only from the [sources] entry mirror
+$ lvpm uninstall gamma                  # --dev or --group ci if it is in another table
 ```
 
-`add` and `remove` edit `lvpm.toml` (comments and layout stay), then lock and
+| Command | In a project | Outside a project |
+| ------- | ------------ | ----------------- |
+| `install` | sync to `lvpm.lock` | error: "give a package name" |
+| `install <pkg>` | add to `lvpm.toml`, lock, sync | direct install, with `--global` or `--prefix <DIR>` |
+| `install <pkg> --no-project` | direct install; `lvpm.toml` and `lvpm.lock` untouched | direct install |
+| `uninstall <pkg>` | take out of `lvpm.toml`, lock, sync; refused when another package requires it | direct uninstall, with `--global` or `--prefix <DIR>` |
+| `uninstall <pkg> --no-project` | direct uninstall; `lvpm.toml` and `lvpm.lock` untouched | direct uninstall |
+| `uninstall --all`, bare `uninstall` | direct, as outside a project | direct |
+| `add ...`, `remove ...` | exactly `install ...` and `uninstall ...` | exactly `install ...` and `uninstall ...` (direct) |
+
+The destination flags (`--prefix`, `--global`, `--labview-version`) only pick
+where the project syncs, as on `sync`: a named `install` or `uninstall` edits
+`lvpm.toml` whichever of them is given, and says so in one note
+(`note: in a project, --prefix picks where the project syncs; lvpm.toml gets x. Pass --no-project to install without changing the project.`;
+for `uninstall`, `lvpm.toml loses x` and `to uninstall without changing the project`).
+Writing into LabVIEW itself still needs `--global`
+([Writing into LabVIEW itself](#writing-into-labview-itself)).
+A named `install` or `uninstall` with `--global` into LabVIEW itself is refused,
+before it writes anything, if the sync would remove any package but the one
+`uninstall` takes out of `lvpm.toml`: packages that other projects or you put
+there, and dependencies the new lock drops, which another project may use. The
+error names them and suggests `--no-project`. A headless project with no venv,
+which chose the installation without `--global`, is not guarded. This is a
+guard until a question replaces it
+([#55](https://github.com/labview-package-manager/lvpm/issues/55)).
+
+`install` and `uninstall` edit `lvpm.toml` (comments and layout stay), then lock and
 sync. If the lock or the sync fails, `lvpm.toml` and `lvpm.lock` are put back
-as they were. A package that another one still requires stays in the lock
-after `remove`, and the output says so. They install `[dependencies]`, dev and
-the group they edit, and never uninstall a package the new lock still lists, so
-what `lvpm sync --group ci` installed stays; plain `lvpm sync` is the exact one.
-`--dev` is `--group dev`. A misspelt `--group` on `add` makes a new group, and
+as they were. A package that another one requires is refused before anything is
+written, with `lvpm.toml` listing it or not: the error says `x is required by
+installed packages: a, b`, and one `next:` line names the `lvpm uninstall` of
+each package of yours to remove first, with its `--dev` or `--group` flag.
+A project install installs `[dependencies]`, dev and the group it edits, and
+never uninstalls a package the new lock still lists, so what
+`lvpm sync --group ci` installed stays; plain `lvpm sync` is the exact one.
+`--dev` is `--group dev`. A misspelt `--group` on `install` makes a new group, and
 says `created [dependency-groups.<name>], a new group`. With `--json` the events
 keep `dev` and add `group`, and `created_table`, when they apply. An `added` or
 `updated` edit of a pinned line also carries `index`, the source's name.
+`--group` with no package still means "also sync this group", as on `sync`.
+
+**What a project refuses.** A lock decides the dependencies, so in a project
+`install <name> --no-deps`, `--manifest` and `--allow-downgrade`, and
+`uninstall <name> --keep-deps` and `--force`, fail and name `--no-project`,
+which takes them. `--force` is only for the direct route. `--with-deps` is accepted: it is what a project uninstall does
+anyway. Outside a project, and with `--no-project`, the saving flags `--dev`,
+`--group` and `--index` fail, since there is no `lvpm.toml` to save in; so do
+`uninstall`'s `--dev`, `--group`, `--dry-run`, `--no-linkfix`, `--relink`,
+`--hooks`, `--keep-open` and `--relink-progress`, which only a project uninstall
+takes. `--no-project` needs a package
+and does not combine with `--project`.
 
 **A source pin.** `--index <NAME>` writes a source pin, as the table form
 `{ version = ">=<the newest version the source lists>", index = "<NAME>" }`, and
 takes that version from `<NAME>` alone. The `>=<newest>` applies only when no
-constraint is given: `add <name>@<constraint> --index <NAME>` writes the
+constraint is given: `install <name>@<constraint> --index <NAME>` writes the
 constraint as given. It works with `--dev` and `--group`.
 `<NAME>` must be a key of `[sources]`. If it is not, or the source does not
-list the package, `add` fails and puts `lvpm.toml` and `lvpm.lock` back. On a
+list the package, `install` fails and puts `lvpm.toml` and `lvpm.lock` back. On a
 line that is already a table, `--index` sets or replaces `index` and keeps the
 other keys; on a line with `github` it fails, since the two cannot be
-combined. `add` without `--index` on a pinned line keeps the source pin and
+combined. `install` without `--index` on a pinned line keeps the source pin and
 changes only `version`. No flag removes a source pin: edit the line, or
-`lvpm remove` the package. What a source pin does is described in
+`lvpm uninstall` the package. What a source pin does is described in
 [Package sources](#package-sources).
 
 **Quote a constraint.** PowerShell and cmd read `>` as a redirect, so
-`lvpm add gamma@>=0.5` sends lvpm's output into a file named `=0.5` and hands
+`lvpm install gamma@>=0.5` sends lvpm's output into a file named `=0.5` and hands
 lvpm only `gamma@`. Put the argument in double quotes, as in
-`lvpm add "gamma@>=0.5"`; that works in both.
+`lvpm install "gamma@>=0.5"`; that works in both.
 
-In a project, `lvpm install <name>` with no destination flag is `lvpm add
-<name>`, and says so in one line; a bare `lvpm install` is `lvpm sync`. With
-`--global`, `--prefix` or `--labview-version`, or outside a project,
-`lvpm install <name>` is the plain install described above and changes no
-manifest or lock.
+A bare `lvpm install` in a project is `lvpm sync`. `lvpm uninstall <name>` of a
+package the project does not list fails ("<name> is not a dependency of this
+project"); when it is installed in the target, the `next:` line offers
+`lvpm uninstall <name> --no-project`.
 
 ### Upgrading
 
@@ -428,10 +499,10 @@ labview_open_source_lib_serializer = { github = "LabVIEW-Open-Source/Serializer"
 That package comes from that repo and never from `[sources]`. Which release
 file lvpm picks, how its version is read and what the manifest refuses are in
 [manifest.md](https://github.com/ThatsTheEnd/lvpm/blob/main/docs/manifest.md#a-dependency-from-github). Edit the line by hand;
-`lvpm add` does not write `github`, and on a table line it changes only
+`lvpm install <name>` does not write `github`, and on a table line it changes only
 `version`.
 
-**Which commands call GitHub.** `lvpm lock`, `lvpm add`, `lvpm remove`,
+**Which commands call GitHub.** `lvpm lock`, a named `lvpm install` or `lvpm uninstall` in a project,
 `lvpm lock --upgrade` and `--upgrade-package` list the repo's releases and
 download the file. `lvpm sync` does when the cache lacks the file or it has to
 lock first. `lvpm lock --check`, `search`, `info` and `lvpm install <name>`
@@ -659,7 +730,7 @@ created C:\Git\MyProject\.lv-venv
   VI Server port 3735
 
 $ lvpm install                    # sync: exactly what lvpm.lock lists, into .lv-venv
-$ lvpm add oglib_error            # one more dependency: lvpm.toml, lvpm.lock and .lv-venv
+$ lvpm install oglib_error        # one more dependency: lvpm.toml, lvpm.lock and .lv-venv
 $ lvpm launch MyProject.lvproj    # a LabVIEW that sees the venv
 ```
 
@@ -737,7 +808,7 @@ the venv started another way than `lvpm launch` gets none of this.
 
 ### Linkfix
 
-`install`, `sync` and `add` run linkfix after the files are copied and
+`install` and `sync` run linkfix after the files are copied and
 before the PostInstall hooks. It edits only the LabVIEW files that install
 wrote into the LabVIEW tree, and needs no LabVIEW:
 
@@ -769,7 +840,13 @@ method changes.
 
 ### Uninstalling
 
-`lvpm uninstall <name>` removes the package's files. When it has
+This is the direct uninstall, which outside a project is `lvpm uninstall <name>`
+with `--prefix <DIR>` or `--global`, and in a project `lvpm uninstall <name> --no-project`
+(`--all` is direct too). With no destination flag, outside a project and a
+venv, it fails and names `--global`.
+`lvpm.toml` and `lvpm.lock` stay as they are; a named uninstall in a project
+edits them instead ([Adding and removing dependencies](#adding-and-removing-dependencies)).
+It removes the package's files. When it has
 dependencies that no other installed package and no entry of `lvpm.toml`
 needs, it asks whether to remove them too:
 
@@ -1339,7 +1416,7 @@ name are ignored, so to try a local build of a pinned package, remove the
 `index` key in `lvpm.toml`. Each such edit makes the lock out of date, so lock
 again before the next `sync`.
 
-- `lvpm add <name> --index <NAME>` writes the source pin
+- `lvpm install <name> --index <NAME>` writes the source pin
   ([Adding and removing dependencies](#adding-and-removing-dependencies)).
 - A name has one source pin. The line pins the name wherever it is listed, so
   the same name pinned to two sources in two tables is refused, and an

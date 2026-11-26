@@ -4,7 +4,8 @@
 use super::lock::{error as lock_error, stale_reason};
 use super::{Renderer, Stream};
 use lvpm_core::errors::{
-    ArchiveFault, LockError, LockIncompatible, LockedArchiveProblem, RouteError, SyncError,
+    ArchiveFault, DirectBecause, LockError, LockIncompatible, LockedArchiveProblem, RouteError,
+    SyncError,
 };
 use lvpm_core::events::{Event, PackageRef, RemoveReason, SyncStep};
 
@@ -211,7 +212,7 @@ pub(super) fn incomplete_body(done: &[SyncStep], left: &[SyncStep], cause: &str)
 pub fn route_error(error: &RouteError) -> String {
     match error {
         RouteError::NoPackage { searched_from } => format!(
-            "give a package name, or --manifest <FILE>\n\
+            "give a package name\n\
              there is no project to sync: no lvpm.toml found in {} or above\n\
              next: name a package to install, or run this in a project, a directory with an \
              lvpm.toml",
@@ -221,21 +222,74 @@ pub fn route_error(error: &RouteError) -> String {
             let (flag, next) = match (option, adding) {
                 (LockIncompatible::NoDeps, false) => (
                     "--no-deps",
-                    "drop --no-deps, or install one package where you choose: \
-                     `lvpm install <package> --no-deps --prefix <dir>`",
+                    "drop --no-deps, or install one package without changing the project: \
+                     `lvpm install <package> --no-deps --no-project --prefix <dir>`",
                 ),
                 (LockIncompatible::NoDeps, true) => (
                     "--no-deps",
-                    "drop --no-deps, or say where the package goes: \
-                     `lvpm install <package> --no-deps --prefix <dir>`",
+                    "drop --no-deps, or install the package without changing the project: \
+                     `lvpm install <package> --no-deps --no-project --prefix <dir>`",
                 ),
-                (LockIncompatible::Manifest, _) => (
+                (LockIncompatible::AllowDowngrade, adding) => (
+                    "--allow-downgrade",
+                    match adding {
+                        false => {
+                            "drop --allow-downgrade (a sync installs the version lvpm.lock names, \
+                             older or newer), or install one package without changing the project: \
+                             `lvpm install <package> --allow-downgrade --no-project --prefix <dir>`"
+                        }
+                        true => {
+                            "drop --allow-downgrade (a sync installs the version lvpm.lock names, \
+                             older or newer), or install the package without changing the project: \
+                             `lvpm install <package> --allow-downgrade --no-project --prefix <dir>`"
+                        }
+                    },
+                ),
+                (LockIncompatible::Manifest, false) => (
                     "--manifest",
-                    "drop --manifest to sync this project, or name a package and where it \
-                     goes: `lvpm install <package> --prefix <dir>`",
+                    "drop --manifest to sync this project, or name a package and install it \
+                     without changing the project: \
+                     `lvpm install <package> --no-project --prefix <dir>`",
+                ),
+                (LockIncompatible::Manifest, true) => (
+                    "--manifest",
+                    "drop --manifest to add <package> to this project, or install the package \
+                     without changing the project: \
+                     `lvpm install <package> --no-project --prefix <dir>`",
                 ),
             };
-            format!("{flag} is {error}\nnext: {next}")
+            format!(
+                "{flag} cannot be used in a project, because lvpm.lock decides the dependencies\n\
+                 next: {next}"
+            )
+        }
+        RouteError::UninstallNotWithLock { flag } => format!(
+            "{error}\n\
+             next: drop {flag}, or uninstall the package without changing the project: \
+             `lvpm uninstall <package> {flag} --no-project`"
+        ),
+        RouteError::OnlyInAProject { flag, because } => {
+            let way_in = match because {
+                DirectBecause::NoPackage => "name a package",
+                DirectBecause::NoProject => "drop --no-project",
+                DirectBecause::NotInAProject => {
+                    "run this in a project, where uninstalling a package takes it out of lvpm.toml"
+                }
+            };
+            format!("{error}\nnext: drop {flag}, or {way_in}")
+        }
+        RouteError::SaveOnlyInAProject { flags, no_project } => {
+            let way_in = match no_project {
+                true => "drop --no-project",
+                false => "run this in a project, where installing a package adds it to lvpm.toml",
+            };
+            // `--group` is the other meaning, and the only one an install with no package has.
+            let aside = match flags.contains(&"--group") {
+                true => " (with no package it installs that group)",
+                false => "",
+            };
+            let flags = flags.join(" and ");
+            format!("{error}\nnext: drop {flags}{aside}, or {way_in}")
         }
         RouteError::Other(cause) => format!("{cause:#}"),
     }
@@ -537,13 +591,153 @@ mod tests {
             });
             assert!(
                 text.starts_with(
-                    "--no-deps is not supported with a lock (lvpm.lock always holds the full set)\nnext: "
+                    "--no-deps cannot be used in a project, because lvpm.lock decides the dependencies\nnext: "
                 ),
                 "{text}"
             );
             // The way out of it is never the install it refuses.
             assert!(
-                text.ends_with("`lvpm install <package> --no-deps --prefix <dir>`"),
+                text.ends_with("`lvpm install <package> --no-deps --no-project --prefix <dir>`"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_downgrade_in_a_project_says_the_lock_names_the_version_and_names_no_project() {
+        for adding in [false, true] {
+            let text = route_error(&RouteError::NotWithLock {
+                option: LockIncompatible::AllowDowngrade,
+                adding,
+            });
+            assert!(
+                text.starts_with(
+                    "--allow-downgrade cannot be used in a project, because lvpm.lock decides the dependencies\nnext: drop --allow-downgrade (a sync installs the version lvpm.lock names, older or newer), or install "
+                ),
+                "{text}"
+            );
+            assert!(
+                text.ends_with(
+                    "without changing the project: `lvpm install <package> --allow-downgrade --no-project --prefix <dir>`"
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_uninstall_flag_the_lock_overrules_names_no_project_as_the_way_out() {
+        let text = route_error(&RouteError::UninstallNotWithLock { flag: "--force" });
+        assert_eq!(
+            text,
+            "--force cannot be used in a project, because lvpm.lock decides what stays\n\
+             next: drop --force, or uninstall the package without changing the project: \
+             `lvpm uninstall <package> --force --no-project`"
+        );
+    }
+
+    #[test]
+    fn a_project_only_flag_on_a_direct_uninstall_is_named_and_the_way_out_is_a_project() {
+        let text = route_error(&RouteError::OnlyInAProject {
+            flag: "--dev",
+            because: DirectBecause::NotInAProject,
+        });
+        assert_eq!(
+            text,
+            "--dev can only be used when uninstalling a package from a project\n\
+             next: drop --dev, or run this in a project, where uninstalling a package takes it \
+             out of lvpm.toml"
+        );
+    }
+
+    #[test]
+    fn a_saving_flag_on_a_direct_install_says_where_to_go_and_group_names_its_other_meaning() {
+        let said = |flags: &[&'static str], no_project| {
+            route_error(&RouteError::SaveOnlyInAProject {
+                flags: flags.to_vec(),
+                no_project,
+            })
+        };
+        let refusal = "can only be used when installing a package into a project, which saves it in lvpm.toml\n";
+        assert_eq!(
+            said(&["--dev"], false),
+            format!(
+                "--dev {refusal}next: drop --dev, or run this in a project, where installing a package adds it to lvpm.toml"
+            )
+        );
+        assert_eq!(
+            said(&["--group"], true),
+            format!(
+                "--group {refusal}next: drop --group (with no package it installs that group), or drop --no-project"
+            )
+        );
+    }
+
+    #[test]
+    fn every_saving_flag_given_is_named_in_the_refusal_and_in_what_to_drop() {
+        let said = |flags: &[&'static str]| {
+            route_error(&RouteError::SaveOnlyInAProject {
+                flags: flags.to_vec(),
+                no_project: false,
+            })
+        };
+        // clap refuses --dev and --index with --no-project, so these two are
+        // only ever met outside a project.
+        assert_eq!(
+            said(&["--dev", "--index"]),
+            "--dev and --index can only be used when installing a package into a project, which saves it in lvpm.toml\n\
+             next: drop --dev and --index, or run this in a project, where installing a package adds it to lvpm.toml"
+        );
+        assert_eq!(
+            said(&["--group", "--index"]),
+            "--group and --index can only be used when installing a package into a project, which saves it in lvpm.toml\n\
+             next: drop --group and --index (with no package it installs that group), or run this in a project, where installing a package adds it to lvpm.toml"
+        );
+    }
+
+    #[test]
+    fn the_way_in_to_a_project_only_flag_follows_why_the_uninstall_is_direct() {
+        let said = |because| {
+            route_error(&RouteError::OnlyInAProject {
+                flag: "--dry-run",
+                because,
+            })
+        };
+        let refusal = "--dry-run can only be used when uninstalling a package from a project\n";
+        assert_eq!(
+            said(DirectBecause::NoPackage),
+            format!("{refusal}next: drop --dry-run, or name a package")
+        );
+        assert_eq!(
+            said(DirectBecause::NoProject),
+            format!("{refusal}next: drop --dry-run, or drop --no-project")
+        );
+    }
+
+    #[test]
+    fn manifest_in_a_project_says_to_sync_or_to_add_by_whether_a_package_is_named() {
+        let said = |adding| {
+            route_error(&RouteError::NotWithLock {
+                option: LockIncompatible::Manifest,
+                adding,
+            })
+        };
+        let syncing = said(false);
+        assert!(
+            syncing.starts_with(
+                "--manifest cannot be used in a project, because lvpm.lock decides the dependencies\nnext: drop --manifest to sync this project, "
+            ),
+            "{syncing}"
+        );
+        let adding = said(true);
+        assert!(
+            adding.contains("next: drop --manifest to add <package> to this project, "),
+            "{adding}"
+        );
+        assert!(!adding.contains("sync this project"), "{adding}");
+        for text in [&syncing, &adding] {
+            assert!(
+                text.ends_with("`lvpm install <package> --no-project --prefix <dir>`"),
                 "{text}"
             );
         }
@@ -555,10 +749,7 @@ mod tests {
         let text = route_error(&RouteError::NoPackage {
             searched_from: PathBuf::from("here"),
         });
-        assert!(
-            text.starts_with("give a package name, or --manifest <FILE>\n"),
-            "{text}"
-        );
+        assert!(text.starts_with("give a package name\n"), "{text}");
         assert!(
             text.contains("no lvpm.toml found in here or above"),
             "{text}"

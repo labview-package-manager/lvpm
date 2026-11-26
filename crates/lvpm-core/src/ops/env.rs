@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// The flags that say where a command's packages live.
 #[derive(Debug, Clone, Default)]
 pub struct DestinationFlags {
-    /// Install into this LabVIEW version, e.g. 2026.
+    /// Pick this LabVIEW version, e.g. 2026. A write into the installation
+    /// itself needs `--global` as well.
     pub labview_version: Option<String>,
     /// Pick the 32- or 64-bit LabVIEW when both of a version are installed.
     pub labview_bitness: Option<u8>,
@@ -38,6 +39,56 @@ pub struct DestinationFlags {
     pub global: bool,
     /// The project whose venv to use, instead of looking upwards from `cwd`.
     pub project: Option<PathBuf>,
+}
+
+impl DestinationFlags {
+    /// The flags that picked the target, as typed, each with its value: first
+    /// the one that decided it, `--prefix`, then `--labview-version`, then
+    /// `--global`, then the `--labview-bitness` that narrowed a LabVIEW pick.
+    /// `--labview-version` picks nothing when `venv_wins` and `--global` is not
+    /// there to say otherwise (see [`OpEnv::destination`]).
+    pub fn picked(&self, venv_wins: bool) -> Vec<(&'static str, Option<String>)> {
+        let version = self
+            .labview_version
+            .as_ref()
+            .filter(|_| !venv_wins || self.global);
+        let bitness = (self.labview_bitness)
+            .filter(|_| self.prefix.is_none() && (version.is_some() || self.global));
+        [
+            self.prefix
+                .as_ref()
+                .map(|p| ("--prefix", Some(p.display().to_string()))),
+            version.map(|v| ("--labview-version", Some(v.clone()))),
+            self.global.then_some(("--global", None)),
+            bitness.map(|b| ("--labview-bitness", Some(b.to_string()))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+/// `word` as one word of a command line a user is told to run. Letters, digits
+/// and `_.:/\+-@=` stay bare, unless the word starts with `-`, `@` or `=`;
+/// anything else goes in single quotes, which are literal in POSIX shells and
+/// PowerShell, with every quote character inside doubled. Nothing in the word
+/// ever expands, so a name a feed supplies cannot run a command.
+// shortcut: a doubled quote is PowerShell's escape; a POSIX shell reads it as two quoted parts and drops it. Upgrade if a real package name has one.
+pub fn shell_word(word: &str) -> String {
+    let bare = |c: char| c.is_ascii_alphanumeric() || r"_.:/\+-@=".contains(c);
+    let leads = |c: char| !"-@=".contains(c);
+    if word.starts_with(leads) && word.chars().all(bare) {
+        return word.to_string();
+    }
+    let mut quoted = String::from("'");
+    for c in word.chars() {
+        // PowerShell ends a single-quoted string at U+2018..U+201B as well as at '
+        if matches!(c, '\'' | '\u{2018}'..='\u{201B}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    quoted + "'"
 }
 
 /// What an operation runs in.
@@ -79,6 +130,14 @@ pub struct OpEnv<'a> {
     bare_year_warned: AtomicBool,
     /// The same for the old-form group warning.
     old_form_groups_warned: AtomicBool,
+}
+
+/// What a command does at its destination: reading needs no more than naming
+/// it, writing into LabVIEW itself needs `--global`.
+#[derive(Clone, Copy, PartialEq)]
+enum Intent {
+    Read,
+    Write,
 }
 
 /// Where a command's packages live.
@@ -159,34 +218,93 @@ impl<'a> OpEnv<'a> {
             }
             (None, Some(p)) => Ok(Roots::scratch(p)),
             (None, None) => bail!(
-                "pick a destination: --labview-version <YYYY> for a real install, --prefix <DIR> for a \
-                 scratch tree, or run inside a project that has a venv (`lvpm venv create`)\n\
+                "pick a destination: --global [--labview-version <YYYY>] for LabVIEW itself, --prefix \
+                 <DIR> for a scratch tree, or run inside a project that has a venv (`lvpm venv create`)\n\
                  hint: `lvpm targets` lists detected LabVIEW installations"
             ),
         }
     }
 
-    /// Settle where a command's packages live, the way cargo settles which crate
-    /// you mean: `--prefix` and `--global` say so outright; otherwise a venv at or
-    /// above the current directory wins, and only when there is none does
-    /// `--labview-version` mean the installation itself.
+    /// The destination flag that decided the target, as typed: the one a named
+    /// install or uninstall in a project tells the user only picks where the
+    /// project syncs. A venv lookup that fails fails the command after it.
+    pub fn destination_flag(&self) -> Option<&'static str> {
+        self.picked().first().map(|(flag, _)| *flag)
+    }
+
+    /// Every destination flag that picked the target, with its value, as one
+    /// command-line fragment (`--prefix dest`): what a suggested command needs
+    /// to act on the same target, and the `--project` that picked the project.
+    pub fn destination_flags_as_typed(&self) -> Option<String> {
+        self.flags_as_typed(true)
+    }
+
+    /// [`Self::destination_flags_as_typed`] without `--project`: for a command
+    /// that cannot take it, as `--no-project` cannot.
+    pub fn target_flags_as_typed(&self) -> Option<String> {
+        self.flags_as_typed(false)
+    }
+
+    fn flags_as_typed(&self, with_project: bool) -> Option<String> {
+        let project = (self.flags.project.as_ref())
+            .filter(|_| with_project)
+            .map(|p| ("--project", Some(p.display().to_string())));
+        let typed: Vec<String> = (self.picked().into_iter().chain(project))
+            .map(|(flag, value)| match value {
+                Some(v) => format!("{flag} {}", shell_word(&v)),
+                None => flag.to_string(),
+            })
+            .collect();
+        (!typed.is_empty()).then(|| typed.join(" "))
+    }
+
+    fn picked(&self) -> Vec<(&'static str, Option<String>)> {
+        let venv_wins = self.find_venv().is_ok_and(|venv| venv.is_some());
+        self.flags.picked(venv_wins)
+    }
+
+    /// Settle where a command that writes packages puts them, the way cargo
+    /// settles which crate you mean: `--prefix` and `--global` say so outright;
+    /// otherwise a venv at or above the current directory wins, and only when
+    /// there is none does `--labview-version` mean the installation itself, and
+    /// then only on a headless machine: a container's LabVIEW *is* the sandbox
+    /// and nobody is there to type `--global`. Anywhere else it is refused,
+    /// because a write into an installation changes every project that uses it.
     ///
-    /// A manifest with no venv is refused — except on a headless machine, where
-    /// the refusal would protect a developer who is not there: a container's
-    /// LabVIEW *is* the sandbox, so `lvpm install` in the project means it.
+    /// A manifest with no venv is refused too, headless excepted for the same
+    /// reason: `lvpm install` in the project means the installation.
     pub fn destination(&self) -> Result<Destination> {
+        self.resolve(Intent::Write)
+    }
+
+    /// [`Self::destination`] for a command that only reads, which needs no
+    /// `--global`: `--labview-version` alone names the installation.
+    pub fn read_destination(&self) -> Result<Destination> {
+        self.resolve(Intent::Read)
+    }
+
+    fn resolve(&self, intent: Intent) -> Result<Destination> {
         let explicit = |r: Roots| match r.target.is_some() {
             true => Destination::Global(r),
             false => Destination::Scratch(r),
         };
         if self.flags.prefix.is_some() || self.flags.global {
-            return self.roots().map(explicit);
+            return self.flagged_roots().map(explicit);
         }
         if self.headless
             && self.flags.project.is_none()
             && let venv::Found::ManifestOnly(repo) = venv::probe(&self.cwd, &self.config.venv_dir)
         {
-            return self.headless_roots(&repo).map(Destination::Global);
+            let roots = self.manifest_roots(&repo)?;
+            self.sink.emit(Event::HeadlessInstallationChosen {
+                repo,
+                labview: roots
+                    .target
+                    .as_ref()
+                    .map(LvTarget::label)
+                    .unwrap_or_default(),
+            });
+            return Ok(Destination::Global(roots));
         }
         if let Some(v) = self.find_venv()? {
             self.sink.emit(Event::VenvSelected {
@@ -195,14 +313,81 @@ impl<'a> OpEnv<'a> {
             });
             return Ok(Destination::Venv(v));
         }
+        if intent == Intent::Write && self.flags.labview_version.is_some() && !self.headless {
+            return Err(self.needs_global());
+        }
         self.roots().map(explicit)
     }
 
-    /// The installation a headless `lvpm install` in a venv-less project means:
-    /// `--labview-version` if given, else the manifest's `labview` — the same
-    /// choice `lvpm venv create` makes, with the same rule that the manifest's
-    /// version is a minimum a newer LabVIEW may satisfy and an older one may not.
-    fn headless_roots(&self, repo: &Path) -> Result<Roots> {
+    /// What `--prefix`, `--global` and `--labview-version` say, with no venv
+    /// looked for unless `--global` is given alone: what a command with an
+    /// explicit destination settles on, and the roots `run-hooks` acts in.
+    pub fn flagged_roots(&self) -> Result<Roots> {
+        let flags = &self.flags;
+        ensure!(
+            !(flags.global && flags.prefix.is_some()),
+            "--global and --prefix are mutually exclusive"
+        );
+        match (flags.global, &flags.labview_version) {
+            (true, None) => self.global_roots(),
+            _ => self.roots(),
+        }
+    }
+
+    /// [`Self::flagged_roots`] for a command that writes into the installation
+    /// it finds with no venv (`run-hooks`): a real one needs `--global`,
+    /// headless excepted.
+    pub(super) fn write_roots(&self) -> Result<Roots> {
+        let roots = self.flagged_roots()?;
+        match roots.target.is_some() && !self.flags.global && !self.headless {
+            true => Err(self.needs_global()),
+            false => Ok(roots),
+        }
+    }
+
+    /// The refusal of a write into LabVIEW itself that `--labview-version`
+    /// alone asked for.
+    fn needs_global(&self) -> anyhow::Error {
+        let year = self.flags.labview_version.as_deref().unwrap_or("YYYY");
+        anyhow::anyhow!(
+            "--labview-version {year} alone does not write into LabVIEW {year} itself: that changes \
+             every project that uses it\n\
+             next: add --global, or --prefix <DIR> for a scratch tree"
+        )
+    }
+
+    /// The installation `--global` means when `--labview-version` does not
+    /// say: a project's own, from its manifest or its venv, else the only one
+    /// installed.
+    fn global_roots(&self) -> Result<Roots> {
+        if self.flags.project.is_none()
+            && let venv::Found::ManifestOnly(repo) = venv::probe(&self.cwd, &self.config.venv_dir)
+        {
+            return self.manifest_roots(&repo);
+        }
+        if let Some(v) = self.find_venv()? {
+            return Ok(self.labview_roots(&v.target));
+        }
+        match self.pickable()?.as_slice() {
+            [] => bail!("no LabVIEW installations detected"),
+            [only] => Ok(self.labview_roots(only)),
+            several => bail!(
+                "which LabVIEW? pass --labview-version <YYYY> (installed: {})\n\
+                 hint: `lvpm targets` lists what is installed",
+                several
+                    .iter()
+                    .map(LvTarget::label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    /// The installation a venv-less project means: `--labview-version` if
+    /// given, else the manifest's `labview` — the same choice `lvpm venv
+    /// create` makes, with the same rule that the manifest's version is a
+    /// minimum a newer LabVIEW may satisfy and an older one may not.
+    fn manifest_roots(&self, repo: &Path) -> Result<Roots> {
         let manifest_path = repo.join(project::FILE_NAME);
         let proj = project::read(&manifest_path)?;
         let min_lv = proj.labview.as_deref();
@@ -222,10 +407,6 @@ impl<'a> OpEnv<'a> {
         );
         let t = target::select_for_project(&self.pickable()?, requested, min_year)?
             .expect("checked above: a flag or a manifest year is set");
-        self.sink.emit(Event::HeadlessInstallationChosen {
-            repo: repo.to_path_buf(),
-            labview: t.label(),
-        });
         Ok(self.labview_roots(&t))
     }
 
@@ -425,7 +606,7 @@ impl<'a> OpEnv<'a> {
 
 /// The names the community indexes are asked for: every dependency of
 /// `project`, in any table, and `own`, the names the command was given
-/// (`lvpm add foo`).
+/// (`lvpm install foo`).
 pub(super) fn wanted_names(project: Option<&Project>, own: &[String]) -> Vec<String> {
     let listed = project.into_iter().flat_map(|p| p.tables());
     let listed = listed.flat_map(|(_, lines)| lines.iter().map(|(name, _)| name.clone()));
@@ -436,6 +617,163 @@ pub(super) fn wanted_names(project: Option<&Project>, own: &[String]) -> Vec<Str
 mod tests {
     use super::*;
     use crate::events::NullSink;
+
+    #[test]
+    fn the_destination_flags_that_picked_the_target_are_listed_with_their_values_in_the_order_that_decides()
+     {
+        let picked = |flags: &DestinationFlags, venv_wins| flags.picked(venv_wins);
+        let version = DestinationFlags {
+            labview_version: Some("2026".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&version, false),
+            [("--labview-version", Some("2026".to_string()))]
+        );
+        // A venv wins over --labview-version, so it picked nothing.
+        assert_eq!(picked(&version, true), []);
+        let prefix_and_version = DestinationFlags {
+            prefix: Some("dest".into()),
+            labview_version: Some("2026".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&prefix_and_version, true),
+            [("--prefix", Some("dest".to_string()))]
+        );
+        let global = DestinationFlags {
+            global: true,
+            ..Default::default()
+        };
+        assert_eq!(picked(&global, true), [("--global", None)]);
+        // --prefix picked the roots, whatever else was typed.
+        let prefix_and_global = DestinationFlags {
+            prefix: Some("dest".into()),
+            global: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&prefix_and_global, true),
+            [("--prefix", Some("dest".to_string())), ("--global", None)]
+        );
+        // With --global a venv does not win, so the version it names is the target.
+        let global_and_version = DestinationFlags {
+            global: true,
+            labview_version: Some("2026".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&global_and_version, true),
+            [
+                ("--labview-version", Some("2026".to_string())),
+                ("--global", None)
+            ]
+        );
+        // --labview-bitness narrowed the LabVIEW pick, so it goes with it.
+        let version_and_bitness = DestinationFlags {
+            labview_version: Some("2026".into()),
+            labview_bitness: Some(32),
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&version_and_bitness, false),
+            [
+                ("--labview-version", Some("2026".to_string())),
+                ("--labview-bitness", Some("32".to_string()))
+            ]
+        );
+        // With --prefix, or a venv that won, no LabVIEW was picked to narrow.
+        assert_eq!(picked(&version_and_bitness, true), []);
+        let prefix_and_bitness = DestinationFlags {
+            prefix: Some("dest".into()),
+            labview_bitness: Some(32),
+            ..Default::default()
+        };
+        assert_eq!(
+            picked(&prefix_and_bitness, false),
+            [("--prefix", Some("dest".to_string()))]
+        );
+        assert_eq!(picked(&DestinationFlags::default(), false), []);
+    }
+
+    #[test]
+    fn the_destination_flags_are_one_command_line_fragment_with_a_spaced_value_quoted() {
+        let mut env = OpEnv::new(&NullSink, config(), Vec::new(), PathBuf::from("."));
+        assert_eq!(env.destination_flag(), None);
+        assert_eq!(env.destination_flags_as_typed(), None);
+        env.flags.prefix = Some(PathBuf::from("dest"));
+        env.flags.global = true;
+        assert_eq!(env.destination_flag(), Some("--prefix"));
+        assert_eq!(
+            env.destination_flags_as_typed().as_deref(),
+            Some("--prefix dest --global")
+        );
+        env.flags.prefix = Some(PathBuf::from("my dest"));
+        assert_eq!(
+            env.destination_flags_as_typed().as_deref(),
+            Some("--prefix 'my dest' --global")
+        );
+        // --project picked the project, so a repeated command needs it too, but
+        // it is not the flag that picked the target.
+        env.flags.project = Some(PathBuf::from("my proj"));
+        assert_eq!(env.destination_flag(), Some("--prefix"));
+        assert_eq!(
+            env.destination_flags_as_typed().as_deref(),
+            Some("--prefix 'my dest' --global --project 'my proj'")
+        );
+        // The target alone, for a command that cannot take --project.
+        assert_eq!(
+            env.target_flags_as_typed().as_deref(),
+            Some("--prefix 'my dest' --global")
+        );
+    }
+
+    #[test]
+    fn a_word_a_shell_reads_is_quoted_literally_and_one_with_a_quote_is_double_quoted() {
+        for (word, said) in [
+            ("plain", "plain"),
+            (r"C:\dir/a-b_c.d+f", r"C:\dir/a-b_c.d+f"),
+            ("gamma@1.0", "gamma@1.0"),
+            ("a,b", "'a,b'"),
+            ("-x", "'-x'"),
+            ("@x", "'@x'"),
+            ("=x", "'=x'"),
+            (
+                "a\u{2019};calc;\u{2019}",
+                "'a\u{2019}\u{2019};calc;\u{2019}\u{2019}'",
+            ),
+            (
+                "\u{2018}\u{201A}\u{201B}",
+                "'\u{2018}\u{2018}\u{201A}\u{201A}\u{201B}\u{201B}'",
+            ),
+            ("gamma@*", "'gamma@*'"),
+            ("a b", "'a b'"),
+            ("a&b", "'a&b'"),
+            ("a;b", "'a;b'"),
+            ("a(b)", "'a(b)'"),
+            ("a>b", "'a>b'"),
+            ("a|b", "'a|b'"),
+            ("a$b", "'a$b'"),
+            ("x\"y", "'x\"y'"),
+            ("", "''"),
+            ("O'Brien", "'O''Brien'"),
+            (r#"it's "$HOME" `x`"#, r#"'it''s "$HOME" `x`'"#),
+            (r"x'\$(id)", r"'x''\$(id)'"),
+        ] {
+            assert_eq!(shell_word(word), said, "{word:?}");
+        }
+    }
+
+    #[test]
+    fn a_value_a_shell_reads_is_quoted_in_every_flag_a_hint_repeats() {
+        let mut env = OpEnv::new(&NullSink, config(), Vec::new(), PathBuf::from("."));
+        env.flags.prefix = Some(PathBuf::from("a&b"));
+        env.flags.project = Some(PathBuf::from("p;q"));
+        assert_eq!(
+            env.destination_flags_as_typed().as_deref(),
+            Some("--prefix 'a&b' --project 'p;q'")
+        );
+    }
 
     #[test]
     fn the_wanted_names_are_every_dependency_in_any_table_then_the_commands_own() {
@@ -527,6 +865,25 @@ mod tests {
     }
 
     #[test]
+    fn a_global_with_no_version_picks_the_only_installation_and_none_is_an_error() {
+        let mut env = OpEnv::new(
+            &NullSink,
+            config(),
+            vec![labview_2026()],
+            PathBuf::from("."),
+        );
+        env.flags.global = true;
+        let Ok(Destination::Global(roots)) = env.destination() else {
+            panic!("--global alone picks the one installation");
+        };
+        assert_eq!(roots.target.unwrap().path, labview_2026().path);
+
+        env.targets.clear();
+        let why = env.destination().unwrap_err().to_string();
+        assert_eq!(why, "no LabVIEW installations detected");
+    }
+
+    #[test]
     fn a_headless_install_reads_the_manifests_labview_the_way_locking_does() {
         for (labview, said) in [
             ("soon", Some("not a minimum LabVIEW year")),
@@ -542,7 +899,7 @@ mod tests {
             .unwrap();
             let mut env = OpEnv::new(&NullSink, config(), vec![labview_2026()], repo.clone());
             env.flags.labview_version = Some("2026".into());
-            match (env.headless_roots(&repo), said) {
+            match (env.manifest_roots(&repo), said) {
                 (Ok(_), None) => {}
                 (Err(why), Some(said)) => {
                     assert!(format!("{why:#}").contains(said), "{labview}: {why:#}")
@@ -619,12 +976,12 @@ mod tests {
         let installed = vec![labview(2025, 64), labview(2026, 32)];
         let mut env = OpEnv::new(&NullSink, config(), installed, repo.clone());
         env.flags.labview_bitness = Some(32);
-        let chosen = env.headless_roots(&repo).unwrap().target.unwrap();
+        let chosen = env.manifest_roots(&repo).unwrap().target.unwrap();
         assert_eq!(chosen.path, labview(2026, 32).path);
 
         // Without the flag the manifest's own year is the pick.
         env.flags.labview_bitness = None;
-        let chosen = env.headless_roots(&repo).unwrap().target.unwrap();
+        let chosen = env.manifest_roots(&repo).unwrap().target.unwrap();
         assert_eq!(chosen.path, labview(2025, 64).path);
         let _ = std::fs::remove_dir_all(&repo);
     }

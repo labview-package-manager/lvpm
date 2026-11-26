@@ -48,9 +48,9 @@ fn put_vi_fixture(world: &mut CliWorld, name: &str) {
 }
 
 /// `--no-relink`: the setup copies files only and never starts a LabVIEW.
-/// `--labview-version` keeps the install a plain one, which the venv still
-/// takes in, instead of an `add` that would write the project's manifest and
-/// lock; the venv wins over the installation it names.
+/// `--no-project` keeps the install a plain one, which the venv still takes
+/// in, instead of an `add` that would write the project's manifest and lock;
+/// the venv wins over the installation `--labview-version` names.
 #[given(expr = "a venv with {word} installed")]
 pub(super) async fn venv_with_package(world: &mut CliWorld, package: String) {
     venv_for_labview(world).await;
@@ -61,6 +61,7 @@ pub(super) async fn venv_with_package(world: &mut CliWorld, package: String) {
         "install",
         &package,
         "--no-relink",
+        "--no-project",
         "--labview-version",
         LABVIEW_YEAR,
     ]);

@@ -4,6 +4,7 @@
 // it from `lvpm-core` only.
 #![allow(clippy::disallowed_methods)]
 
+use lvpm_core::errors::EditError;
 use lvpm_core::events::{Event, EventSink};
 use lvpm_core::github::{GitHub, gh, gh_auth_token};
 use lvpm_core::manifest_edit::DependencyTable;
@@ -13,7 +14,7 @@ use lvpm_core::ops::install::InstallOptions;
 use lvpm_core::ops::lock::{Upgrade, UpgradeTarget};
 use lvpm_core::ops::publish::PublishTarget;
 use lvpm_core::ops::relink::RelinkOptions;
-use lvpm_core::ops::route::{self, InstallMode, InstallRequest};
+use lvpm_core::ops::route::{self, InstallMode, InstallRequest, UninstallMode, UninstallRequest};
 use lvpm_core::ops::sync::{LockFlags, SyncOptions, strictness};
 use lvpm_core::ops::{self, Destination, DestinationFlags, OpEnv};
 use lvpm_core::{config, git, launch, target, venv, viserver};
@@ -36,7 +37,7 @@ use std::sync::Arc;
     about = "Open-source package manager for LabVIEW packages (.lvpkg; reads .vip and .ogp) — proof of concept"
 )]
 struct Cli {
-    /// Install into this LabVIEW version, e.g. 2026. See `lvpm targets`.
+    /// Which LabVIEW version, e.g. 2026; a write into LabVIEW itself also needs --global. See `lvpm targets`.
     #[arg(long = "labview-version", global = true, value_name = "YYYY")]
     labview_version: Option<String>,
 
@@ -54,8 +55,7 @@ struct Cli {
     )]
     labview_bitness: Option<u8>,
 
-    /// Use the LabVIEW installation itself, even from inside a project that
-    /// has a venv.
+    /// Write into LabVIEW itself, even from a project with a venv; alone, it picks the project's LabVIEW, the venv's, or the only installation.
     #[arg(long, global = true, conflicts_with = "project")]
     global: bool,
 
@@ -146,6 +146,22 @@ struct ApplyArgs {
 }
 
 impl ApplyArgs {
+    /// The first of the flags that only matter to a project's sync, as typed.
+    // shortcut: `--relink-timeout` has a default, so a typed one reads as none, and the hidden `--no-relink` is accepted and ignored here as everywhere; refuse them when clap's value_source is carried here.
+    fn flag_given(&self) -> Option<&'static str> {
+        let typed = [
+            (self.dry_run, "--dry-run"),
+            (self.no_linkfix, "--no-linkfix"),
+            (self.force_relink, "--relink"),
+            (self.run_hooks, "--hooks"),
+            (self.relink.keep_open, "--keep-open"),
+            (self.relink.progress.is_some(), "--relink-progress"),
+        ];
+        typed
+            .into_iter()
+            .find_map(|(given, name)| given.then_some(name))
+    }
+
     fn options(&self, no_deps: bool, allow_downgrade: bool) -> InstallOptions {
         InstallOptions {
             dry_run: self.dry_run,
@@ -263,19 +279,36 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Install a package by name, or name@version. In a project, a bare
-    /// install is `lvpm sync` and a named install is `lvpm add`, unless
-    /// --global, --prefix or --labview-version say where it goes.
+    /// Install a package by name, or name@version; `add` is the same command.
+    /// In a project a bare install is `lvpm sync` and a named install adds the package to lvpm.toml, locks and syncs; --no-project installs it alone.
+    #[command(visible_alias = "add", mut_arg("group", |arg| arg.help(
+        "With a package: save it in [dependency-groups.NAME]. Without: also install this group (repeatable)"
+    )))]
     Install {
         /// Package to install. Omit it in a project to sync the project.
-        #[arg(conflicts_with_all = ["locked", "frozen", "no_locked", "no_dev", "group"])]
+        #[arg(conflicts_with_all = ["locked", "frozen", "no_locked", "no_dev"])]
         package: Option<String>,
         /// Not supported with a lock: lvpm.lock always holds the full set.
-        #[arg(long, value_name = "FILE", conflicts_with = "package")]
+        #[arg(long, value_name = "FILE")]
         manifest: Option<PathBuf>,
         /// Do not install dependencies.
         #[arg(long)]
         no_deps: bool,
+        /// Install the package alone, as outside a project: lvpm.toml and
+        /// lvpm.lock are left as they are.
+        #[arg(long, requires = "package", conflicts_with = "project")]
+        no_project: bool,
+        /// Save the package in [dev-dependencies].
+        #[arg(long, requires = "package", conflicts_with_all = ["no_dev", "group", "no_project"])]
+        dev: bool,
+        /// Take the package only from this [sources] name; writes index = "<NAME>".
+        #[arg(
+            long = "index",
+            value_name = "NAME",
+            requires = "package",
+            conflicts_with = "no_project"
+        )]
+        source_pin: Option<String>,
         /// Replace an installed package with an older version. Without this,
         /// resolving to something older than what is installed is refused.
         #[arg(long)]
@@ -295,42 +328,6 @@ enum Cmd {
         apply: ApplyArgs,
         #[command(flatten)]
         sync: SyncArgs,
-    },
-    /// Add a package to lvpm.toml, lock the project and sync the destination.
-    ///
-    /// With no constraint it writes `>=` the version it locked. Quote a
-    /// constraint, or the shell reads its `>` as a redirect: "gamma@>=0.5".
-    /// Nothing is written unless the lock and the sync both work.
-    Add {
-        /// The package, or package@constraint, e.g. "gamma@>=0.5".
-        package: String,
-        /// Add it to [dev-dependencies].
-        #[arg(long)]
-        dev: bool,
-        /// Add it to [dependency-groups.<NAME>], which is made if it is new.
-        #[arg(long, value_name = "NAME", conflicts_with = "dev")]
-        group: Option<String>,
-        /// Take this package only from this [sources] name; writes index = "<NAME>".
-        #[arg(long = "index", value_name = "NAME")]
-        source_pin: Option<String>,
-        #[command(flatten)]
-        apply: ApplyArgs,
-    },
-    /// Remove a package from lvpm.toml, lock the project and sync the
-    /// destination. A package that another one still requires stays.
-    ///
-    /// Nothing is written unless the lock and the sync both work.
-    Remove {
-        /// The package to take out of lvpm.toml.
-        package: String,
-        /// It is in [dev-dependencies].
-        #[arg(long)]
-        dev: bool,
-        /// It is in [dependency-groups.<NAME>].
-        #[arg(long, value_name = "NAME", conflicts_with = "dev")]
-        group: Option<String>,
-        #[command(flatten)]
-        apply: ApplyArgs,
     },
     /// Relink an already-installed package, without reinstalling it.
     ///
@@ -375,23 +372,41 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         timeout: u64,
     },
-    /// Remove a previously installed package.
+    /// Remove a package; `remove` is the same command.
+    /// In a project a named uninstall takes the package out of lvpm.toml, locks and syncs; --no-project and --all leave the project's files alone.
+    #[command(visible_alias = "remove")]
     Uninstall {
         /// Package to remove. Omit when using --all.
         package: Option<String>,
         /// Remove every package installed in this target.
         #[arg(long, conflicts_with = "package")]
         all: bool,
+        /// Uninstall the package alone, as outside a project: lvpm.toml and
+        /// lvpm.lock are left as they are.
+        #[arg(long, requires = "package", conflicts_with = "project")]
+        no_project: bool,
         /// Remove dependencies nothing else needs too, without prompting.
         #[arg(long, conflicts_with_all = ["all", "keep_deps"])]
         with_deps: bool,
-        /// Keep dependencies, without prompting.
+        /// Keep dependencies, without prompting. In a project it is refused and
+        /// needs --no-project: lvpm.lock decides what stays.
         #[arg(long, conflicts_with_all = ["all", "with_deps"])]
         keep_deps: bool,
         /// Remove the package even though other installed packages require
-        /// it, leaving them without it. Without this, that is refused.
+        /// it, leaving them without it. Without this, that is refused. In a
+        /// project it is refused too and needs --no-project: lvpm.lock decides
+        /// what stays.
         #[arg(long, conflicts_with = "all")]
         force: bool,
+        /// It is in [dev-dependencies]. Only an uninstall in a project takes it.
+        #[arg(long, conflicts_with = "all")]
+        dev: bool,
+        /// It is in [dependency-groups.<NAME>]. Only an uninstall in a project
+        /// takes it.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["all", "dev"])]
+        group: Option<String>,
+        #[command(flatten)]
+        apply: ApplyArgs,
     },
     /// Invoke parameterless Application-class methods by raw id, and report
     /// what LabVIEW says. Re-establishes method ids on a new LabVIEW: 1036
@@ -1028,6 +1043,9 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
             package,
             manifest,
             no_deps,
+            no_project,
+            dev,
+            source_pin,
             allow_downgrade,
             apply,
             sync,
@@ -1036,6 +1054,9 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 package: package.as_deref(),
                 manifest: manifest.as_deref(),
                 no_deps: *no_deps,
+                allow_downgrade: *allow_downgrade,
+                no_project: *no_project,
+                saving_flags: &saving_flags(*dev, &sync.group, source_pin.as_deref()),
             };
             let mode = route::install_mode(&env, &request)
                 .map_err(|why| anyhow!(render::sync::route_error(&why)))?;
@@ -1043,10 +1064,8 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
                 (InstallMode::Sync, _) => cmd_sync(&env, &sync.options(apply, env.headless)),
                 // A named install in a project is an add, and always names one.
                 (InstallMode::Add, Some(spec)) => {
-                    env.sink.emit(Event::InstallAddsToProject {
-                        package: spec.to_string(),
-                    });
-                    cmd_add(&env, spec, DependencyTable::Dependencies, None, apply)
+                    let table = saved_into(*dev, &sync.group)?;
+                    cmd_install_adds(&env, spec, table, source_pin.as_deref(), apply)
                 }
                 (InstallMode::Add | InstallMode::Additive, package) => {
                     ops::install::install(&env, package, &apply.options(*no_deps, *allow_downgrade))
@@ -1054,32 +1073,6 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
             }
             .map(|()| Report::done("install"))
         }
-        Cmd::Add {
-            package,
-            dev,
-            group,
-            source_pin,
-            apply,
-        } => cmd_add(
-            &env,
-            package,
-            dependency_table(*dev, group.as_deref())?,
-            source_pin.as_deref(),
-            apply,
-        )
-        .map(|()| Report::done("add")),
-        Cmd::Remove {
-            package,
-            dev,
-            group,
-            apply,
-        } => cmd_remove(
-            &env,
-            package,
-            dependency_table(*dev, group.as_deref())?,
-            apply,
-        )
-        .map(|()| Report::done("remove")),
         Cmd::Sync { apply, sync } => {
             cmd_sync(&env, &sync.options(apply, env.headless)).map(|()| Report::done("sync"))
         }
@@ -1128,35 +1121,32 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
         Cmd::Uninstall {
             package,
             all,
+            no_project,
             with_deps,
             keep_deps,
             force,
+            dev,
+            group,
+            apply,
         } => {
-            use ops::uninstall::Dependencies;
-            let ask = |names: &[String]| {
-                use std::io::IsTerminal;
-                // Under --json stdin is no place for an answer.
-                ensure!(
-                    !cli.json,
-                    "dependencies can be removed: {}. Pass --with-deps, --keep-deps or --yes under --json",
-                    names.join(", ")
-                );
-                let stdin = std::io::stdin();
-                confirm_dependencies(
-                    names,
-                    stdin.is_terminal(),
-                    &mut stdin.lock(),
-                    &mut std::io::stderr(),
-                )
+            let request = UninstallRequest {
+                package: package.as_deref(),
+                all: *all,
+                no_project: *no_project,
+                keep_deps: *keep_deps,
+                force: *force,
+                table_flag: table_flag(*dev, group.as_deref()),
+                apply_flag: apply.flag_given(),
             };
-            let deps = match (with_deps, keep_deps) {
-                (true, _) => Dependencies::Remove,
-                (_, true) => Dependencies::Keep,
-                _ if cli.yes => Dependencies::Remove,
-                _ => Dependencies::Ask(&ask),
-            };
-            ops::uninstall::uninstall(&env, package.as_deref(), *all, deps, *force)
-                .map(|()| Report::done("uninstall"))
+            let mode = route::uninstall_mode(&env, &request)
+                .map_err(|why| anyhow!(render::sync::route_error(&why)))?;
+            match (mode, package.as_deref()) {
+                (UninstallMode::Project, Some(name)) => {
+                    cmd_uninstall_project(&env, name, *dev, group.as_deref(), apply)
+                }
+                _ => cmd_uninstall(&env, cli, &request, *with_deps),
+            }
+            .map(|()| Report::done("uninstall"))
         }
         Cmd::AppProbe { ids } => cmd_app_probe(&env, ids).map(|()| Report::done("app-probe")),
         Cmd::ViProbe { vi, timeout } => {
@@ -1326,26 +1316,144 @@ fn dependency_table(dev: bool, group: Option<&str>) -> Result<DependencyTable> {
     Ok(table)
 }
 
-fn cmd_add(
+/// The table a named install saves into: `--dev`, or the one `--group`, else
+/// `[dependencies]`.
+fn saved_into(dev: bool, groups: &[String]) -> Result<DependencyTable> {
+    ensure!(groups.len() <= 1, "a package goes into one group");
+    dependency_table(dev, groups.first().map(String::as_str))
+}
+
+/// Each flag, as typed, that says where a named install saves the package.
+fn saving_flags(dev: bool, groups: &[String], index: Option<&str>) -> Vec<&'static str> {
+    [
+        (dev, "--dev"),
+        (!groups.is_empty(), "--group"),
+        (index.is_some(), "--index"),
+    ]
+    .into_iter()
+    .filter_map(|(given, flag)| given.then_some(flag))
+    .collect()
+}
+
+/// `--dev` or `--group`, as typed: the table a project uninstall takes a
+/// package out of.
+fn table_flag(dev: bool, group: Option<&str>) -> Option<&'static str> {
+    match (dev, group) {
+        (true, _) => Some("--dev"),
+        (_, Some(_)) => Some("--group"),
+        _ => None,
+    }
+}
+
+/// A named `uninstall` in a project takes the package out of the project's
+/// `lvpm.toml`, and says so once it is known to be listed in the table.
+fn cmd_uninstall_project(
+    env: &OpEnv,
+    package: &str,
+    dev: bool,
+    group: Option<&str>,
+    apply: &ApplyArgs,
+) -> Result<()> {
+    let table = dependency_table(dev, group)?;
+    let announce = Event::UninstallRemovesFromProject {
+        package: package.to_string(),
+        destination: env.destination_flag().map(str::to_string),
+        dry_run: apply.dry_run,
+    };
+    let options = apply.options(false, false);
+    ops::add_remove::remove_announcing(env, package, table.clone(), &options, announce)
+        .map_err(|why| edit_error(env, &why, "uninstall", package, &table, None))
+}
+
+/// `uninstall` that leaves the project alone: the named package, or `--all`, out
+/// of the destination.
+fn cmd_uninstall(
+    env: &OpEnv,
+    cli: &Cli,
+    request: &UninstallRequest,
+    with_deps: bool,
+) -> Result<()> {
+    use ops::uninstall::Dependencies;
+    let ask = |names: &[String]| {
+        use std::io::IsTerminal;
+        // Under --json stdin is no place for an answer.
+        ensure!(
+            !cli.json,
+            "dependencies can be removed: {}. Pass --with-deps, --keep-deps or --yes under --json",
+            names.join(", ")
+        );
+        let stdin = std::io::stdin();
+        confirm_dependencies(
+            names,
+            stdin.is_terminal(),
+            &mut stdin.lock(),
+            &mut std::io::stderr(),
+        )
+    };
+    let deps = match (with_deps, request.keep_deps) {
+        (true, _) => Dependencies::Remove,
+        (_, true) => Dependencies::Keep,
+        _ if cli.yes => Dependencies::Remove,
+        _ => Dependencies::Ask(&ask),
+    };
+    ops::uninstall::uninstall(env, request.package, request.all, deps, request.force).map_err(
+        |why| match why.downcast::<EditError>() {
+            Ok(required) => anyhow!(render::edit::direct_error(
+                &required,
+                env.destination_flags_as_typed().as_deref(),
+                request.no_project
+            )),
+            Err(other) => other,
+        },
+    )
+}
+
+/// A named `install` in a project: an add, which says so once the lock is made.
+fn cmd_install_adds(
     env: &OpEnv,
     package: &str,
     table: DependencyTable,
     source_pin: Option<&str>,
     apply: &ApplyArgs,
 ) -> Result<()> {
-    ops::add_remove::add(
-        env,
-        package,
-        table,
-        source_pin,
-        &apply.options(false, false),
-    )
-    .map_err(|why| anyhow!(render::edit::error(&why, "`lvpm add`")))
+    let announce = Event::InstallAddsToProject {
+        package: package.to_string(),
+        destination: env.destination_flag().map(str::to_string),
+        dry_run: apply.dry_run,
+    };
+    let options = apply.options(false, false);
+    ops::add_remove::add_announcing(env, package, table.clone(), source_pin, &options, announce)
+        .map_err(|why| edit_error(env, &why, "install", package, &table, source_pin))
 }
 
-fn cmd_remove(env: &OpEnv, package: &str, table: DependencyTable, apply: &ApplyArgs) -> Result<()> {
-    ops::add_remove::remove(env, package, table, &apply.options(false, false))
-        .map_err(|why| anyhow!(render::edit::error(&why, "`lvpm remove`")))
+/// What a project `install` or `uninstall` of `package` that failed prints: its
+/// next step is the command as typed (the table, the source pin and the
+/// destination flags it was given), so it acts on the same package and target.
+fn edit_error(
+    env: &OpEnv,
+    why: &EditError,
+    verb: &str,
+    package: &str,
+    table: &DependencyTable,
+    index: Option<&str>,
+) -> anyhow::Error {
+    let project = env
+        .flags
+        .project
+        .as_ref()
+        .map(|dir| dir.display().to_string());
+    anyhow!(render::edit::error(
+        why,
+        &render::edit::Typed {
+            verb,
+            package,
+            table,
+            index,
+            destination: env.destination_flags_as_typed().as_deref(),
+            target: env.target_flags_as_typed().as_deref(),
+            project: project.as_deref(),
+        },
+    ))
 }
 
 /// A refused build is a result, not an error: its stdout and `--json` are
@@ -1511,7 +1619,7 @@ fn confirm_removal(v: &venv::Venv) -> Result<bool> {
 /// method that wants arguments answers with a complaint about those instead,
 /// and that too proves the id resolved.
 fn cmd_app_probe(env: &OpEnv, ids: &[String]) -> Result<()> {
-    let roots = env.roots()?;
+    let roots = env.flagged_roots()?;
     let Some(t) = roots.target.clone() else {
         bail!("app-probe needs a real LabVIEW target, not --prefix");
     };
@@ -1557,7 +1665,7 @@ fn cmd_app_probe(env: &OpEnv, ids: &[String]) -> Result<()> {
 /// venv is in effect (started if none is running — and left running, it is the
 /// user's to close), else the target's. Returns a label and the port.
 fn vi_server_for(env: &OpEnv, what: &str) -> Result<(String, u16)> {
-    match env.destination()? {
+    match env.read_destination()? {
         Destination::Venv(v) => {
             let inst = launch::ensure_instance(
                 &v,
@@ -1876,6 +1984,88 @@ fn cmd_vi_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relink_flag_on_a_direct_uninstall_is_refused_like_the_other_sync_flags() {
+        let given = |flags: &[&str]| {
+            let args = ["lvpm", "uninstall", "alpha"]
+                .into_iter()
+                .chain(flags.iter().copied());
+            match Cli::try_parse_from(args).unwrap().cmd {
+                Cmd::Uninstall { apply, .. } => apply.flag_given(),
+                _ => unreachable!("an uninstall"),
+            }
+        };
+        assert_eq!(given(&[]), None);
+        assert_eq!(given(&["--relink"]), Some("--relink"));
+        assert_eq!(given(&["--hooks"]), Some("--hooks"));
+        assert_eq!(given(&["--hooks", "--keep-open"]), Some("--hooks"));
+        assert_eq!(given(&["--keep-open"]), Some("--keep-open"));
+        assert_eq!(
+            given(&["--relink-progress", "bar"]),
+            Some("--relink-progress")
+        );
+        assert_eq!(given(&["--dry-run", "--keep-open"]), Some("--dry-run"));
+        // Not told apart from its default, and hidden: the plan records both.
+        assert_eq!(given(&["--relink-timeout", "5"]), None);
+        assert_eq!(given(&["--no-relink"]), None);
+    }
+
+    #[test]
+    fn every_saving_flag_given_is_named_in_the_order_dev_group_index() {
+        let given = |flags: &[&str]| {
+            let args = ["lvpm", "install", "caraya"]
+                .into_iter()
+                .chain(flags.iter().copied());
+            match Cli::try_parse_from(args).unwrap().cmd {
+                Cmd::Install {
+                    dev,
+                    source_pin,
+                    sync,
+                    ..
+                } => saving_flags(dev, &sync.group, source_pin.as_deref()),
+                _ => unreachable!("an install"),
+            }
+        };
+        assert!(given(&[]).is_empty());
+        assert_eq!(given(&["--dev"]), ["--dev"]);
+        assert_eq!(given(&["--group", "ci"]), ["--group"]);
+        assert_eq!(given(&["--index", "second"]), ["--index"]);
+        assert_eq!(given(&["--dev", "--index", "second"]), ["--dev", "--index"]);
+        assert_eq!(
+            given(&["--index", "second", "--group", "ci"]),
+            ["--group", "--index"]
+        );
+    }
+
+    #[test]
+    fn a_named_install_saves_into_dev_the_one_group_or_dependencies() {
+        let groups = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            saved_into(false, &groups(&[])).unwrap(),
+            DependencyTable::Dependencies
+        );
+        assert_eq!(
+            saved_into(true, &groups(&[])).unwrap(),
+            DependencyTable::DevDependencies
+        );
+        assert_eq!(
+            saved_into(false, &groups(&["ci"])).unwrap(),
+            DependencyTable::Group("ci".into())
+        );
+        // `--group dev` is `--dev`, as for `add`.
+        assert_eq!(
+            saved_into(false, &groups(&["dev"])).unwrap(),
+            DependencyTable::DevDependencies
+        );
+        let two = saved_into(false, &groups(&["ci", "test"])).unwrap_err();
+        assert_eq!(two.to_string(), "a package goes into one group");
+    }
 
     #[test]
     fn lvpm_tui_refuses_every_global_option() {

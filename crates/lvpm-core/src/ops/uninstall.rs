@@ -8,6 +8,7 @@ use super::env::{Destination, OpEnv};
 use super::hooks::{HOOK_TIMEOUT_SECS, HookCall, hook_action_info};
 use super::install::{Applied, InstallOptions, finish};
 use super::session::InstallSession;
+use crate::errors::EditError;
 use crate::events::{Event, HookKind, KeptBecause, UnrunReason};
 use crate::project::same_name;
 use crate::{dependency, install, project};
@@ -131,8 +132,12 @@ fn say_if_still_listed(env: &OpEnv, bound: Option<&Path>, package: &str) {
     });
     if let Some((name, table)) = found {
         let (dev, group) = table.flags();
-        env.sink
-            .emit(Event::UninstalledStillListed { name, dev, group });
+        env.sink.emit(Event::UninstalledStillListed {
+            name,
+            dev,
+            group,
+            destination: env.destination_flags_as_typed(),
+        });
     }
 }
 
@@ -219,16 +224,25 @@ fn with_dependencies(
     }
     if !plan.dependents.is_empty() {
         // Removing what another installed package needs leaves that one
-        // broken: refused before anything is touched, unless --force.
-        ensure!(
-            force,
-            "{} is required by installed packages: {}\n\
-             hint: uninstall {} first, or pass --force to remove {} anyway",
-            plan.root,
-            plan.dependents.join(", "),
-            plan.dependents.join(", "),
-            plan.root
-        );
+        // broken: refused before anything is touched, unless --force. The
+        // front end words it, as it does for a project's.
+        if !force {
+            let dependents_of = |name: &str| {
+                (installed.iter())
+                    .filter(|p| p.dependencies.iter().any(|d| same_name(d, name)))
+                    .map(|p| p.name.clone())
+                    .collect()
+            };
+            return Err(EditError::Required {
+                roots: dependency::roots_above(&plan.root, dependents_of, |_| false)
+                    .into_iter()
+                    .map(|root| (root, Vec::new()))
+                    .collect(),
+                name: plan.root,
+                required_by: plan.dependents,
+            }
+            .into());
+        }
         env.sink.emit(Event::UninstallRequiredBy {
             package: plan.root.clone(),
             dependents: plan.dependents.clone(),
@@ -478,13 +492,14 @@ mod tests {
             Dependencies::Keep,
             false,
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        // Typed, so that the front end words it as a project's refusal is.
         assert!(
-            why.contains("required by installed packages: beta"),
-            "{why}"
+            matches!(why.downcast_ref::<EditError>(), Some(EditError::Required { name, required_by, roots })
+                if name == "alpha" && required_by == &["beta"]
+                    && roots.iter().map(|(root, tables)| (root.as_str(), tables.len())).eq([("beta", 0)])),
+            "{why:?}"
         );
-        assert!(why.contains("--force"), "{why}");
         assert!(file.exists(), "nothing was touched");
         uninstall(
             &env_for(&sink, &dir),
@@ -560,6 +575,12 @@ mod tests {
                     name: "alpha".into(),
                     dev,
                     group,
+                    // The command that removes it for good acts on the same target.
+                    // Quoted as the hint quotes it: a CI temp dir like RUNNER~1 has a `~`.
+                    destination: Some(format!(
+                        "--prefix {}",
+                        super::super::env::shell_word(&dir.display().to_string())
+                    )),
                 }),
                 "{table}: {events:?}"
             );
@@ -717,6 +738,7 @@ mod tests {
         let sink = Recorded::default();
         let mut env = env_on(&sink, &dir);
         fake.place(&mut env);
+        env.flags.global = true;
         env.flags.labview_version = Some("2099".into());
         let why = uninstall(&env, Some("alpha"), false, Dependencies::Keep, false).unwrap_err();
 
@@ -967,6 +989,27 @@ mod tests {
             absent.starts_with("beta is not installed in this target"),
             "{absent}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_uninstall_at_a_labview_version_alone_is_refused_and_changes_nothing() {
+        use crate::ops::testing::{FakeInstallation, Recorded, env_on, scratch_dir, snapshot};
+        let dir = scratch_dir("uninstall-needs-global");
+        let fake = FakeInstallation::new(&dir);
+        fake.with_package("alpha");
+        let before = snapshot(&dir);
+
+        let sink = Recorded::default();
+        let mut env = env_on(&sink, &dir);
+        fake.place(&mut env);
+        env.flags.labview_version = Some("2099".into());
+        let why = format!(
+            "{:#}",
+            uninstall(&env, Some("alpha"), false, Dependencies::Keep, false).unwrap_err()
+        );
+        assert!(why.contains("alone does not write"), "{why}");
+        assert_eq!(snapshot(&dir), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

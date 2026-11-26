@@ -81,7 +81,7 @@ async fn locked_project_with_hooks(
         &constraint,
         &hooks_key(&hooks),
     );
-    // `lvpm add` installs into a destination: the scratch folder `dest`.
+    // `lvpm install` installs into a destination: the scratch folder `dest`.
     world.sandbox.make_empty_dest();
     world.lock_the_project();
 }
@@ -216,7 +216,7 @@ async fn hook_fixture_installed_skipped(world: &mut CliWorld) {
     hook_fixture_not_installed(world).await;
     world
         .sandbox
-        .setup_lvpm(&["install", FIXTURE_NAME, "--global"]);
+        .setup_lvpm(&["install", FIXTURE_NAME, "--no-project", "--global"]);
     assert_eq!(world.sandbox.hook_marker(), None, "the hook ran on install");
 }
 

@@ -51,7 +51,7 @@
 //! ```
 
 use crate::manifest_edit::DependencyTable;
-use crate::project::{Constraint, Project, name_key};
+use crate::project::{Constraint, Project, name_key, same_name};
 use crate::solve::range_of;
 use crate::verify::Policy;
 use crate::version::Version;
@@ -407,6 +407,23 @@ impl Lockfile {
 }
 
 impl Lockfile {
+    /// The locked packages that require `name`, in the lock's order.
+    pub fn dependents_of(&self, name: &str) -> Vec<String> {
+        let mut dependents: Vec<String> = (self.packages.iter())
+            .filter(|package| {
+                !same_name(&package.name, name)
+                    && package
+                        .requires
+                        .iter()
+                        .any(|required| same_name(required, name))
+            })
+            .map(|package| package.name.clone())
+            .collect();
+        dependents.sort_by_cached_key(|dependent| name_key(dependent));
+        dependents.dedup();
+        dependents
+    }
+
     /// The same lock with everything in its one canonical order, which is the
     /// order the file is written in.
     fn sorted(&self) -> Lockfile {
@@ -492,6 +509,17 @@ mod tests {
                 required_by: "beta".to_string(),
             }],
         }
+    }
+
+    #[test]
+    fn the_dependents_of_a_package_are_the_locked_packages_that_require_it() {
+        let mut lock = lock();
+        let mut aardvark = package("Aardvark", "1.0");
+        aardvark.requires = vec!["alpha".to_string(), "ALPHA".to_string()];
+        lock.packages.push(aardvark);
+        assert_eq!(lock.dependents_of("Alpha"), ["Aardvark", "beta"]);
+        assert_eq!(lock.dependents_of("beta"), Vec::<String>::new());
+        assert_eq!(lock.dependents_of("zeta"), Vec::<String>::new());
     }
 
     #[test]
