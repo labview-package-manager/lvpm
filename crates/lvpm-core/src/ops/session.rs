@@ -165,7 +165,7 @@ pub struct InstallSession {
     /// PostInstall hooks extracted so far, executed only after the relink
     /// pass has made them runnable.
     pub(super) post_install_hooks: Vec<PostInstallHook>,
-    /// The LabVIEW a venv install resaves its staged packages in.
+    /// The LabVIEW a venv install with `--resave` resaves its staged packages in.
     pub(super) resaver: Resaver,
 }
 

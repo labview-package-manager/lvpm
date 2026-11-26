@@ -59,13 +59,15 @@ are refused, naming `--no-project`);
 linkfix runs over the LabVIEW files the install wrote and `--no-linkfix`
 skips it ([Linkfix](#linkfix)); `--relink` runs LabVIEW's load-and-save relink
 pass instead of linkfix (the hidden `--no-relink` is accepted and ignored);
+`--resave` resaves each package in the venv's LabVIEW before it lands
+([The resave](#the-resave));
 `--hooks` runs the install
 hooks of every package for this command, where they are off by default
 (see [Install hooks](#install-hooks); a headless LabVIEW runs none without
 it). `--relink-timeout <SECS>`
 (default 900) bounds one folder's relink; `--keep-open` leaves the LabVIEW
 started for a venv relink running. `sync`, a project `install <name>` and a
-project `uninstall` take `--dry-run` and the relink and hook flags as well.
+project `uninstall` take `--dry-run` and the relink, resave and hook flags as well.
 
 lvpm 0.3 had three `install` flags that are gone or refused
 ([labview-package-manager/lvpm#47](https://github.com/labview-package-manager/lvpm/issues/47)):
@@ -809,7 +811,7 @@ the venv started another way than `lvpm launch` gets none of this.
 ### Linkfix
 
 `install` and `sync` run linkfix after the files are copied and
-before the PostInstall hooks. It edits only the LabVIEW files that install
+before the PostInstall hooks, into a venv too. It edits only the LabVIEW files that install
 wrote into the LabVIEW tree, and needs no LabVIEW:
 
 - it repairs owner paths, relative paths, build-machine absolute paths and
@@ -838,6 +840,39 @@ Call Library node whose library VI Package Builder pinned to one bitness
 a venv knows and a `--tree` takes as `--bitness <32|64>`. See [linkfix](linkfix.md) for what each
 method changes.
 
+### The load check
+
+Linkfix marks each VI source-only: it sets the flag and drops the compiled
+code it carried. On some VIs saved in an older LabVIEW, the venv's LabVIEW
+then loads that VI broken, though the same file loads fine before linkfix
+and fine when it is resaved first. This is
+[issue #77](https://github.com/labview-package-manager/lvpm/issues/77), not
+yet fixed. It was seen with `ni_lib_rt_management` (LabVIEW 13.0 files) in a
+venv of 20 packages. The same package alone in a fresh venv loads clean, so
+the trigger also depends on what else is installed.
+
+So after linkfix, a venv install opens the VIs linkfix made source-only, once,
+in a LabVIEW it starts fresh on the venv. It reads whether each VI can run,
+closes it, and saves nothing. A package with broken VIs gets one warning:
+
+```console
+load check: opening the 101 VIs linkfix made source-only in the venv's LabVIEW (nothing is saved)
+warning: 26 of ni_lib_rt_management's 101 source-only VIs are broken in the venv's LabVIEW (first: Delete directory.vi). Reinstall it with a resave: `lvpm uninstall ni_lib_rt_management`, then `lvpm install ni_lib_rt_management --resave`. If they are still broken after that, the package itself is broken. See https://github.com/labview-package-manager/lvpm/issues/77.
+load check: 101 VIs, 1 package(s) with broken VIs (see the warnings)
+```
+
+- It runs only for a venv install that linkfix changed VIs in. `--no-linkfix`,
+  `--relink`, `--dry-run`, `--global` and `--prefix` installs have no check.
+- It costs one LabVIEW start per run, headless where LabVIEW runs headless.
+- The warning does not fail the install: the exit code stays 0.
+- A broken VI that a resave does not fix is broken in the package itself, for
+  example a missing add-on it needs. lvpm cannot fix that.
+- If LabVIEW does not start, or the check stops part way, a warning says the
+  check did not finish. That is not a clean result.
+- Scripts read the results from `--json`: `load_check_broken` per package,
+  `load_check_done` with the totals, `load_check_incomplete` when it did not
+  finish.
+
 ### Uninstalling
 
 This is the direct uninstall, which outside a project is `lvpm uninstall <name>`
@@ -865,10 +900,14 @@ reinstalled, and `--keep-deps` still works.
 
 ### The resave
 
-A venv install opens and saves each package's VIs in the venv's LabVIEW
-before the package reaches `.lv-venv`. A VI saved in an older LabVIEW can
-otherwise load broken from an add-on folder. The package is unpacked into
-`.lv-venv.staging/` beside the venv, resaved there, then moved into place.
+With `--resave`, a venv install opens and saves each package's VIs in the
+venv's LabVIEW before the package reaches `.lv-venv`. Without it, the default,
+linkfix alone prepares the files and no LabVIEW starts. Ask for the resave when
+a VI saved in an older LabVIEW loads broken from an add-on folder after
+linkfix. Every venv install unpacks each package into `.lv-venv.staging/`
+beside the venv and then moves it into place; with `--resave` the package is
+resaved there first. Linkfix still runs afterwards, unless `--relink` replaces
+it.
 
 ```console
 starting the venv's LabVIEW for the resave (about a minute per package)
@@ -879,10 +918,10 @@ resave (2/2) oglib_string ... already saved in LabVIEW 2026, skipped
 - It costs one LabVIEW start per run and about 40 to 85 seconds per package,
   mostly the cold load of its VIs. A package whose VIs are all saved in the
   venv's LabVIEW version already is skipped, and starts no LabVIEW.
-- The relink pass is off unless `--relink` is given. The resave still
-  runs, and the relink line says so. `--dry-run` lists the packages with
-  VIs it may resave, including ones the version check will skip, and starts
-  no LabVIEW.
+- `--resave` and `--relink` are separate: the relink pass runs only with
+  `--relink` or for packages marked `relink = true`. `--dry-run --resave` lists the packages with VIs it
+  may resave, including ones the version check will skip, and starts no
+  LabVIEW. `sync`, `add` and `remove` take `--resave` too; the TUI never resaves.
 - A failed resave is a warning, not an error: the package is still
   installed and the exit code stays 0. The warning names the package and its
   folder. Reinstall the package; if it fails again, run `lvpm launch` and
@@ -891,8 +930,8 @@ resave (2/2) oglib_string ... already saved in LabVIEW 2026, skipped
   packages installed without a resave.
 - Scripts read the failures from `--json`: the install summary carries a
   `resave_failed` list, present only when a package failed.
-- A venv installed before this release has packages that were never
-  resaved. Delete `.lv-venv` and run `lvpm sync` to reinstall them.
+- To resave a venv installed without it, delete `.lv-venv` and run
+  `lvpm sync --resave`.
 
 ## Building a package
 

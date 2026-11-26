@@ -51,10 +51,13 @@ except with `--relink` or for a package marked `relink = true`):
 | palettes and menus                 | rebuilt after the install                                                           | not rebuilt: no one sees a palette                                                                                                   | `lvpm refresh`                   |
 | `lvpm sync` or bare `lvpm install` | a missing or out-of-date `lvpm.lock` is locked again first                          | acts as `--locked`: a missing or out-of-date `lvpm.lock` fails, after a note saying so. `--frozen` still applies. `lock`, a named `install` and a named `uninstall` are not affected | `--no-locked`                    |
 
-Together those mean a headless `lvpm install` into the LabVIEW installation
-never starts LabVIEW: it is downloads, MD5 checks, file copies and linkfix,
-and takes seconds. (A headless install into a venv still resaves each
-package in a headless LabVIEW; see [The resave](usage.md#the-resave).)
+Together those mean a headless `lvpm install` into the LabVIEW installation,
+without `--hooks` or `--relink` and with no package marked `relink = true`,
+never starts LabVIEW: it is downloads, MD5
+checks, file copies and linkfix, and takes seconds. (A headless install into
+a venv starts a headless LabVIEW for [the load check](usage.md#the-load-check),
+and resaves each package in one only with `--resave`; see
+[The resave](usage.md#the-resave).)
 Earlier timings on a DQMH project, from before linkfix was the default: two
 minutes with hooks, twelve with relink as well, and the mass compile
 afterwards reported nothing wrong either way.
@@ -78,8 +81,8 @@ has the differences, and every pull request's CI runs lvpm in it.
 
 Two container facts worth knowing. LabVIEW allows one mode at a time per
 machine, headless or IDE, so a headless job cannot share a host with an open
-IDE. And any LabVIEW that is started (by `--hooks`, `--relink`, or the job
-itself) outlives lvpm by design; in a container that keeps a `docker run`
+IDE. And any LabVIEW that is started (by `--hooks`, `--relink`, `--resave`, or
+the job itself) outlives lvpm by design; in a container that keeps a `docker run`
 alive, so end such a job with
 `LabVIEWCLI -OperationName CloseLabVIEW -Headless` (a Dockerfile `RUN` step
 exits on its own). Tools that want a LabVIEW of their own, such as Caraya's

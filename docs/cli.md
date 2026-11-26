@@ -36,7 +36,7 @@ lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refre
   list                          what lvpm installed into the target
   install [<pkg>[@ver]] [--no-project] [--dev] [--group NAME] [--index NAME]
           [--manifest FILE] [--dry-run] [--no-deps]
-          [--no-linkfix] [--relink] [--no-hooks | --hooks] [--allow-downgrade]
+          [--no-linkfix] [--relink] [--resave] [--no-hooks | --hooks] [--allow-downgrade]
           [--relink-timeout SECS] [--relink-progress NAME] [--keep-open]
   uninstall <pkg> [--no-project] [--dev] [--group NAME]
             [--with-deps | --keep-deps] [--force] | --all

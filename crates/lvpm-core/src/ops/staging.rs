@@ -298,6 +298,7 @@ mod tests {
         let mut session = InstallSession::new(env.destination()?);
         let opts = InstallOptions {
             no_relink: true,
+            resave: true,
             ..InstallOptions::default()
         };
         apply(env, &mut session, &plan(archive, version), &opts).map(drop)

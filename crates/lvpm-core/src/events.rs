@@ -294,7 +294,8 @@ pub enum Event {
         position: usize,
         total: usize,
     },
-    /// A dry run's packages with LabVIEW files, which a venv install resaves.
+    /// A dry run's packages with LabVIEW files, which a venv install with
+    /// `--resave` may resave. The version check can still skip some.
     ResavePlanned { packages: Vec<String> },
 
     // ---- ops::linkfix ----
@@ -317,6 +318,20 @@ pub enum Event {
     LinkfixDone { report: LinkfixReport },
     /// `lvpm linkfix --report` wrote its JSON report here.
     LinkfixReportWritten { path: PathBuf },
+    /// The venv's LabVIEW is about to open the `files` VIs linkfix made
+    /// source-only, to find the broken ones. Nothing is saved.
+    LoadCheckStarting { files: usize },
+    /// `broken` of a package's `checked` source-only VIs do not run in the
+    /// venv's LabVIEW. A resave may fix them; see issue #77.
+    LoadCheckBroken {
+        package: String,
+        broken: Vec<PathBuf>,
+        checked: usize,
+    },
+    /// The load check opened `checked` VIs; `broken` packages have broken ones.
+    LoadCheckDone { checked: usize, broken: usize },
+    /// The load check did not finish, so a broken VI may have gone unseen.
+    LoadCheckIncomplete { error: String },
 
     // ---- ops::relink ----
     /// The relink pass begins: `folders` to walk with the relink VI at `vi`,

@@ -4,6 +4,13 @@
 **Format:** dev-team specs 14.0.1 · **Status:** gate passed; the four stakeholder answers were given by the user on 2026-10-27 · **Date:** 2026-10-27 ·
 **Evidence:** [PR #55 comment](https://github.com/ThatsTheEnd/lvpm/pull/55#issuecomment-6440371424)
 
+> **Changed (2026-11-25,
+> [#59](https://github.com/labview-package-manager/lvpm/issues/59)):** the
+> resave is now opt-in with `--resave`. A default venv install prepares the
+> files with linkfix alone and starts no LabVIEW; `sync` and the TUI do the
+> same. With `--resave` everything below still holds, and linkfix runs after
+> it. The measurements below were taken with no linkfix.
+
 ## Intent Description
 
 A package built from old LabVIEW sources can be broken in a venv. The
@@ -150,6 +157,7 @@ Other observations:
 | Staging location | `inferable` | measurement | The sibling `<project>/.lv-venv.staging/`. Both locations under `<venv>` load as add-on context (M1a, M1b). The sibling is on the same volume, so the move is a rename, and the layout is mirrored so in-package relative links hold. |
 | Links to dependencies saved from staging | `inferable` | measurement | They hold after the move with no relink pass, in one LabVIEW session and with a fresh one per package (M3a, M3b). |
 | Detecting broken VIs | `inferable` | inference | Follows from the user's failure answer, which covers "a VI stays broken". The relink VI's JSON report gains the not-executable list. |
+| Broken VIs without `--resave` | `requires-stakeholder-input` | human, 2026-11-26 | Linkfix's source-only edit breaks some older VIs in a venv (issue #77). The root cause is out of scope. After linkfix, a venv install opens the VIs linkfix made source-only once in the venv's LabVIEW, saves nothing, and warns per package with the command to reinstall it with a resave. A check that does not finish is a warning, never a clean result. |
 | Existing venvs that are already broken | `inferable` | inference | Out of scope. Reinstalling, for example by deleting `.lv-venv` and running `lvpm sync`, runs the new path. The user docs say so. |
 | Uninstall | `inferable` | inference | Unchanged. The manifest holds final paths only (AC2). |
 | Global vi.lib has the same breakage | `inferable` | inference | Unmeasured, and out of scope by the user's answer on destinations. |

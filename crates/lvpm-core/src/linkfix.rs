@@ -2586,6 +2586,16 @@ pub fn summarize(outcomes: &[Outcome]) -> BTreeMap<&'static str, usize> {
     m
 }
 
+/// A real VI with a compiled-code block added, which linkfix separates.
+#[cfg(test)]
+pub(crate) fn vi_with_compiled_code() -> Vec<u8> {
+    let vi = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lv-src/relink-package.vi");
+    let mut r = Rsrc::parse(&std::fs::read(vi).unwrap()).unwrap();
+    r.edit_blocks(&[], Some((*b"VICD", b"synthetic compiled block".to_vec())))
+        .unwrap();
+    r.write()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

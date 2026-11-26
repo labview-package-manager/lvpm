@@ -289,7 +289,6 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
             position,
             total,
         } => {
-            r.resaved = true;
             r.begin(
                 Stream::Out,
                 &format!("resave ({position}/{total}) {package} ... "),
@@ -495,9 +494,6 @@ fn phase_skipped(r: &mut Renderer, phase: Phase, reason: SkipReason, skipped: us
             "\nrelink: skipped — a scratch tree has no LabVIEW to relink with"
         }
         (phase, SkipReason::Headless) => return headless::phase_skipped(r, phase),
-        (Phase::Relink, SkipReason::Declined) if r.resaved => {
-            "\nLabVIEW relink: skipped (pass --relink to use LabVIEW instead of linkfix). The resave still ran."
-        }
         (Phase::Relink, SkipReason::Declined) => {
             "\nLabVIEW relink: skipped (pass --relink to use LabVIEW instead of linkfix)"
         }
@@ -821,34 +817,6 @@ mod tests {
              packages were installed without a resave: alpha, beta. Fix the start problem, then \
              reinstall them.\n"
         );
-    }
-
-    #[test]
-    fn a_relink_skipped_after_a_resave_says_the_resave_still_ran() {
-        let resaved_then = |reason| {
-            text_of(&[
-                Event::ResaveStarted {
-                    package: "alpha".into(),
-                    position: 1,
-                    total: 1,
-                },
-                Event::ResaveDone {
-                    package: "alpha".into(),
-                    saved: 1,
-                    took: std::time::Duration::from_secs(9),
-                },
-                Event::PhaseSkipped {
-                    phase: Phase::Relink,
-                    reason,
-                    skipped: 1,
-                },
-            ])
-            .0
-        };
-        assert!(resaved_then(SkipReason::Declined).ends_with(
-            "\nLabVIEW relink: skipped (pass --relink to use LabVIEW instead of linkfix). \
-             The resave still ran.\n"
-        ));
     }
 
     #[test]

@@ -129,10 +129,15 @@ struct ApplyArgs {
     #[arg(long, hide = true)]
     no_relink: bool,
     /// Load and save the installed VIs in LabVIEW instead of running
-    /// linkfix. A venv install still resaves each package in the venv's
-    /// LabVIEW either way.
+    /// linkfix. Not the resave: see --resave.
     #[arg(long = "relink", conflicts_with = "no_relink")]
     force_relink: bool,
+    /// Venv installs: open and save each package in the venv's LabVIEW
+    /// before it lands, for packages with files saved in an older LabVIEW.
+    /// Takes about a minute per package. Linkfix still runs, unless
+    /// --relink replaces it.
+    #[arg(long)]
+    resave: bool,
     /// Run every package's install hooks for this command. They are package
     /// code, run inside LabVIEW with your rights, and are off by default for
     /// any package not allowed by `hooks = "run"` in lvpm.toml or `hooks.run`
@@ -169,6 +174,7 @@ impl ApplyArgs {
             no_linkfix: self.no_linkfix,
             no_relink: self.no_relink,
             force_relink: self.force_relink,
+            resave: self.resave,
             run_hooks: self.run_hooks,
             allow_downgrade,
             relink: (&self.relink).into(),
@@ -2151,6 +2157,24 @@ mod tests {
             let cli = Cli::try_parse_from(args).unwrap();
             assert!(cli.yes, "{args:?}");
         }
+    }
+
+    #[test]
+    fn resave_is_asked_for_by_flag_on_install_sync_add_and_uninstall() {
+        let resave = |args: &[&str]| match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::Install { apply, .. } | Cmd::Sync { apply, .. } | Cmd::Uninstall { apply, .. } => {
+                apply.options(false, false).resave
+            }
+            _ => unreachable!(),
+        };
+        assert!(resave(&["lvpm", "install", "x", "--resave"]));
+        assert!(resave(&["lvpm", "sync", "--resave"]));
+        assert!(resave(&["lvpm", "add", "x", "--resave"]));
+        assert!(!resave(&["lvpm", "install", "x"]));
+        assert!(!resave(&["lvpm", "sync"]));
+        assert!(!resave(&["lvpm", "add", "x"]));
+        assert!(resave(&["lvpm", "uninstall", "x", "--resave"]));
+        assert!(!resave(&["lvpm", "uninstall", "x"]));
     }
 
     #[test]

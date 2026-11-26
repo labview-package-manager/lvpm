@@ -2742,7 +2742,7 @@ beta = \"*\"
     }
 
     #[test]
-    fn sync_resaves_too_dependencies_first() {
+    fn sync_resaves_when_asked_dependencies_first() {
         use crate::ops::resave::fake::Fake;
         use crate::ops::testing::{labview_2026, venv_in, vip_in};
         let scratch = Scratch::new("resave");
@@ -2769,7 +2769,7 @@ beta = \"*\"
         env.targets = vec![labview_2026()];
         let opts = SyncOptions {
             install: InstallOptions {
-                no_relink: true,
+                resave: true,
                 ..InstallOptions::default()
             },
             ..SyncOptions::default()
@@ -2802,5 +2802,32 @@ beta = \"*\"
         assert!(why.contains("but no venv"), "{why}");
         assert_eq!(snapshot(&dir), before);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_default_sync_starts_no_labview_for_a_resave() {
+        use crate::ops::resave::fake::Fake;
+        use crate::ops::testing::{labview_2026, venv_in, vip_in};
+        let scratch = Scratch::new("no-resave");
+        vip_in(
+            &scratch.folder(),
+            "alpha",
+            "1.0",
+            "",
+            &["alpha/a.vi"],
+            false,
+        );
+        scratch.write_manifest(&["alpha"]);
+        let venv = venv_in(&scratch.root);
+        let fake = Fake::saving().install();
+        let mut env = scratch.env(&NullSink, vec![scratch.folder()]);
+        env.targets = vec![labview_2026()];
+
+        sync(&env, &SyncOptions::default()).unwrap();
+
+        let log = fake.log();
+        assert_eq!(log.starts, 0, "LabVIEW started");
+        assert!(log.resaves.is_empty(), "resaved: {:?}", log.resaves);
+        assert!(install::is_installed(&venv.store(), "alpha"));
     }
 }

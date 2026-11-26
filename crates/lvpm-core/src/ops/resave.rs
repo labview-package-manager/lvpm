@@ -8,9 +8,10 @@ use crate::events::{Event, EventSink};
 use crate::launch::{self, VenvLabview};
 use crate::linker::Rsrc;
 use crate::venv::Venv;
-use anyhow::{Result, bail};
+use crate::viserver::LvValue;
+use anyhow::{Result, bail, ensure};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Starts the LabVIEW the resave runs in. The seam the tests replace.
 pub(crate) trait Launcher {
@@ -22,7 +23,27 @@ pub(crate) trait Session {
     /// Open and save each of a staged package's LabVIEW `files` where it is.
     /// How many were saved.
     fn resave(&mut self, staged: &Path, files: &[PathBuf]) -> Result<usize>;
+    /// Open each of `files` without saving it, and hand back the ones that
+    /// are broken or do not open. The helper VI is written into `work_dir`.
+    fn broken(&mut self, work_dir: &Path, files: &[PathBuf]) -> Result<Vec<PathBuf>>;
 }
+
+/// The launcher a run uses. A unit test never starts a LabVIEW: it gets the
+/// fake its thread set.
+pub(crate) fn launcher() -> Box<dyn Launcher> {
+    #[cfg(not(test))]
+    return Box::new(VenvLauncher);
+    #[cfg(test)]
+    Box::new(fake::current())
+}
+
+/// The load-check helper: it opens each path in `Files to check`, reads its
+/// execution state, and lists the broken ones in `Broken`. It never saves.
+#[cfg_attr(test, allow(dead_code))]
+const CHECK_VI_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/lv-src/check-broken.vi"
+));
 
 /// The venv's own LabVIEW, started fresh, over VI Server.
 #[cfg_attr(test, allow(dead_code))]
@@ -63,6 +84,61 @@ impl Session for VenvSession {
                 files.len()
             ),
         }
+    }
+
+    fn broken(&mut self, work_dir: &Path, files: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        let helper = crate::relink::materialize_vi(work_dir, "lvpm-check-broken", CHECK_VI_BYTES)?;
+        let sent: Vec<(String, &PathBuf)> = files
+            .iter()
+            .map(|f| (crate::relink::lv_folder(f), f))
+            .collect();
+        let list = sent
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        let c = self.labview.connection();
+        let vi = c.open_vi_reference(&helper)?;
+        let read = (|| -> Result<String> {
+            c.ctrl_val_set(vi, "Files to check", LvValue::Str(list))?;
+            c.run_vi_async(vi)?;
+            // shortcut: one budget for the whole list, about a second a VI as
+            // measured; give the helper a progress indicator if it runs short.
+            let budget = launch::CALL_TIMEOUT + Duration::from_secs(files.len() as u64);
+            let started = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                match c.ctrl_val_get(vi, "Done")? {
+                    LvValue::Bool(true) => break,
+                    LvValue::Bool(false) => {}
+                    other => bail!("Done read back as {other}, not a boolean"),
+                }
+                ensure!(
+                    started.elapsed() < budget,
+                    "the check of {} VIs still running after {}s; LabVIEW may be showing a dialog",
+                    files.len(),
+                    budget.as_secs()
+                );
+            }
+            match c.ctrl_val_get(vi, "Broken")? {
+                LvValue::Str(s) => Ok(s),
+                other => bail!("Broken read back as {other}, not a string"),
+            }
+        })();
+        let _ = c.release(vi);
+        Ok(read?
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                sent.iter()
+                    .find(|(s, _)| s.eq_ignore_ascii_case(l))
+                    .map_or_else(|| PathBuf::from(l), |(_, f)| (*f).clone())
+            })
+            .collect())
     }
 }
 
@@ -131,13 +207,8 @@ pub struct Resaver {
 
 impl Default for Resaver {
     fn default() -> Self {
-        // A unit test never starts a LabVIEW: it gets the fake its thread set.
-        #[cfg(not(test))]
-        let launcher: Box<dyn Launcher> = Box::new(VenvLauncher);
-        #[cfg(test)]
-        let launcher: Box<dyn Launcher> = Box::new(fake::current());
         Resaver {
-            launcher,
+            launcher: launcher(),
             session: None,
             start_failure: None,
             wanted: 0,
@@ -264,6 +335,8 @@ pub(crate) mod fake {
         /// Per resave: the package, and the packages then in their add-on
         /// folders.
         pub resaves: Vec<(String, Vec<String>)>,
+        /// Per load check: the file names it was asked to open.
+        pub checks: Vec<Vec<String>>,
     }
 
     #[derive(Clone, Default)]
@@ -271,6 +344,10 @@ pub(crate) mod fake {
         log: Arc<Mutex<Log>>,
         cannot_start: bool,
         failing: Vec<String>,
+        /// File names the load check finds broken.
+        broken: Vec<String>,
+        /// The load check fails part way.
+        check_fails: bool,
     }
 
     thread_local! {
@@ -296,6 +373,22 @@ pub(crate) mod fake {
         pub(crate) fn failing(packages: &[&str]) -> Fake {
             Fake {
                 failing: packages.iter().map(|p| p.to_string()).collect(),
+                ..Fake::default()
+            }
+        }
+
+        /// A LabVIEW whose load check finds these file names broken.
+        pub(crate) fn broken(names: &[&str]) -> Fake {
+            Fake {
+                broken: names.iter().map(|n| n.to_string()).collect(),
+                ..Fake::default()
+            }
+        }
+
+        /// A LabVIEW whose load check stops part way.
+        pub(crate) fn check_fails() -> Fake {
+            Fake {
+                check_fails: true,
                 ..Fake::default()
             }
         }
@@ -363,6 +456,20 @@ pub(crate) mod fake {
             }
             Ok(files.len())
         }
+
+        fn broken(&mut self, _work_dir: &Path, files: &[PathBuf]) -> Result<Vec<PathBuf>> {
+            let name = |f: &PathBuf| f.file_name().unwrap().to_string_lossy().into_owned();
+            let mut log = self.fake.log.lock().unwrap();
+            log.checks.push(files.iter().map(name).collect());
+            if self.fake.check_fails {
+                bail!("VI Server error 56 reading Done");
+            }
+            Ok(files
+                .iter()
+                .filter(|f| self.fake.broken.contains(&name(f)))
+                .cloned()
+                .collect())
+        }
     }
 
     impl Drop for FakeSession {
@@ -407,9 +514,10 @@ mod tests {
         )
     }
 
-    fn no_relink() -> InstallOptions {
+    /// `--resave`: a venv install resaves each package before it lands.
+    fn resaving() -> InstallOptions {
         InstallOptions {
-            no_relink: true,
+            resave: true,
             ..InstallOptions::default()
         }
     }
@@ -487,7 +595,7 @@ mod tests {
         let fake = Fake::saving().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
 
         let events = sink.events();
         assert!(events.contains(&Event::ResaveStarting));
@@ -517,7 +625,7 @@ mod tests {
         Fake::failing(&["alpha"]).install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
 
         let events = sink.events();
         let failed = events.iter().find_map(|e| match e {
@@ -549,7 +657,7 @@ mod tests {
         let fake = Fake::failing(&["alpha"]).install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("beta"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("beta"), &resaving()).unwrap();
 
         let events = sink.events();
         assert!(events.iter().any(|e| matches!(
@@ -571,7 +679,7 @@ mod tests {
         let fake = Fake::cannot_start().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("beta"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("beta"), &resaving()).unwrap();
 
         let events = sink.events();
         let both = vec!["alpha".to_string(), "beta".to_string()];
@@ -630,7 +738,7 @@ mod tests {
         let fake = Fake::saving().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("beta"), &no_relink()).unwrap_err();
+        install(&env_on(&sink, &repo), Some("beta"), &resaving()).unwrap_err();
 
         let log = fake.log();
         assert_eq!(log.resaves.len(), 1, "alpha was resaved first");
@@ -660,7 +768,7 @@ mod tests {
             let fake = Fake::saving().install();
             let sink = Recorded::default();
 
-            install(&env_on(&sink, &repo), Some("top"), &no_relink()).unwrap();
+            install(&env_on(&sink, &repo), Some("top"), &resaving()).unwrap();
 
             let log = fake.log();
             assert_eq!(log.resaves.len(), graph.len(), "{graph:?}");
@@ -690,7 +798,7 @@ mod tests {
         let fake = Fake::saving().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
 
         let events = sink.events();
         assert!(!events.contains(&Event::ResaveStarting));
@@ -708,7 +816,7 @@ mod tests {
         let mut env = env_on(&sink, &repo);
         env.headless = true;
 
-        install(&env, Some("alpha"), &InstallOptions::default()).unwrap();
+        install(&env, Some("alpha"), &resaving()).unwrap();
 
         let events = sink.events();
         assert_eq!(resaves(&events), ["alpha"]);
@@ -722,13 +830,80 @@ mod tests {
     }
 
     #[test]
+    fn a_default_venv_install_runs_linkfix_and_starts_no_labview() {
+        let (repo, venv) = repo("resave-default");
+        package(&repo, "alpha", "");
+        let fake = Fake::saving().install();
+        let sink = Recorded::default();
+
+        install(
+            &env_on(&sink, &repo),
+            Some("alpha"),
+            &InstallOptions::default(),
+        )
+        .unwrap();
+
+        let events = sink.events();
+        assert!(events.contains(&Event::LinkfixPreparing), "{events:?}");
+        assert!(!events.contains(&Event::ResaveStarting));
+        assert!(resaves(&events).is_empty());
+        assert_eq!(fake.log().starts, 0);
+        assert!(landed(&venv, "alpha"));
+        assert!(!venv.staging_dir().exists());
+    }
+
+    #[test]
+    fn a_resave_asked_for_still_runs_linkfix() {
+        let (repo, venv) = repo("resave-and-linkfix");
+        package(&repo, "alpha", "");
+        Fake::saving().install();
+        let sink = Recorded::default();
+
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
+
+        let events = sink.events();
+        let at = |want: fn(&Event) -> bool| events.iter().position(want);
+        let resave = at(|e| matches!(e, Event::ResaveStarted { .. })).expect("resaved");
+        let linkfix = at(|e| matches!(e, Event::LinkfixPreparing)).expect("linkfix ran");
+        assert!(resave < linkfix, "the resave comes before linkfix");
+        assert!(landed(&venv, "alpha"));
+    }
+
+    #[test]
+    fn a_dry_run_lists_a_resave_only_when_asked_for() {
+        let (repo, _venv) = repo("resave-dry-default");
+        package(&repo, "alpha", "");
+        Fake::saving().install();
+        let sink = Recorded::default();
+        let dry = InstallOptions {
+            dry_run: true,
+            ..InstallOptions::default()
+        };
+
+        install(&env_on(&sink, &repo), Some("alpha"), &dry).unwrap();
+        assert_eq!(planned(&sink.events()), None);
+
+        let asked = Recorded::default();
+        let dry = InstallOptions {
+            resave: true,
+            ..dry
+        };
+        install(&env_on(&asked, &repo), Some("alpha"), &dry).unwrap();
+        assert_eq!(planned(&asked.events()), Some(vec!["alpha".into()]));
+    }
+
+    #[test]
     fn no_relink_skips_the_relink_and_not_the_resave() {
         let (repo, _venv) = repo("resave-no-relink");
         package(&repo, "alpha", "");
         Fake::saving().install();
         let sink = Recorded::default();
+        let opts = InstallOptions {
+            no_relink: true,
+            ..resaving()
+        };
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &opts).unwrap();
 
         let events = sink.events();
         assert_eq!(resaves(&events), ["alpha"]);
@@ -741,10 +916,12 @@ mod tests {
         )));
     }
 
-    /// `--relink`: LabVIEW's load-and-save pass instead of linkfix.
+    /// `--relink --resave`: the resave, then LabVIEW's load-and-save pass
+    /// instead of linkfix.
     fn relink() -> InstallOptions {
         InstallOptions {
             force_relink: true,
+            resave: true,
             ..InstallOptions::default()
         }
     }
@@ -941,7 +1118,7 @@ mod tests {
         let fake = Fake::saving().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("both"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("both"), &resaving()).unwrap();
 
         let events = sink.events();
         assert!(events.iter().any(|e| matches!(
@@ -964,7 +1141,7 @@ mod tests {
         let fake = Fake::cannot_start().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
 
         let events = sink.events();
         assert_eq!(fake.log().starts, 0);
@@ -993,7 +1170,7 @@ mod tests {
         Fake::failing(&["beta"]).install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("all"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("all"), &resaving()).unwrap();
 
         let events = sink.events();
         assert_eq!(resaves(&events), ["beta", "gamma"]);
@@ -1017,7 +1194,7 @@ mod tests {
         Fake::saving().install();
         let sink = Recorded::default();
 
-        install(&env_on(&sink, &repo), Some("alpha"), &no_relink()).unwrap();
+        install(&env_on(&sink, &repo), Some("alpha"), &resaving()).unwrap();
 
         assert_eq!(resaves(&sink.events()), ["alpha"]);
     }

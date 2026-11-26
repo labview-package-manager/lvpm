@@ -44,8 +44,11 @@ pub struct InstallOptions {
     /// `force_relink` asks for it.
     pub no_relink: bool,
     /// Run LabVIEW's load-and-save relink pass instead of linkfix (`--relink`).
-    /// Not the resave: a venv install resaves each package whatever this says.
+    /// Not the resave, which is `resave`.
     pub force_relink: bool,
+    /// Resave each venv package in the venv's LabVIEW before it lands
+    /// (`--resave`). Off by default: linkfix prepares the files on its own.
+    pub resave: bool,
     /// The packages the manifest marks `relink = true`: without
     /// `force_relink`, LabVIEW's relink pass runs for these alone, after
     /// linkfix. For VIs only LabVIEW can re-resolve, such as .NET invoke
@@ -546,7 +549,7 @@ fn install_one(
     let verdict = hook_verdict(env, session, opts, &entry.name);
     let files = pkg.plan.writes.len();
     match opts.dry_run {
-        true => preview(env, session, &pkg)?,
+        true => preview(env, session, &pkg, opts)?,
         false => unpack(env, session, &mut pkg, opts, verdict)?,
     }
     report_leftovers(env, &pkg.plan);
@@ -686,7 +689,12 @@ fn remove_old(
 
 /// A dry run: say what would be written, and note the folders a relink pass
 /// would walk.
-fn preview(env: &OpEnv, session: &mut InstallSession, pkg: &Unpacking) -> Result<()> {
+fn preview(
+    env: &OpEnv,
+    session: &mut InstallSession,
+    pkg: &Unpacking,
+    opts: &InstallOptions,
+) -> Result<()> {
     env.sink.emit(Event::PackageDone {
         files: pkg.plan.writes.len(),
         dry_run: true,
@@ -709,7 +717,10 @@ fn preview(env: &OpEnv, session: &mut InstallSession, pkg: &Unpacking) -> Result
     session.linkfix_files.extend(lv_tree_writes(pkg));
     // shortcut: lists packages the version skip may pass over, since a dry run
     // unpacks nothing to read; read the archive members if that misleads.
-    if session.venv().is_some() && pkg.plan.writes.iter().any(|w| resave::is_lv_file(&w.dest)) {
+    if opts.resave
+        && session.venv().is_some()
+        && pkg.plan.writes.iter().any(|w| resave::is_lv_file(&w.dest))
+    {
         session.resaver.planned.push(pkg.entry.name.clone());
     }
     Ok(())
@@ -805,7 +816,9 @@ fn unpack(
                 )
             });
             let m = staged.inspect_err(|_| staging.discard())?;
-            session.resave(env, &staging, name);
+            if opts.resave {
+                session.resave(env, &staging, name);
+            }
             staging::land(env, session, &staging, &m)?;
             m
         }
@@ -893,7 +906,8 @@ pub fn finish(
     opts: &InstallOptions,
 ) -> Result<()> {
     session.close_hook_connection();
-    linkfix::after_install(env, session, applied, opts);
+    let separated = linkfix::after_install(env, session, applied, opts);
+    super::load_check::after_linkfix(env, session, &separated);
     relink_pass(env, session, applied, opts)?;
     post_install_hooks(env, session, opts);
     refresh_palettes(env, session, applied)?;

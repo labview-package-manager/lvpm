@@ -17,6 +17,7 @@ pub mod init;
 pub mod install;
 pub mod launch_cmd;
 pub mod linkfix;
+mod load_check;
 pub mod lock;
 pub mod publish;
 pub mod query;
