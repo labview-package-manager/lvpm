@@ -64,9 +64,10 @@ need is not installed, and is taken out when it is. `lvpm add/remove --group
 - **Docs.** ADR 1 stands. Update build-slices.md S11 and the manifest.md
   note and "Named dependency groups" section to this syntax; usage.md gets
   the flags.
-- **Out of scope:** `--only-group`, `--all-groups`, include-group (since done
-  in labview-package-manager/lvpm#68),
+- **Out of scope:** `--only-group`, `--all-groups`,
   a configurable default group set, groups on a global `lvpm install`.
+  (include-groups was out of scope here too; it shipped in
+  labview-package-manager/lvpm#68.)
 
 ## Acceptance Criteria
 

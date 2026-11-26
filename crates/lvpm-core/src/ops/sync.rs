@@ -220,7 +220,7 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
 
     let lock_path = manifest_path.with_file_name(lockfile::FILE_NAME);
     let (lock, first_sync) = settle_lock(env, &found, &lock_path, opts)?;
-    refuse_groups_the_lock_lacks(&lock, &selection)?;
+    refuse_groups_the_lock_lacks(project, &lock, &selection)?;
     if !project.nipm.is_empty() {
         env.sink.emit(Event::NipmNotInstalled {
             count: project.nipm.len(),
@@ -285,15 +285,34 @@ pub(super) fn refuse_unknown_groups(project: &Project, groups: &[String]) -> Res
     .into())
 }
 
-/// Under `--only`, fail when the lock records no lines for a selected group:
-/// a `--frozen` lock older than the group would reach nothing, and every
-/// installed package would be taken out.
-fn refuse_groups_the_lock_lacks(lock: &Lockfile, selection: &Selection) -> Result<(), SyncError> {
-    let missing = (selection.groups.iter())
-        .find(|group| selection.no_main && !lock.inputs.dependency_groups.contains_key(*group));
+/// Under `--only`, fail when the lock records no lines for a selected group
+/// (dev included) that has lines in the manifest: a `--frozen` lock older than
+/// the group would reach nothing, and every installed package would be taken
+/// out. A group with no lines of its own reaches nothing either way.
+fn refuse_groups_the_lock_lacks(
+    project: &Project,
+    lock: &Lockfile,
+    selection: &Selection,
+) -> Result<(), SyncError> {
+    let dev = (!selection.no_dev).then(|| {
+        let locked = !lock.inputs.dev_dependencies.is_empty();
+        (DEV_GROUP, !project.dev_dependencies.is_empty(), locked)
+    });
+    let groups = (selection.groups.iter()).map(|group| {
+        let lines = (project.groups.iter()).find(|(name, _)| name == group);
+        let locked = (lock.inputs.dependency_groups.get(group)).is_some_and(|l| !l.is_empty());
+        (
+            group.as_str(),
+            lines.is_some_and(|(_, l)| !l.is_empty()),
+            locked,
+        )
+    });
+    let missing = (dev.into_iter().chain(groups))
+        .find(|(_, has_lines, locked)| selection.no_main && *has_lines && !locked)
+        .map(|(group, _, _)| group);
     match missing {
         Some(group) => Err(anyhow::anyhow!(
-            "lvpm.lock records no group '{group}': it is older than lvpm.toml;              run `lvpm lock`, or sync without --frozen"
+            "lvpm.lock records no group '{group}': it is older than lvpm.toml; run `lvpm lock`, or sync without --frozen"
         )
         .into()),
         None => Ok(()),
@@ -1461,20 +1480,46 @@ mod tests {
     #[test]
     fn only_refuses_a_group_the_lock_records_no_lines_for() {
         let lock = with_a_ci_group();
+        let project = crate::project::parse(
+            "[dependency-groups.docs]\nbeta = \"*\"\n[dependency-groups.all]\ninclude-groups = [\"docs\"]",
+        )
+        .unwrap();
+        let refuse =
+            |selection: &Selection| refuse_groups_the_lock_lacks(&project, &lock, selection);
         let only = |group: &str| Selection {
             groups: vec![group.to_string()],
             no_main: true,
             ..Selection::default()
         };
-        let err = refuse_groups_the_lock_lacks(&lock, &only("docs"))
-            .unwrap_err()
-            .to_string();
+        let err = refuse(&only("docs")).unwrap_err().to_string();
         assert!(err.contains("lvpm.lock records no group 'docs'"), "{err}");
         let with_docs = Selection {
             no_main: false,
             ..only("docs")
         };
-        assert!(refuse_groups_the_lock_lacks(&lock, &with_docs).is_ok());
+        assert!(refuse(&with_docs).is_ok());
+        // An include-only group has no lines to miss: a current lock lacks it too.
+        assert!(refuse(&only("all")).is_ok());
+        // A lock that recorded the group while it was empty lacks its lines too.
+        let mut empty_docs = with_a_ci_group();
+        (empty_docs.inputs.dependency_groups).insert("docs".to_string(), BTreeMap::new());
+        let err = refuse_groups_the_lock_lacks(&project, &empty_docs, &only("docs")).unwrap_err();
+        assert!(err.to_string().contains("no group 'docs'"), "{err}");
+        // dev is checked the same way, though Selection.groups never holds it.
+        let dev_project = crate::project::parse("[dev-dependencies]\ncaraya = \"*\"").unwrap();
+        let mut no_dev_lines = with_a_ci_group();
+        no_dev_lines.inputs.dev_dependencies.clear();
+        let only_dev = Selection {
+            groups: vec![],
+            ..only("docs")
+        };
+        let err = refuse_groups_the_lock_lacks(&dev_project, &no_dev_lines, &only_dev).unwrap_err();
+        assert!(err.to_string().contains("no group 'dev'"), "{err}");
+        let not_dev = Selection {
+            no_dev: true,
+            ..only_dev
+        };
+        assert!(refuse_groups_the_lock_lacks(&dev_project, &no_dev_lines, &not_dev).is_ok());
     }
 
     #[test]

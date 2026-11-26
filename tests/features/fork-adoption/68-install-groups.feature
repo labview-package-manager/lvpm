@@ -35,6 +35,11 @@ Feature: pick groups at install with --with, --without, --only and include-group
     Then the command succeeds and dest's lvpm-installed packages are exactly alpha
     And the output says "groups not selected: test, ci (--with <GROUP> adds one)"
 
+  Scenario: install with a package and --group brings the group's include-groups
+    Given lvpm.toml has [dev-dependencies] "caraya" "*"; [dependency-groups.test] "beta" "*"; [dependency-groups.ci] include-groups = ["test"]
+    When I run "lvpm install ci_tools --group ci --prefix dest"
+    Then the command succeeds and dest's lvpm-installed packages are exactly alpha, beta, caraya, ci_tools, delta
+
   Scenario: --only names no group as left out
     Given lvpm.toml has [dependency-groups.test] "beta" "*"; [dependency-groups.ci] "ci_tools" "*"
     When I run "lvpm install --only test --prefix dest"

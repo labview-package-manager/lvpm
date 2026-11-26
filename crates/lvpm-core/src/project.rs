@@ -787,6 +787,25 @@ fn check_includes(p: &Project) -> Result<()> {
         }
         p.expand(name, &mut Vec::new(), &mut done)?;
     }
+    // The shared walk can split a long chain; `done` lists includes first, so
+    // each group's height follows from those before it, without recursing.
+    let mut height: BTreeMap<&str, usize> = BTreeMap::new();
+    for name in &done {
+        let below = (p.group_includes.get(name).into_iter().flatten())
+            .map(|included| {
+                height
+                    .get(group_key(included).as_str())
+                    .copied()
+                    .unwrap_or(1)
+            })
+            .max()
+            .unwrap_or(0);
+        ensure!(
+            below < MAX_INCLUDE_DEPTH,
+            "{INCLUDE_KEY} nest more than {MAX_INCLUDE_DEPTH} groups deep at {name:?}"
+        );
+        height.insert(name, below + 1);
+    }
     Ok(())
 }
 
@@ -801,7 +820,7 @@ impl Project {
 
     /// `roots` and every group they take in through `include-groups`, each
     /// once: a group's includes before the group, `dev` in its one spelling.
-    /// Fails only on a chain nested too deep, as the manifest's read does.
+    /// Fails on a chain nested too deep; cycles are refused when the manifest is read.
     pub fn with_includes(&self, roots: &[String]) -> Result<Vec<String>> {
         let mut order = Vec::new();
         for root in roots {
@@ -816,7 +835,7 @@ impl Project {
         let name = group_key(name);
         ensure!(
             stack.len() < MAX_INCLUDE_DEPTH,
-            "{INCLUDE_KEY} nest more than {MAX_INCLUDE_DEPTH} groups deep at {name}"
+            "{INCLUDE_KEY} nest more than {MAX_INCLUDE_DEPTH} groups deep at {name:?}"
         );
         if stack.contains(&name) {
             stack.push(name);
@@ -2070,6 +2089,39 @@ e = \"*\"
             .chain([format!("[dependency-groups.g{}]\n", MAX_INCLUDE_DEPTH + 1)])
             .collect();
         let err = format!("{:#}", parse(&chain).unwrap_err());
+        assert!(err.contains("nest more than 64 groups deep"), "{err}");
+        let at_the_limit: String = (0..MAX_INCLUDE_DEPTH - 1)
+            .map(|i| {
+                format!(
+                    "[dependency-groups.g{i}]\ninclude-groups = [\"g{}\"]\n",
+                    i + 1
+                )
+            })
+            .chain([format!("[dependency-groups.g{}]\n", MAX_INCLUDE_DEPTH - 1)])
+            .collect();
+        parse(&at_the_limit)
+            .unwrap()
+            .with_includes(&["g0".to_string()])
+            .unwrap();
+        // Walked from x00 first, the y chain stops at x00; its height still counts.
+        let split: String = (0..40)
+            .map(|i| {
+                format!(
+                    "[dependency-groups.x{i:02}]\ninclude-groups = [\"x{:02}\"]\n",
+                    i + 1
+                )
+            })
+            .chain((0..40).map(|i| {
+                let next = if i == 39 {
+                    "x00".to_string()
+                } else {
+                    format!("y{:02}", i + 1)
+                };
+                format!("[dependency-groups.y{i:02}]\ninclude-groups = [\"{next}\"]\n")
+            }))
+            .chain(["[dependency-groups.x40]\n".to_string()])
+            .collect();
+        let err = format!("{:#}", parse(&split).unwrap_err());
         assert!(err.contains("nest more than 64 groups deep"), "{err}");
 
         let err = format!(
