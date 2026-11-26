@@ -491,15 +491,20 @@ vipm_package_builder = "*"
 `--with`, `--without` and `--only` take comma-separated lists and are
 repeatable, as in lvpm 0.3. A selected group brings its `include-groups`;
 `--without` applies after that, so `--with ci --without dev` leaves out the dev
-that ci includes. `--only` leaves out `[dependencies]` and dev unless they are
-named or included, but keeps what the selected groups need from them. uv spells
-these `--group`, `--no-group` and `--only-group`. Each run names the groups it
-leaves out: `groups not selected: ci, build (--with <GROUP> adds one)`.
+that ci includes. Leaving dev out wins: `--with ci --no-dev` leaves it out too.
+`--only` leaves out `[dependencies]`, and dev unless `--only` or a selected
+group names it; it keeps what the selected groups need from either. `--only`
+conflicts with `--with`, `--group`, `--without` and `--no-dev`. uv spells these
+`--group`, `--no-group` and `--only-group`
+([uv docs](https://docs.astral.sh/uv/concepts/projects/dependencies/#dependency-groups)).
+A run without `--only` names the groups it leaves out:
+`groups not selected: ci, build (--with <GROUP> adds one)`.
 
-`--group` is repeatable. `--group dev --no-dev` is refused, and a `--group`
+`--group` is repeatable. `--group dev` or `--with dev` with `--no-dev` or
+`--without dev` is refused, and a `--group`
 the manifest does not define fails before anything changes, listing the
 defined groups (`dev` is always one). A package that `[dependencies]` needs is
-installed whatever the flags; one that only unselected groups need is
+installed whatever the flags but `--only`; one that only unselected groups need is
 uninstalled, and the plan names those groups.
 
 `lvpm install <pkg> --group ci` writes the package under `[dependency-groups.ci]`,

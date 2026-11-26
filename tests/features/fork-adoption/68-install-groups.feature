@@ -35,6 +35,27 @@ Feature: pick groups at install with --with, --without, --only and include-group
     Then the command succeeds and dest's lvpm-installed packages are exactly alpha
     And the output says "groups not selected: test, ci (--with <GROUP> adds one)"
 
+  Scenario: --only names no group as left out
+    Given lvpm.toml has [dependency-groups.test] "beta" "*"; [dependency-groups.ci] "ci_tools" "*"
+    When I run "lvpm install --only test --prefix dest"
+    Then the command succeeds and dest's lvpm-installed packages are exactly beta
+    And the output does not say "groups not selected"
+
+  Scenario: leaving dev out wins over a group that includes it
+    Given lvpm.toml has [dev-dependencies] "caraya" "*"; [dependency-groups.ci] include-groups = ["dev"], "ci_tools" "*"
+    When I run "lvpm install --with ci --no-dev --prefix dest"
+    Then the command succeeds and dest's lvpm-installed packages are exactly alpha, ci_tools
+
+  Scenario Outline: dev both asked for and left out is refused
+    When I run "lvpm install <flags> --prefix dest"
+    Then the command fails saying "<asked>" and "<left out>" cannot be combined
+
+    Examples:
+      | flags                   | asked      | left out      |
+      | --with dev --no-dev     | --with dev | --no-dev      |
+      | --with dev --without dev | --with dev | --without dev |
+      | --group dev --without dev | --group dev | --without dev |
+
   Scenario Outline: a wrong include-groups is refused when read
     Given lvpm.toml has <manifest>
     When I run "lvpm lock"

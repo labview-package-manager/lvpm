@@ -222,11 +222,13 @@ struct SyncArgs {
 }
 
 impl SyncArgs {
-    /// `--group dev` or `--with dev` with `--no-dev`: dev is both asked for and left out.
+    /// `--group dev` or `--with dev` with `--no-dev` or `--without dev`: dev
+    /// is both asked for and left out.
     fn asks_for_and_against_dev(&self) -> bool {
-        self.no_dev
-            && (self.group.iter().chain(&self.with))
-                .any(|g| lvpm_core::project::is_dev_group(g.trim()))
+        let names_dev =
+            |groups: &[String]| (groups.iter()).any(|g| lvpm_core::project::is_dev_group(g.trim()));
+        (names_dev(&self.group) || names_dev(&self.with))
+            && (self.no_dev || names_dev(&self.without))
     }
 
     fn options(&self, apply: &ApplyArgs, headless: bool) -> SyncOptions {
@@ -913,7 +915,7 @@ fn main() -> std::process::ExitCode {
         Cli::command()
             .error(
                 clap::error::ErrorKind::ArgumentConflict,
-                "--group dev and --no-dev cannot be combined: --no-dev leaves out the dev group",
+                "--group dev or --with dev cannot be combined with --no-dev or --without dev: they leave out the dev group",
             )
             .exit();
     }

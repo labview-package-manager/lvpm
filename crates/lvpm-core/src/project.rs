@@ -655,6 +655,14 @@ pub fn is_dev_group(name: &str) -> bool {
     name.eq_ignore_ascii_case(DEV_GROUP)
 }
 
+/// `name` as a selection holds it: `dev` in its one spelling.
+pub fn group_key(name: &str) -> String {
+    match is_dev_group(name) {
+        true => DEV_GROUP.to_string(),
+        false => name.to_string(),
+    }
+}
+
 /// Whether `name` can name a dependency group: letters, digits, `-` and `_`.
 pub fn valid_group_name(name: &str) -> Result<()> {
     if name.is_empty()
@@ -746,6 +754,8 @@ fn take_includes(groups: &mut toml::Table) -> Result<BTreeMap<String, Vec<String
         let Some(list) = value.as_table_mut().and_then(|t| t.remove(INCLUDE_KEY)) else {
             continue;
         };
+        // Checked before the name is printed: it may hold control characters.
+        valid_group_name(name).context("[dependency-groups]")?;
         let names = (list.as_array()).and_then(|items| {
             items
                 .iter()
@@ -766,37 +776,48 @@ fn take_includes(groups: &mut toml::Table) -> Result<BTreeMap<String, Vec<String
 /// Every `include-groups` names a group the manifest defines, or dev, and no
 /// group takes itself in, directly or through others.
 fn check_includes(p: &Project) -> Result<()> {
+    // One `done` for all: a group expanded once is not walked again.
+    let mut done = Vec::new();
     for (name, included) in &p.group_includes {
         for other in included {
             ensure!(
-                is_dev_group(other) || p.groups.iter().any(|(g, _)| g == other),
-                "[dependency-groups.{name}] {INCLUDE_KEY}: there is no group {other}"
+                p.defines_group(other),
+                "[dependency-groups.{name}] {INCLUDE_KEY}: there is no group {other:?}"
             );
         }
-        p.expand(name, &mut Vec::new(), &mut Vec::new())?;
+        p.expand(name, &mut Vec::new(), &mut done)?;
     }
     Ok(())
 }
 
+/// How deep `include-groups` may nest: a deeper chain is refused, not recursed.
+const MAX_INCLUDE_DEPTH: usize = 64;
+
 impl Project {
+    /// `name` is dev or a `[dependency-groups]` table of the manifest.
+    pub fn defines_group(&self, name: &str) -> bool {
+        is_dev_group(name) || self.groups.iter().any(|(group, _)| group == name)
+    }
+
     /// `roots` and every group they take in through `include-groups`, each
     /// once: a group's includes before the group, `dev` in its one spelling.
-    pub fn with_includes(&self, roots: &[String]) -> Vec<String> {
+    /// Fails only on a chain nested too deep, as the manifest's read does.
+    pub fn with_includes(&self, roots: &[String]) -> Result<Vec<String>> {
         let mut order = Vec::new();
         for root in roots {
-            self.expand(root, &mut Vec::new(), &mut order)
-                .expect("cycles are refused when the manifest is read");
+            self.expand(root, &mut Vec::new(), &mut order)?;
         }
-        order
+        Ok(order)
     }
 
     /// Depth-first over `include-groups`; a group met again while still on
     /// `stack` is a cycle.
     fn expand(&self, name: &str, stack: &mut Vec<String>, order: &mut Vec<String>) -> Result<()> {
-        let name = match is_dev_group(name) {
-            true => DEV_GROUP.to_string(),
-            false => name.to_string(),
-        };
+        let name = group_key(name);
+        ensure!(
+            stack.len() < MAX_INCLUDE_DEPTH,
+            "{INCLUDE_KEY} nest more than {MAX_INCLUDE_DEPTH} groups deep at {name}"
+        );
         if stack.contains(&name) {
             stack.push(name);
             bail!("{INCLUDE_KEY} forms a cycle: {}", stack.join(" -> "));
@@ -1990,10 +2011,11 @@ e = \"*\"
             "#,
         )
         .unwrap();
-        let names = |g: &str| p.groups.iter().find(|(n, _)| n == g).unwrap().1.len();
-        assert_eq!((names("ci"), names("test"), names("docs")), (1, 1, 0));
-        let roots =
-            |r: &[&str]| p.with_includes(&r.iter().map(|g| g.to_string()).collect::<Vec<_>>());
+        let lines = |g: &str| p.groups.iter().find(|(n, _)| n == g).unwrap().1.len();
+        assert_eq!((lines("ci"), lines("test"), lines("docs")), (1, 1, 0));
+        let roots = |r: &[&str]| {
+            (p.with_includes(&r.iter().map(|g| g.to_string()).collect::<Vec<_>>())).unwrap()
+        };
         assert_eq!(roots(&["ci"]), ["dev", "test", "ci"]);
         assert_eq!(roots(&["docs", "ci"]), ["dev", "test", "docs", "ci"]);
         assert_eq!(roots(&["beta_is_no_group"]), ["beta_is_no_group"]);
@@ -2004,7 +2026,7 @@ e = \"*\"
         for (manifest, says) in [
             (
                 "[dependency-groups.ci]\ninclude-groups = [\"test\"]",
-                "there is no group test",
+                "there is no group \"test\"",
             ),
             (
                 "[dependency-groups.ci]\ninclude-groups = \"test\"",
@@ -2027,9 +2049,38 @@ e = \"*\"
             let err = format!("{:#}", parse(manifest).unwrap_err());
             assert!(err.contains(says), "{manifest}: {err}");
         }
+    }
+
+    #[test]
+    fn an_old_form_group_takes_include_groups_too() {
         let old_form =
             parse("[dependencies.ci]\ninclude-groups = [\"dev\"]\nci_tools = \"*\"").unwrap();
         assert_eq!(old_form.group_includes["ci"], ["dev"]);
+    }
+
+    #[test]
+    fn include_groups_nested_too_deep_are_refused_and_control_characters_are_escaped() {
+        let chain: String = (0..=MAX_INCLUDE_DEPTH)
+            .map(|i| {
+                format!(
+                    "[dependency-groups.g{i}]\ninclude-groups = [\"g{}\"]\n",
+                    i + 1
+                )
+            })
+            .chain([format!("[dependency-groups.g{}]\n", MAX_INCLUDE_DEPTH + 1)])
+            .collect();
+        let err = format!("{:#}", parse(&chain).unwrap_err());
+        assert!(err.contains("nest more than 64 groups deep"), "{err}");
+
+        let err = format!(
+            "{:#}",
+            parse(
+                r#"[dependency-groups.ci]
+include-groups = ["\u001b[31m"]"#
+            )
+            .unwrap_err()
+        );
+        assert!(!err.contains('\u{1b}') && err.contains(r"\u{1b}"), "{err}");
     }
 
     #[test]
