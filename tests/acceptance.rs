@@ -85,6 +85,7 @@ const FEATURE_FILES: &[&str] = &[
     "tests/features/sources/s13-first-source-wins.feature",
     "tests/features/sources/s7c-pinned-sources.feature",
     "tests/features/hooks/s12-install-hooks.feature",
+    "tests/features/viserver/properties.feature",
     "tests/features/lvpm-min-release-age/slice-1-versions-younger-than-the-limit-are-held-back.feature",
     "tests/features/lvpm-min-release-age/slice-2-report-held-back-versions-and-the-docs.feature",
     "tests/features/fork-adoption/44-bare-labview-year.feature",

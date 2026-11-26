@@ -36,3 +36,4 @@ pub mod staleness;
 pub mod sync;
 pub mod upgrade;
 pub mod venv;
+pub mod viserver;

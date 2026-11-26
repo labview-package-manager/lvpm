@@ -25,6 +25,18 @@ dumpcap -i \Device\NPF_Loopback -f "tcp port 3364" -w cap.pcapng
 No decoder script is kept in this repository: read the capture against the
 framing below.
 
+**A logging proxy, no npcap** — LabVIEW's own client is the one worth
+capturing, and it can be pointed at a proxy. Run a VI inside LabVIEW (over VI
+Server, or by hand) whose diagram does `Open Application Reference` to
+`localhost:<proxy port>` and then the operations to capture; a small TCP proxy
+on that port forwards to the real VI Server port and logs each message in both
+directions by the framing below. One catch, measured on 2026-11-26: LabVIEW's
+client claims its LAN address in the handshake, the server sees the proxy's
+loopback connection, and answers **1379** — the handshake rule below, from the
+other side. The proxy rewrites the four bytes at +28 of the first message to
+`7f 00 00 01`. This is how the Properties section and the method ids 1004 and
+1006 below were captured.
+
 The port is per LabVIEW version — read `server.tcp.port` from that install's
 `LabVIEW.ini` (2025 defaults to 3363, 2026 to 3364).
 
@@ -191,6 +203,8 @@ Cross-checked against the built-in log, which names each one
 | 1052 | `Ctrl Val.Get` | `lvcore_lvprop_vi_get_cont_valuevrnt` |
 | 1053 | `Ctrl Val.Get All` | `lvcore_lvprop_vi_get_all_cont_valuvrnt` |
 | 1080 | `FP.Open` | `lvcore_lvprop_vi_open_front_panel` |
+| 1004 | `Abort VI` | captured 2026-11-26 through a proxy; not implemented here |
+| 1006 | `Print VI To HTML` | captured 2026-11-26; parameters HTML File Path, Append, Format (enum), Image Format, Image Depth, Image Directory, in that order; LabVIEW's client sent the unwired ones as `00000010 00000000`, and the defaults (PNG, 24 bit) applied |
 
 The `lvcore_lvprop_*` tokens sit in an id-ordered table inside `LabVIEW.exe`, but
 it is **rank-ordered, not dense** — positions 143→154 span 11 tokens while ids
@@ -262,6 +276,10 @@ u32 count          type descriptors; 1 for a scalar, 2 for an array
 <value>
 u32 attributes     0 in everything observed
 ```
+
+A descriptor's length is not always even: LabVIEW's own named DBL `d out`
+(`000b 400a 00 05 "d out"`) is 11 bytes. Decode by the length field, never by
+assuming padding.
 
 Variants carry no padding of their own — any padding belongs to the enclosing
 parameter block. Observed: Dbl `40 5F 40 00…` = 125.0, I32 `00 00 00 7d`
@@ -375,26 +393,67 @@ u32 slots | u32 flags | u32 types+data length | <return types as sent>
 
 ## Properties — `*AttrVector` (1, 2, 22)
 
-The built-in log renders these only as `nAttrs=N`; the body has more:
+The built-in log renders these only as `nAttrs=N`. The whole layout below was
+captured on 2026-11-26 from LabVIEW 2026 Q3's own client (a Property Node
+reading seven `Execution` properties of a VI, and a write of `Front Panel
+Window:Open`), and every read in `viserver.rs` is pinned to it:
 
 ```
-+0   u32  refnum
-+4   u32  0x02
-+8   u32  attribute count
-+12  u32  0x01
-+16  u32  property id
-+20  ...  value / type descriptor
+request: u32 refnum            the VI's; 0 for the Application
+         u32 0x02              on a VI only - the Application has no format tag,
+                               as AppDoMethod has none
+         u32 attribute count
+         per attribute:
+           u32 flag (1 read, 0 write)
+           u32 prop id
+           u32 blk             everything after this field, padded to even
+           u32 tdsec           u32 1 | descriptor | 00 01 00 00, as a parameter block's
+           u32 1
+           <type descriptor>
+           00 01 00 00
+           [value, on a write] [00 to even]
+         u32 00000200          after the last attribute, in every request
+
+read reply:  u32 count | u32 0 | u32 0 | attributes as above, each read one
+             carrying its value after the selector
+write reply: u32 count | u32 0 | attributes as above, with no values
 ```
 
-Property ids are at `+16` (501 and 573 observed). The modification bitset used to
-decide whether a VI needs saving lives here — tokens
-`lvcore_lvprop_vi_modvi_modificat_bitset`, `..._modblockdgm_mods_bitset`,
-`..._modfp_mods_bitset`.
+**A read declares the type it wants back**, as a method's return type does
+(see "Reading values back"): LabVIEW's client sent `blk` 0 for the outputs its
+Property Node left unwired, and the reply carried nothing for them. The header
+words of a reply were seen in one form each, so `decode_vi_attr_reply` finds
+each property by its read flag and id rather than at a fixed offset.
+
+**An enum property is declared as an enum.** `Execution:State`, `Priority`,
+`Preferred Exec System` and `Reentrancy Type` declared as a plain U32 (or U16)
+answer **error 42**. An enum descriptor with no items, or with exactly the
+property's own items, is accepted; one with other items is refused with 42
+again. A Boolean property is accepted unnamed. An enum descriptor is
+
+```
+u16 len | u16 flags|code (0x15 U8, 0x16 U16, 0x17 U32 enum)
+u16 item count | pascal items | [00 to even] | 00
+[pascal name]
+```
+
+so the reserved byte a fixed-size numeric carries right after its code comes
+after an enum's items. `enum_desc` writes the one with no items:
+`0007 0017 0000 00`.
+
+Ids used: Execution:State 557, Execution:Is Reentrant 525, Execution:Allow
+Debugging 518, Execution:Priority 526, Execution:Preferred Exec System 559,
+Execution:Run When Opened 524, Execution:Suspend On Call 555, Execution:Reentrancy
+Type 648, Front Panel Window:Open 534, Application:Version Number 2. Where they
+come from is under Stability. The modification bitset used to decide whether a
+VI needs saving lives here too — tokens `lvcore_lvprop_vi_modvi_modificat_bitset`,
+`..._modblockdgm_mods_bitset`, `..._modfp_mods_bitset`.
 
 ## Errors
 
 | Code | Meaning | When it bites |
 |---:|---|---|
+| 42 | generic error | a property read declaring a type the property does not have (a plain U32 for an enum) |
 | 91 | variant type mismatch | wrong inner type in a `Ctrl Val.Set` |
 | 1026 | VI Reference is invalid | see Auto Dispose below |
 | 1031 | reference type ≠ connector pane | `LabVIEWCLI RunVI` on a VI with the wrong pane |
@@ -404,6 +463,10 @@ decide whether a VI needs saving lives here — tokens
 
 The last two arrive on the *handshake* reply, which still uses opcode 10 — so a
 client that only checks the opcode will miss them.
+
+**An error reply can carry text.** `Abort VI` on a VI that is not running
+answered 1000 with a body of `u32 length | "Method Name: <b>Abort VI</b>"` - an
+HTML fragment naming the method, worth stripping into an error message.
 
 ## Gotchas
 
@@ -432,6 +495,16 @@ large share of files on that basis, one package rewriting none of its 385.
 These are internal enum values with no compatibility promise, and the id table is
 not dense enough to derive from. Anything built on them needs re-validating per
 LabVIEW release.
+
+**The ids are the codes LabVIEW stores in its own Property and Invoke Nodes.**
+A Property Node or Invoke Node saved in a VI carries the code of each property
+and method it uses, and those codes are the wire's ids: Run VI 1003, Ctrl
+Val.Set/Get 1051/1052 and FP.Open 1080 read off saved nodes equal the ids
+above, and Execution:State 557, Is Reentrant 525, Front Panel Window:Open 534,
+Abort VI 1004 and Print VI To HTML 1006 read off saved nodes were confirmed by
+capture (2026-11-26, LabVIEW 2026 Q3; labview-mcp keeps such a table, harvested
+from VIs that use the nodes, as `vi-server-props.json`). So a release's id table
+is read from VI files that use the properties, not derived from `LabVIEW.exe`.
 
 That is why `lvpm` keeps its dependency deliberately small — the five primitives
 (hello, `GetVIRef`, `Call`, `ReleaseRef`, `ClientBye`) plus the handful of VI

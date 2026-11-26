@@ -143,6 +143,8 @@ pub fn ensure_vi_server(
 
 // Request opcodes.
 const OP_HELLO: u32 = 0;
+/// `VIAttrVector`: read or write VI properties. See [`vi_attr_read_body`].
+const OP_VI_ATTR: u32 = 2;
 const OP_GET_VI_REF: u32 = 3;
 #[allow(dead_code)] // Call By Reference: needed once we invoke our own batch VIs.
 const OP_CALL: u32 = 4;
@@ -161,6 +163,7 @@ const OP_BYE: u32 = 8;
 // Reply opcodes. Not a fixed offset from the request: most are +10, but
 // ObjAttrVector is 22->23 and Ping 32->33, so they are separate enum values.
 const RET_HELLO: u32 = 10;
+const RET_VI_ATTR: u32 = 12;
 const RET_GET_VI_REF: u32 = 13;
 #[allow(dead_code)]
 const RET_CALL: u32 = 14;
@@ -228,6 +231,19 @@ const TD_STRING: u16 = 0x30;
 const TD_ARRAY: u16 = 0x40;
 pub const TD_PATH: u16 = 0x32;
 const TD_VARIANT: u16 = 0x53;
+const TD_ENUM_U8: u16 = 0x15;
+const TD_ENUM_U16: u16 = 0x16;
+const TD_ENUM_U32: u16 = 0x17;
+
+/// Flattened size of an enum's value: its integer's.
+fn enum_size(code: u16) -> Option<usize> {
+    match code {
+        TD_ENUM_U8 => Some(1),
+        TD_ENUM_U16 => Some(2),
+        TD_ENUM_U32 => Some(4),
+        _ => None,
+    }
+}
 
 /// Flattened sizes of the fixed-size numeric family (codes 0x01..=0x0b:
 /// i8..i64, u8..u64, sgl, dbl, ext), used to skip values we do not decode.
@@ -1083,6 +1099,11 @@ impl<'a> Reader<'a> {
                     items,
                 }
             }
+            // An enum is its integer; the item names stay in the descriptor.
+            code if enum_size(code).is_some() => LvValue::Other {
+                code,
+                data: self.take(enum_size(code).unwrap())?.to_vec(),
+            },
             other => match numeric_size(other) {
                 // Recognised size: preserve the bytes so the rest of the
                 // reply stays parseable.
@@ -1094,6 +1115,165 @@ impl<'a> Reader<'a> {
                 None => bail!("control type {other:#04x} is not supported"),
             },
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Properties
+// ---------------------------------------------------------------------------
+
+/// VI property ids. They are the codes LabVIEW stores in its own Property
+/// Nodes, and the wire's ids: see the Properties section of
+/// `docs/vi-server-protocol.md`.
+const PROP_EXEC_STATE: u32 = 557;
+
+/// The word that ends every attribute vector LabVIEW's own client sent.
+const ATTR_TRAILER: u32 = 0x0000_0200;
+
+/// An enum descriptor with no item names: `len | code | u16 0 | 00`.
+///
+/// A property whose type is an enum must be read as one. Declared as a plain
+/// U32 (or U16), `Execution:State` and its kin are refused with error 42; an
+/// enum descriptor with no items, or with exactly the property's own items, is
+/// accepted, and one with other items is refused again. The reserved byte a
+/// fixed-size numeric carries after its code comes after an enum's items, the
+/// items padded to even before it.
+fn enum_desc(code: u16) -> Vec<u8> {
+    let mut td = vec![0, 0];
+    td.extend_from_slice(&code.to_be_bytes());
+    td.extend_from_slice(&0u16.to_be_bytes()); // no items: 6 bytes, even already
+    td.push(0); // the reserved byte
+    let len = td.len() as u16;
+    td[0..2].copy_from_slice(&len.to_be_bytes());
+    td
+}
+
+/// A `VIAttrVector` request that READS VI properties, as LabVIEW's own client
+/// frames it:
+///
+/// ```text
+/// u32 refnum | u32 2 | u32 count
+/// per property: u32 1 (read) | u32 id | u32 blk
+///               u32 tdsec | u32 1 | descriptor | 00 01 00 00 | [00 to even]
+/// u32 00000200
+/// ```
+///
+/// `blk` is everything after it, padded to even; `tdsec` is the count, the
+/// descriptor and the selector. A read declares the type it wants back. With
+/// `None` the property is sent with `blk` 0, as LabVIEW's client sends an
+/// unwired output, and nothing comes back for it.
+fn vi_attr_read_body(vi: VIRef, props: &[(u32, Option<Vec<u8>>)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&vi.0.to_be_bytes());
+    body.extend_from_slice(&ARGS_FORMAT.to_be_bytes());
+    body.extend_from_slice(&(props.len() as u32).to_be_bytes());
+    for (id, td) in props {
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&id.to_be_bytes());
+        match td {
+            None => body.extend_from_slice(&0u32.to_be_bytes()),
+            Some(td) => {
+                let tdsec = 4 + td.len() + SINGLE_TD.len();
+                let blk = 4 + tdsec;
+                let padded = blk + blk % 2;
+                body.extend_from_slice(&(padded as u32).to_be_bytes());
+                body.extend_from_slice(&(tdsec as u32).to_be_bytes());
+                body.extend_from_slice(&1u32.to_be_bytes());
+                body.extend_from_slice(td);
+                body.extend_from_slice(&SINGLE_TD);
+                body.resize(body.len() + (padded - blk), 0);
+            }
+        }
+    }
+    body.extend_from_slice(&ATTR_TRAILER.to_be_bytes());
+    body
+}
+
+/// The values of a `VIAttrVector` reply, in the order `ids` were asked for:
+/// `None` for one read with no declared type.
+///
+/// A read reply came back as `u32 count | 0 | 0 | properties`, each property
+/// `u32 flag | u32 id | u32 blk | [u32 tdsec | u32 count | descriptors |
+/// 00 01 | u16 root | value, padded]`. With the header seen in that one form,
+/// each property is FOUND by its read flag and id from where the last one
+/// ended, rather than at a fixed offset.
+fn decode_vi_attr_reply(body: &[u8], ids: &[u32]) -> Result<Vec<Option<LvValue>>> {
+    let mut out = Vec::with_capacity(ids.len());
+    let mut at = 4;
+    for &id in ids {
+        let start = (at..body.len().saturating_sub(11))
+            .step_by(4)
+            .find(|&q| {
+                body[q..q + 4] == 1u32.to_be_bytes() && body[q + 4..q + 8] == id.to_be_bytes()
+            })
+            .with_context(|| format!("property {id} is missing from the reply"))?;
+        let mut r = Reader::new(&body[start + 8..]);
+        let blk = r.u32()? as usize;
+        let end = start + 12 + blk;
+        ensure!(end <= body.len(), "property {id} overruns the reply");
+        if blk == 0 {
+            out.push(None);
+        } else {
+            let _tdsec = r.u32()?;
+            let count = r.u32()?;
+            ensure!(
+                (1..=MAX_TYPE_DESCS).contains(&count),
+                "property {id} has {count} type descriptors"
+            );
+            let table: Vec<TypeDesc> = (0..count).map(|_| r.type_desc()).collect::<Result<_>>()?;
+            let _tops = r.u16()?;
+            let root = r.u16()?;
+            out.push(Some(r.value(&table, root, 0)?));
+        }
+        at = end;
+    }
+    Ok(out)
+}
+
+/// A VI's `Execution:State`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecState {
+    /// The VI cannot run: a broken wire, a missing subVI.
+    Bad,
+    Idle,
+    RunTopLevel,
+    Running,
+    /// A value this table does not know.
+    Other(u32),
+}
+
+impl From<u32> for ExecState {
+    fn from(v: u32) -> Self {
+        match v {
+            0 => ExecState::Bad,
+            1 => ExecState::Idle,
+            2 => ExecState::RunTopLevel,
+            3 => ExecState::Running,
+            other => ExecState::Other(other),
+        }
+    }
+}
+
+impl std::fmt::Display for ExecState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecState::Bad => write!(f, "Bad"),
+            ExecState::Idle => write!(f, "Idle"),
+            ExecState::RunTopLevel => write!(f, "Run top level"),
+            ExecState::Running => write!(f, "Running"),
+            ExecState::Other(v) => write!(f, "{v}"),
+        }
+    }
+}
+
+/// The integer an enum or unsigned numeric value carries.
+fn unsigned_of(value: &LvValue) -> Result<u32> {
+    match value {
+        LvValue::I32(v) => Ok(*v as u32),
+        LvValue::Other { data, .. } if data.len() <= 4 => {
+            Ok(data.iter().fold(0u32, |acc, b| (acc << 8) | *b as u32))
+        }
+        other => bail!("expected an integer, got {other}"),
     }
 }
 
@@ -1152,6 +1332,9 @@ fn describe_error(code: i32) -> &'static str {
         1031 => " (connector pane does not match)",
         1032 => " (VI Server access denied)",
         1379 => " (the address claimed in the handshake is not one this machine holds)",
+        42 => {
+            " (generic error — a property read whose declared type the property does not have answers this)"
+        }
         _ => "",
     }
 }
@@ -1387,6 +1570,22 @@ impl Connection {
     /// Read one front-panel object by label. See [`CtrlValGet`].
     pub fn ctrl_val_get(&mut self, vi: VIRef, control: &str) -> Result<LvValue> {
         self.invoke(vi, &CtrlValGet { control })
+    }
+
+    /// A VI's `Execution:State`: `Bad` for a VI that cannot run. Opening a
+    /// reference succeeds for a broken VI too, so this is what tells them apart.
+    pub fn exec_state(&mut self, vi: VIRef) -> Result<ExecState> {
+        let body = vi_attr_read_body(vi, &[(PROP_EXEC_STATE, Some(enum_desc(TD_ENUM_U32)))]);
+        let reply = self
+            .request(OP_VI_ATTR, &body, RET_VI_ATTR)
+            .with_context(|| format!("reading Execution:State of {vi}"))?;
+        let values = decode_vi_attr_reply(&reply.body, &[PROP_EXEC_STATE])?;
+        let value = values
+            .into_iter()
+            .next()
+            .flatten()
+            .context("Execution:State came back with no value")?;
+        Ok(ExecState::from(unsigned_of(&value)?))
     }
 
     /// Invoke a parameterless Application-class method by raw id.
@@ -2163,5 +2362,99 @@ ray out\x00\x00\x01\x00\x01\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\x02\x00\
             .encode_args()
             .is_err()
         );
+    }
+
+    // ---- VIAttrVector (issue #78), captured 2026-11-26 from LabVIEW 2026 Q3's
+    // own client through a logging proxy, and from our reads of the same VI.
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let s: String = s.split_whitespace().collect();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// LabVIEW's client reading seven Execution properties, two of them wired.
+    const CAPTURED_ATTR_READ: &str = "7b30003c 00000002 00000007 \
+        00000001 0000022d 00000040 0000003b 00000001 003340170004034261640449646c650d52756e20746f70206c6576656c0752756e6e696e6700000a457865632e537461746500 00010000 00 \
+        00000001 0000020d 00000022 0000001e 00000001 0016402110457865632e49735265656e7472616e7400 00010000 \
+        00000001 00000206 00000000 \
+        00000001 0000020e 00000000 \
+        00000001 0000022f 00000000 \
+        00000001 0000020c 00000000 \
+        00000001 0000022b 00000000 \
+        00000200";
+
+    /// LabVIEW's answer to it: Execution:State Idle, Is Reentrant false.
+    const CAPTURED_ATTR_REPLY: &str = "000000070000000000000000000000010000022d000000440000003b00000001003340170004034261640449646c650d52756e20746f70206c6576656c0752756e6e696e6700000a457865632e537461746500000100000000000100000000010000020d000000240000001e000000010016402110457865632e49735265656e7472616e7400000100000000000000010000020600000000000000010000020e00000000000000010000022f00000000000000010000020c00000000000000010000022b0000000000000000";
+
+    #[test]
+    fn a_property_read_matches_labviews_own_client_byte_for_byte() {
+        let state = unhex(
+            "003340170004034261640449646c650d52756e20746f70206c6576656c0752756e6e696e6700000a457865632e537461746500",
+        );
+        let reentrant = unhex("0016402110457865632e49735265656e7472616e7400");
+        let body = vi_attr_read_body(
+            VIRef(0x7b30_003c),
+            &[
+                (557, Some(state)),
+                (525, Some(reentrant)),
+                (518, None),
+                (526, None),
+                (559, None),
+                (524, None),
+                (555, None),
+            ],
+        );
+        assert_eq!(body, unhex(CAPTURED_ATTR_READ));
+    }
+
+    #[test]
+    fn decodes_the_captured_property_reply() {
+        let values = decode_vi_attr_reply(
+            &unhex(CAPTURED_ATTR_REPLY),
+            &[557, 525, 518, 526, 559, 524, 555],
+        )
+        .unwrap();
+        assert_eq!(values.len(), 7);
+        let state = values[0].as_ref().expect("Execution:State was declared");
+        assert_eq!(
+            ExecState::from(unsigned_of(state).unwrap()),
+            ExecState::Idle
+        );
+        assert_eq!(values[1], Some(LvValue::Bool(false)));
+        assert!(values[2..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn an_enum_property_is_declared_with_no_items() {
+        assert_eq!(enum_desc(TD_ENUM_U32), unhex("0007 0017 0000 00"));
+        let body = vi_attr_read_body(VIRef(1), &[(PROP_EXEC_STATE, Some(enum_desc(TD_ENUM_U32)))]);
+        // blk = 4 + tdsec (15) = 19, padded to 20
+        assert_eq!(
+            body,
+            unhex(
+                "00000001 00000002 00000001 00000001 0000022d 00000014 0000000f 00000001 00070017000000 00010000 00 00000200"
+            )
+        );
+    }
+
+    #[test]
+    fn decodes_execution_state_read_with_the_label_free_enum() {
+        // our own reads of a VI that runs and of one whose subVI is gone
+        let idle = "000000010000000000000000000000010000022d000000180000000f000000010007001700000000010000000000010000000000";
+        let bad = "000000010000000000000000000000010000022d000000180000000f000000010007001700000000010000000000000000000000";
+        for (reply, want) in [(idle, ExecState::Idle), (bad, ExecState::Bad)] {
+            let values = decode_vi_attr_reply(&unhex(reply), &[PROP_EXEC_STATE]).unwrap();
+            let state = values[0].as_ref().unwrap();
+            assert_eq!(ExecState::from(unsigned_of(state).unwrap()), want);
+        }
+    }
+
+    #[test]
+    fn a_property_missing_from_the_reply_is_an_error() {
+        let err = decode_vi_attr_reply(&unhex(CAPTURED_ATTR_REPLY), &[648]).unwrap_err();
+        assert!(err.to_string().contains("property 648 is missing"), "{err}");
     }
 }
