@@ -103,6 +103,7 @@ impl Renderer {
             | Event::DependencyUnresolved { .. }
             | Event::Resolved { .. }
             | Event::NipmNotInstalled { .. }
+            | Event::GroupsNotSelected { .. }
             | Event::PackageAlreadyInstalled { .. }
             | Event::PackageNotDowngraded { .. }
             | Event::PackageReplacing { .. }

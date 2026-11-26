@@ -189,6 +189,7 @@ fn problems(
         no_dev: true,
         groups: Vec::new(),
         keep_listed: true,
+        ..Selection::default()
     };
     let mut found: Vec<String> = (plan_sync(lock, installed, &main_only).steps.iter())
         .filter_map(|step| match step {

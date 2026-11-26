@@ -451,6 +451,7 @@ delacor_lib_qmh = "7.1.2.1547"
 jki_lib_caraya = "*"
 
 [dependency-groups.ci]
+include-groups = ["dev"]          # and every package of dev too
 ni_vi_analyzer_tests = "1.2.0.3"
 oglib_error = ">=6.0"
 
@@ -464,6 +465,10 @@ vipm_package_builder = "*"
 - **Names** are letters, digits, `-` and `_`. `dev` is always `[dev-dependencies]`,
   so `[dependency-groups.dev]` (in any case) is an error naming it. An empty
   table defines a group with no packages.
+- **`include-groups`** lists groups, `dev` among them, whose packages this group
+  takes too, as an include does in PEP 735. A name the manifest does not define,
+  or a group that takes itself in (directly or through others), is refused when
+  the manifest is read.
 - **One lock.** A package named in several tables is resolved once. `lvpm.lock`
   records, per package, the groups that alone need it
   ([usage.md](usage.md#the-lock-file)).
@@ -478,6 +483,18 @@ vipm_package_builder = "*"
 | `lvpm sync --no-dev`                 | `[dependencies]` only             |
 | `lvpm sync --no-dev --group ci`      | `[dependencies]` + ci             |
 | `lvpm sync --group ci --group build` | `[dependencies]` + dev + ci + build |
+| `lvpm sync --with ci,build`          | the same: `--with` is `--group`    |
+| `lvpm sync --with ci --without dev`  | `[dependencies]` + ci; `--without dev` is `--no-dev` |
+| `lvpm sync --only build`             | build only                         |
+| `lvpm sync --only build,dev`         | build + dev                        |
+
+`--with`, `--without` and `--only` take comma-separated lists and are
+repeatable, as in lvpm 0.3. A selected group brings its `include-groups`;
+`--without` applies after that, so `--with ci --without dev` leaves out the dev
+that ci includes. `--only` leaves out `[dependencies]` and dev unless they are
+named or included, but keeps what the selected groups need from them. uv spells
+these `--group`, `--no-group` and `--only-group`. Each run names the groups it
+leaves out: `groups not selected: ci, build (--with <GROUP> adds one)`.
 
 `--group` is repeatable. `--group dev --no-dev` is refused, and a `--group`
 the manifest does not define fails before anything changes, listing the
@@ -772,7 +789,7 @@ Tracked in [roadmap.md](roadmap.md#the-manifest-and-the-lockfile):
     `cargo add`; it is not written in the manifest.
     `lvpm install` writes `=x` when given a version and a caret on the resolved
     version otherwise, as `cargo add` does.
-- **More group controls**: `include-groups`, `--only-group`, `--all-groups`, a
+- **More group controls**: `--all-groups`, a
   configurable default set (`[project] default-groups`), and groups on a global
   `lvpm install`. Groups are built ([above](#named-dependency-groups)).
 - **`[venv]` overrides**: `dir`, `vi-server-port`, `bitness`.

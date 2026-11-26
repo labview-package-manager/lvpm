@@ -99,6 +99,11 @@ pub struct SyncOptions {
     /// The dependency groups to install besides `[dependencies]` and dev, which
     /// are installed unless `no_dev`. `dev` in any case names the dev group.
     pub groups: Vec<String>,
+    /// Groups left out once `include-groups` are expanded; `dev` is `no_dev`.
+    pub without: Vec<String>,
+    /// When not empty, install these groups and what they include, and
+    /// neither `[dependencies]` nor dev unless named.
+    pub only: Vec<String>,
     /// The install flags a sync honors: a dry run, and what the relink and the
     /// hooks do. A sync takes the lock's versions, and all of them, so
     /// `allow_downgrade` and `no_deps` mean nothing to it.
@@ -106,18 +111,39 @@ pub struct SyncOptions {
 }
 
 impl SyncOptions {
-    /// What the options select, `dev` folded to its one spelling.
-    fn selection(&self) -> Selection {
-        Selection {
-            no_dev: self.no_dev,
-            groups: (self.groups.iter())
+    /// What the options select from `project`, `dev` folded to its one
+    /// spelling and `include-groups` expanded. Fails on a group `project`
+    /// does not define.
+    fn selection(&self, project: &Project) -> Result<Selection, SyncError> {
+        // `--with "a, b"` reaches here as "a" and " b".
+        let fold = |groups: &[String]| -> Vec<String> {
+            (groups.iter().map(|group| group.trim()))
+                .filter(|group| !group.is_empty())
                 .map(|group| match is_dev_group(group) {
                     true => DEV_GROUP.to_string(),
-                    false => group.clone(),
+                    false => group.to_string(),
                 })
-                .collect(),
-            keep_listed: false,
+                .collect()
+        };
+        let (with, without, only) = (fold(&self.groups), fold(&self.without), fold(&self.only));
+        refuse_unknown_groups(project, &[&with[..], &without, &only].concat())?;
+        // `--only ,` would otherwise fall back to the default selection.
+        if only.is_empty() && !self.only.is_empty() {
+            return Err(anyhow::anyhow!("--only names no group").into());
         }
+        let no_main = !only.is_empty();
+        let mut groups = project.with_includes(if no_main { &only } else { &with });
+        groups.retain(|group| !without.contains(group));
+        let dev_left_out = without.iter().any(|group| group == DEV_GROUP);
+        Ok(Selection {
+            no_dev: match no_main {
+                true => !groups.iter().any(|group| group == DEV_GROUP),
+                false => self.no_dev || dev_left_out,
+            },
+            groups,
+            no_main,
+            keep_listed: false,
+        })
     }
 }
 
@@ -129,6 +155,9 @@ pub struct Selection {
     /// The selected groups as the manifest spells them, `dev` in its one
     /// spelling. Dev is selected by `no_dev` alone: `wants` never looks it up here.
     pub groups: Vec<String>,
+    /// `--only`: `[dependencies]` is not selected, so what it needs is put on
+    /// disk only when a selected group needs it too.
+    pub no_main: bool,
     /// Keep an installed package the lock lists, wanted or not: a sync that
     /// installs only part of the lock takes nothing out but what the lock drops.
     pub keep_listed: bool,
@@ -160,7 +189,17 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
     }
     let found = locking::find_manifest(env)?;
     let (manifest_path, project) = &found;
-    refuse_unknown_groups(project, &opts.selection().groups)?;
+    let selection = opts.selection(project)?;
+    let not_selected: Vec<String> = (project.groups.iter())
+        .map(|(name, _)| name.clone())
+        .filter(|name| !selection.groups.contains(name))
+        .collect();
+    // Under `--only` the left-out groups are what was asked for, and `--with` conflicts.
+    if !not_selected.is_empty() && !selection.no_main {
+        env.sink.emit(Event::GroupsNotSelected {
+            groups: not_selected,
+        });
+    }
     env.sink.emit(Event::PhaseStarted {
         phase: Phase::Resolve,
     });
@@ -185,7 +224,6 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
         });
     }
 
-    let selection = opts.selection();
     let plan = plan_sync(&lock, &install::list_installed(&store)?, &selection);
     if first_sync {
         announce_migration(env, &plan);
@@ -476,6 +514,14 @@ pub fn plan_sync(lock: &Lockfile, installed: &[Manifest], selection: &Selection)
 
     // No source lists these, so the lock cannot hold them: what is installed
     // under such a name meets a requirement and stays.
+    let reached = selection
+        .no_main
+        .then(|| needed_by_groups(lock, &locked, selection));
+    let wants = |package: &LockedPackage| match &reached {
+        Some(reached) => reached.contains(&name_key(&package.name)),
+        None => selection.wants(package),
+    };
+
     let unresolved: HashSet<String> = lock
         .unresolved
         .iter()
@@ -488,9 +534,7 @@ pub fn plan_sync(lock: &Lockfile, installed: &[Manifest], selection: &Selection)
             let (reason, groups) = match locked.get(&name_key(&manifest.name)) {
                 None if unresolved.contains(&name_key(&manifest.name)) => return None,
                 None => (RemoveReason::NotInLock, Vec::new()),
-                Some(package) if !selection.keep_listed && !selection.wants(package) => {
-                    unselected(package)
-                }
+                Some(package) if !selection.keep_listed && !wants(package) => unselected(package),
                 Some(_) => return None,
             };
             Some(SyncStep::Remove {
@@ -503,10 +547,7 @@ pub fn plan_sync(lock: &Lockfile, installed: &[Manifest], selection: &Selection)
         .collect();
 
     let mut wanted = Vec::new();
-    let to_put_on_disk = lock
-        .packages
-        .iter()
-        .filter(|package| selection.wants(package));
+    let to_put_on_disk = lock.packages.iter().filter(|package| wants(package));
     let ordered = order_dependencies_first(
         to_put_on_disk.collect(),
         |package| name_key(&package.name),
@@ -531,10 +572,37 @@ pub fn plan_sync(lock: &Lockfile, installed: &[Manifest], selection: &Selection)
     SyncPlan { steps, wanted }
 }
 
+/// Every package, by name key, the selected groups' own lines need directly
+/// or through what they require, dev's when it is selected: what `--only`
+/// puts on disk, a package `[dependencies]` needs too among them.
+fn needed_by_groups(
+    lock: &Lockfile,
+    locked: &HashMap<String, &LockedPackage>,
+    selection: &Selection,
+) -> HashSet<String> {
+    let inputs = &lock.inputs;
+    let dev = (!selection.no_dev).then_some(&inputs.dev_dependencies);
+    let groups = (selection.groups.iter()).filter_map(|group| inputs.dependency_groups.get(group));
+    let mut pending: Vec<String> = (dev.into_iter().chain(groups))
+        .flat_map(|lines| lines.keys().map(|name| name_key(name)))
+        .collect();
+    let mut reached = HashSet::new();
+    while let Some(key) = pending.pop() {
+        if let Some(package) = locked.get(&key)
+            && reached.insert(key)
+        {
+            pending.extend(package.requires.iter().map(|name| name_key(name)));
+        }
+    }
+    reached
+}
+
 /// Why a locked package is taken out, and which groups need it, when no
 /// selected group does.
 fn unselected(package: &LockedPackage) -> (RemoveReason, Vec<String>) {
     match package.groups.as_slice() {
+        // Only `--only` leaves out what `[dependencies]` needs.
+        [] => (RemoveReason::DependenciesOnly, Vec::new()),
         [only] if only == DEV_GROUP => (RemoveReason::DevOnly, Vec::new()),
         groups => (RemoveReason::GroupsOnly, groups.to_vec()),
     }
@@ -1297,7 +1365,85 @@ mod tests {
             groups: vec!["Dev".to_string(), "ci".to_string()],
             ..SyncOptions::default()
         };
-        assert_eq!(options.selection().groups, ["dev", "ci"]);
+        let project = crate::project::parse("[dependency-groups.ci]").unwrap();
+        assert_eq!(options.selection(&project).unwrap().groups, ["dev", "ci"]);
+    }
+
+    #[test]
+    fn the_group_flags_fold_into_one_selection() {
+        let project = crate::project::parse(
+            "[dependency-groups.test]\n\
+             [dependency-groups.ci]\ninclude-groups = [\"test\"]",
+        )
+        .unwrap();
+        let list = |groups: &[&str]| groups.iter().map(|g| g.to_string()).collect::<Vec<_>>();
+        let select = |with: &[&str], without: &[&str], only: &[&str]| {
+            let options = SyncOptions {
+                groups: list(with),
+                without: list(without),
+                only: list(only),
+                ..SyncOptions::default()
+            };
+            options.selection(&project).map_err(|e| e.to_string())
+        };
+        let picked = |groups: &[&str], no_dev: bool, no_main: bool| Selection {
+            groups: list(groups),
+            no_dev,
+            no_main,
+            keep_listed: false,
+        };
+        assert_eq!(
+            select(&[" ci"], &[], &[]),
+            Ok(picked(&["test", "ci"], false, false))
+        );
+        assert_eq!(
+            select(&["ci"], &["test"], &[]),
+            Ok(picked(&["ci"], false, false))
+        );
+        assert_eq!(select(&[], &["Dev"], &[]), Ok(picked(&[], true, false)));
+        assert_eq!(
+            select(&[], &[], &["ci"]),
+            Ok(picked(&["test", "ci"], true, true))
+        );
+        assert_eq!(
+            select(&[], &[], &["ci", "DEV"]),
+            Ok(picked(&["test", "ci", "dev"], false, true))
+        );
+        for (with, without, only) in [
+            (&["nope"][..], &[][..], &[][..]),
+            (&[], &["nope"], &[]),
+            (&[], &[], &["nope"]),
+        ] {
+            let err = select(with, without, only).unwrap_err();
+            assert!(err.contains("unknown group 'nope'"), "{err}");
+        }
+        assert_eq!(
+            select(&[], &[], &[""]),
+            Err("--only names no group".to_string())
+        );
+    }
+
+    #[test]
+    fn only_removes_what_just_dependencies_need_and_keeps_what_the_group_reaches() {
+        let mut lock = with_a_ci_group();
+        lock.packages.push(locked_in("beta", "1.0", &[], &[]));
+        let line = |name: &str| (name.to_string(), "*".to_string());
+        lock.inputs.dependency_groups.insert(
+            "ci".to_string(),
+            BTreeMap::from([line("ci_tools"), line("caraya")]),
+        );
+        let here = ["alpha", "beta", "ci_tools", "caraya", "delta"].map(|n| installed(n, "1.0"));
+        let only_ci = Selection {
+            groups: vec!["ci".to_string()],
+            no_dev: true,
+            no_main: true,
+            keep_listed: false,
+        };
+        // alpha stays because ci_tools needs it; delta because caraya does.
+        assert_eq!(
+            plan_sync(&lock, &here, &only_ci).steps,
+            [remove("beta", "1.0", RemoveReason::DependenciesOnly)]
+        );
     }
 
     #[test]

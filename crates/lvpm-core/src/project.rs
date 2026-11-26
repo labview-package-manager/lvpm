@@ -23,6 +23,7 @@
 //! jki_lib_unit_test = "*"
 //!
 //! [dependency-groups.ci]            # a named group, same syntax
+//! include-groups = ["test"]         # and every package of these groups too
 //! ci_tools = "*"
 //!
 //! [nipm.dependencies]               # NI Package Manager packages, reported only
@@ -217,6 +218,9 @@ pub struct Project {
     /// `[dependency-groups.<name>]`, in file order: the same syntax as
     /// `[dependencies]`. Never `dev`, which is `[dev-dependencies]`.
     pub groups: Vec<(String, Vec<(String, Constraint)>)>,
+    /// Each group's `include-groups`: the groups, `dev` among them, whose
+    /// packages it takes too. A group without the key is not listed.
+    pub group_includes: BTreeMap<String, Vec<String>>,
     /// The `github = "owner/repo"` of every dependency that has one, in any
     /// table, by the name the line is written under.
     pub github: BTreeMap<String, String>,
@@ -262,6 +266,7 @@ impl Default for Project {
             dependencies: Vec::new(),
             dev_dependencies: Vec::new(),
             groups: Vec::new(),
+            group_includes: BTreeMap::new(),
             github: BTreeMap::new(),
             source_pins: BTreeMap::new(),
             hooks_allowed: BTreeSet::new(),
@@ -536,7 +541,9 @@ pub(crate) fn parse(text: &str) -> Result<Project> {
     let mut stated = Stated::default();
     p.dependencies = parse_dependencies("dependencies", f.dependencies, &mut stated)?;
     p.dev_dependencies = parse_dependencies("dev-dependencies", f.dev_dependencies, &mut stated)?;
+    p.group_includes = take_includes(&mut f.dependency_groups)?;
     p.groups = parse_groups(f.dependency_groups, &mut stated)?;
+    check_includes(&p)?;
     check_source_pins(&p.sources, &stated.index)?;
     p.github = (stated.github.into_iter())
         .map(|(name, (repo, _))| (name, repo))
@@ -726,6 +733,85 @@ fn move_old_form_groups(f: &mut File) -> Result<Vec<String>> {
         }
     }
     Ok(old_form_names)
+}
+
+/// The key a group names the groups it takes in with.
+const INCLUDE_KEY: &str = "include-groups";
+
+/// Take each group's `include-groups` out of its table, before its lines are
+/// read as packages.
+fn take_includes(groups: &mut toml::Table) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut includes = BTreeMap::new();
+    for (name, value) in groups.iter_mut() {
+        let Some(list) = value.as_table_mut().and_then(|t| t.remove(INCLUDE_KEY)) else {
+            continue;
+        };
+        let names = (list.as_array()).and_then(|items| {
+            items
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect()
+        });
+        let Some(names) = names else {
+            bail!(
+                "[dependency-groups.{name}] {INCLUDE_KEY}: must be a list of group names, \
+                 for example {INCLUDE_KEY} = [\"test\"]"
+            );
+        };
+        includes.insert(name.clone(), names);
+    }
+    Ok(includes)
+}
+
+/// Every `include-groups` names a group the manifest defines, or dev, and no
+/// group takes itself in, directly or through others.
+fn check_includes(p: &Project) -> Result<()> {
+    for (name, included) in &p.group_includes {
+        for other in included {
+            ensure!(
+                is_dev_group(other) || p.groups.iter().any(|(g, _)| g == other),
+                "[dependency-groups.{name}] {INCLUDE_KEY}: there is no group {other}"
+            );
+        }
+        p.expand(name, &mut Vec::new(), &mut Vec::new())?;
+    }
+    Ok(())
+}
+
+impl Project {
+    /// `roots` and every group they take in through `include-groups`, each
+    /// once: a group's includes before the group, `dev` in its one spelling.
+    pub fn with_includes(&self, roots: &[String]) -> Vec<String> {
+        let mut order = Vec::new();
+        for root in roots {
+            self.expand(root, &mut Vec::new(), &mut order)
+                .expect("cycles are refused when the manifest is read");
+        }
+        order
+    }
+
+    /// Depth-first over `include-groups`; a group met again while still on
+    /// `stack` is a cycle.
+    fn expand(&self, name: &str, stack: &mut Vec<String>, order: &mut Vec<String>) -> Result<()> {
+        let name = match is_dev_group(name) {
+            true => DEV_GROUP.to_string(),
+            false => name.to_string(),
+        };
+        if stack.contains(&name) {
+            stack.push(name);
+            bail!("{INCLUDE_KEY} forms a cycle: {}", stack.join(" -> "));
+        }
+        if order.contains(&name) {
+            return Ok(());
+        }
+        stack.push(name.clone());
+        for included in self.group_includes.get(&name).into_iter().flatten() {
+            self.expand(included, stack, order)?;
+        }
+        stack.pop();
+        order.push(name);
+        Ok(())
+    }
 }
 
 /// `[dependency-groups]`: each key a group name, each value that group's
@@ -1887,6 +1973,63 @@ e = \"*\"
             parse("[dependency-groups.devs]\n").is_ok(),
             "only dev itself"
         );
+    }
+
+    #[test]
+    fn include_groups_expand_depth_first_each_group_once() {
+        let p = parse(
+            r#"
+            [dependency-groups.ci]
+            include-groups = ["test", "Dev"]
+            ci_tools = "*"
+            [dependency-groups.test]
+            include-groups = ["dev"]
+            beta = "*"
+            [dependency-groups.docs]
+            include-groups = ["test"]
+            "#,
+        )
+        .unwrap();
+        let names = |g: &str| p.groups.iter().find(|(n, _)| n == g).unwrap().1.len();
+        assert_eq!((names("ci"), names("test"), names("docs")), (1, 1, 0));
+        let roots =
+            |r: &[&str]| p.with_includes(&r.iter().map(|g| g.to_string()).collect::<Vec<_>>());
+        assert_eq!(roots(&["ci"]), ["dev", "test", "ci"]);
+        assert_eq!(roots(&["docs", "ci"]), ["dev", "test", "docs", "ci"]);
+        assert_eq!(roots(&["beta_is_no_group"]), ["beta_is_no_group"]);
+    }
+
+    #[test]
+    fn a_wrong_include_groups_is_refused_when_read() {
+        for (manifest, says) in [
+            (
+                "[dependency-groups.ci]\ninclude-groups = [\"test\"]",
+                "there is no group test",
+            ),
+            (
+                "[dependency-groups.ci]\ninclude-groups = \"test\"",
+                "must be a list of group names",
+            ),
+            (
+                "[dependency-groups.ci]\ninclude-groups = [1]",
+                "must be a list of group names",
+            ),
+            (
+                "[dependency-groups.ci]\ninclude-groups = [\"ci\"]",
+                "a cycle: ci -> ci",
+            ),
+            (
+                "[dependency-groups.a]\ninclude-groups = [\"b\"]\n\
+                 [dependency-groups.b]\ninclude-groups = [\"a\"]",
+                "a cycle: a -> b -> a",
+            ),
+        ] {
+            let err = format!("{:#}", parse(manifest).unwrap_err());
+            assert!(err.contains(says), "{manifest}: {err}");
+        }
+        let old_form =
+            parse("[dependencies.ci]\ninclude-groups = [\"dev\"]\nci_tools = \"*\"").unwrap();
+        assert_eq!(old_form.group_includes["ci"], ["dev"]);
     }
 
     #[test]
