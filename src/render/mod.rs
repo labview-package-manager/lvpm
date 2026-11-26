@@ -76,7 +76,11 @@ impl Renderer {
             | Event::LinkfixPlanned { .. }
             | Event::LinkfixFailed { .. }
             | Event::LinkfixReportWritten { .. }
-            | Event::LinkfixDone { .. } => linkfix::render(self, event),
+            | Event::LinkfixDone { .. }
+            | Event::LoadCheckStarting { .. }
+            | Event::LoadCheckBroken { .. }
+            | Event::LoadCheckDone { .. }
+            | Event::LoadCheckIncomplete { .. } => linkfix::render(self, event),
             Event::RelinkDoneNotClearable { .. }
             | Event::RelinkProgress { .. }
             | Event::RelinkProgressUnreadable { .. }

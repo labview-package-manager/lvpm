@@ -840,6 +840,39 @@ Call Library node whose library VI Package Builder pinned to one bitness
 a venv knows and a `--tree` takes as `--bitness <32|64>`. See [linkfix](linkfix.md) for what each
 method changes.
 
+### The load check
+
+Linkfix marks each VI source-only: it sets the flag and drops the compiled
+code it carried. On some VIs saved in an older LabVIEW, the venv's LabVIEW
+then loads that VI broken, though the same file loads fine before linkfix
+and fine when it is resaved first. This is
+[issue #77](https://github.com/labview-package-manager/lvpm/issues/77), not
+yet fixed. It was seen with `ni_lib_rt_management` (LabVIEW 13.0 files) in a
+venv of 20 packages. The same package alone in a fresh venv loads clean, so
+the trigger also depends on what else is installed.
+
+So after linkfix, a venv install opens the VIs linkfix made source-only, once,
+in a LabVIEW it starts fresh on the venv. It reads whether each VI can run,
+closes it, and saves nothing. A package with broken VIs gets one warning:
+
+```console
+load check: opening the 101 VIs linkfix made source-only in the venv's LabVIEW (nothing is saved)
+warning: 26 of ni_lib_rt_management's 101 source-only VIs are broken in the venv's LabVIEW (first: Delete directory.vi). Reinstall it with a resave: `lvpm uninstall ni_lib_rt_management`, then `lvpm install ni_lib_rt_management --resave`. If they are still broken after that, the package itself is broken. See https://github.com/labview-package-manager/lvpm/issues/77.
+load check: 101 VIs, 1 package(s) with broken VIs (see the warnings)
+```
+
+- It runs only for a venv install that linkfix changed VIs in. `--no-linkfix`,
+  `--relink`, `--dry-run`, `--global` and `--prefix` installs have no check.
+- It costs one LabVIEW start per run, headless where LabVIEW runs headless.
+- The warning does not fail the install: the exit code stays 0.
+- A broken VI that a resave does not fix is broken in the package itself, for
+  example a missing add-on it needs. lvpm cannot fix that.
+- If LabVIEW does not start, or the check stops part way, a warning says the
+  check did not finish. That is not a clean result.
+- Scripts read the results from `--json`: `load_check_broken` per package,
+  `load_check_done` with the totals, `load_check_incomplete` when it did not
+  finish.
+
 ### Uninstalling
 
 This is the direct uninstall, which outside a project is `lvpm uninstall <name>`

@@ -46,6 +46,46 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
             r.line(Stream::Out, &format!("report: {}", path.display()))
         }
         Event::LinkfixDone { report } => done(r, report),
+        Event::LoadCheckStarting { files } => r.line(
+            Stream::Out,
+            &format!(
+                "\nload check: opening the {files} VIs linkfix made source-only in the venv's \
+                 LabVIEW (nothing is saved)"
+            ),
+        ),
+        Event::LoadCheckBroken {
+            package,
+            broken,
+            checked,
+        } => {
+            let first = broken[0].file_name().unwrap_or_default().to_string_lossy();
+            r.line(
+                Stream::Err,
+                &format!(
+                    "warning: {} of {package}'s {checked} source-only VIs are broken in the \
+                     venv's LabVIEW (first: {first}). Reinstall it with a resave: \
+                     `lvpm uninstall {package}`, then `lvpm install {package} --resave`. If \
+                     they are still broken after that, the package itself is broken. See \
+                     https://github.com/labview-package-manager/lvpm/issues/77.",
+                    broken.len()
+                ),
+            );
+        }
+        Event::LoadCheckDone { checked, broken } => r.line(
+            Stream::Out,
+            &match broken {
+                0 => format!("load check: {checked} VIs, none broken"),
+                n => format!("load check: {checked} VIs, {n} package(s) with broken VIs (see the warnings)"),
+            },
+        ),
+        Event::LoadCheckIncomplete { error } => r.line(
+            Stream::Err,
+            &format!(
+                "warning: the load check did not finish ({error}), so a VI linkfix left broken \
+                 may have gone unseen. The install stands. To check by hand, run lvpm launch \
+                 and open the packages' VIs."
+            ),
+        ),
         _ => unreachable!("routed here by Renderer::render: {event:?}"),
     }
 }
@@ -124,6 +164,27 @@ mod tests {
     use super::*;
     use lvpm_core::linkfix::Changes;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_package_with_broken_vis_is_one_warning_naming_the_resave() {
+        let (mut renderer, _out, err) = renderer();
+        renderer.render(&Event::LoadCheckBroken {
+            package: "ni_lib_rt_management".into(),
+            broken: vec![PathBuf::from("x").join("Delete directory.vi")],
+            checked: 117,
+        });
+        let err = err.text();
+        assert!(
+            err.starts_with("warning: 1 of ni_lib_rt_management's 117 source-only VIs are broken"),
+            "{err}"
+        );
+        assert!(err.contains("(first: Delete directory.vi)"), "{err}");
+        assert!(
+            err.contains("`lvpm install ni_lib_rt_management --resave`"),
+            "{err}"
+        );
+        assert!(err.contains("the package itself is broken"), "{err}");
+    }
 
     #[test]
     fn a_quiet_report_gives_totals_names_unseparated_files_and_points_at_verbose() {

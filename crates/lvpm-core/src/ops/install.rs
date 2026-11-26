@@ -906,7 +906,8 @@ pub fn finish(
     opts: &InstallOptions,
 ) -> Result<()> {
     session.close_hook_connection();
-    linkfix::after_install(env, session, applied, opts);
+    let separated = linkfix::after_install(env, session, applied, opts);
+    super::load_check::after_linkfix(env, session, &separated);
     relink_pass(env, session, applied, opts)?;
     post_install_hooks(env, session, opts);
     refresh_palettes(env, session, applied)?;

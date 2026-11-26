@@ -64,6 +64,18 @@ any LabVIEW from 2020 on can load it.
 - `lvpm relink <name>` / `lvpm relink --all` reruns the pass from the
   install manifests, without reinstalling.
 
+## The load check
+
+After linkfix, a venv install checks the VIs it made source-only (see
+[the load check](usage.md#the-load-check) and issue #77). A second helper VI,
+`check-broken.vi`, is embedded the same way as the relink VI and saved for
+LabVIEW 2020. lvpm writes the paths, one per line, into its `Files to check`
+control, runs it, and polls its `Done` indicator. The VI opens a reference to
+each path, reads `Execution.State`, and closes the reference. It never runs,
+saves or shows a checked VI. Its `Broken` indicator lists the paths that are
+not executable or did not open. A path whose VI name is already in memory from
+another location fails to open, so it is listed as broken.
+
 ## Hooks
 
 A hook is a VI a package ships. lvpm runs it inside your LabVIEW, with your

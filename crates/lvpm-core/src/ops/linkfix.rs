@@ -89,30 +89,34 @@ pub fn linkfix(env: &OpEnv, opts: &LinkfixOptions) -> Result<()> {
 /// The install's linkfix pass, over every LabVIEW-tree file it wrote, after
 /// the last package is on disk and before the PostInstall hooks. `--relink`
 /// takes LabVIEW's load-and-save pass instead. A failure is reported, not
-/// fatal: the files are installed as copied.
+/// fatal: the files are installed as copied. The files it made source-only.
 pub(super) fn after_install(
     env: &OpEnv,
     session: &InstallSession,
     applied: &Applied,
     opts: &InstallOptions,
-) {
+) -> Vec<PathBuf> {
     let files = &session.linkfix_files;
     if files.is_empty() {
-        return;
+        return Vec::new();
     }
     let skipped = |reason| Event::PhaseSkipped {
         phase: Phase::Linkfix,
         reason,
         skipped: files.len(),
     };
+    let emit = |event| {
+        env.sink.emit(event);
+        Vec::new()
+    };
     if opts.no_linkfix {
-        return env.sink.emit(skipped(SkipReason::Declined));
+        return emit(skipped(SkipReason::Declined));
     }
     if opts.force_relink {
-        return env.sink.emit(skipped(SkipReason::RelinkInstead));
+        return emit(skipped(SkipReason::RelinkInstead));
     }
     if applied.dry_run {
-        return env.sink.emit(Event::LinkfixPlanned { files: files.len() });
+        return emit(Event::LinkfixPlanned { files: files.len() });
     }
     env.sink.emit(Event::PhaseStarted {
         phase: Phase::Linkfix,
@@ -126,10 +130,17 @@ pub(super) fn after_install(
         let bitness = session.target().map(|t| t.bitness);
         linkfix::fix_files(&roots, files, false, Methods::of(&Method::ALL, bitness))
     }) {
-        Ok((_, outcomes)) => env.sink.emit(Event::LinkfixDone {
-            report: report(&outcomes, false, true),
-        }),
-        Err(error) => env.sink.emit(Event::LinkfixFailed {
+        Ok((_, outcomes)) => {
+            env.sink.emit(Event::LinkfixDone {
+                report: report(&outcomes, false, true),
+            });
+            outcomes
+                .into_iter()
+                .filter(|o| o.result.as_ref().is_ok_and(|c| c.separated > 0))
+                .map(|o| o.path)
+                .collect()
+        }
+        Err(error) => emit(Event::LinkfixFailed {
             error: format!("{error:#}"),
         }),
     }
