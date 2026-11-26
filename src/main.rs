@@ -2160,9 +2160,9 @@ mod tests {
     }
 
     #[test]
-    fn resave_is_asked_for_by_flag_on_install_sync_and_add() {
+    fn resave_is_asked_for_by_flag_on_install_sync_add_and_uninstall() {
         let resave = |args: &[&str]| match Cli::try_parse_from(args).unwrap().cmd {
-            Cmd::Install { apply, .. } | Cmd::Sync { apply, .. } | Cmd::Add { apply, .. } => {
+            Cmd::Install { apply, .. } | Cmd::Sync { apply, .. } | Cmd::Uninstall { apply, .. } => {
                 apply.options(false, false).resave
             }
             _ => unreachable!(),
@@ -2173,6 +2173,8 @@ mod tests {
         assert!(!resave(&["lvpm", "install", "x"]));
         assert!(!resave(&["lvpm", "sync"]));
         assert!(!resave(&["lvpm", "add", "x"]));
+        assert!(resave(&["lvpm", "uninstall", "x", "--resave"]));
+        assert!(!resave(&["lvpm", "uninstall", "x"]));
     }
 
     #[test]
