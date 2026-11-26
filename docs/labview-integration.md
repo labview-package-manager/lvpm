@@ -194,8 +194,9 @@ process.
 
 For diagnosis the primitives are exposed directly:
 
-- `lvpm vi-probe <VI>` opens a reference and releases it, proving the
-  transport.
+- `lvpm vi-probe <VI>` opens a reference, prints its `Execution:State` and
+  releases it, proving the transport. A VI that opens but cannot run (a
+  missing subVI after a relink) prints `state Bad`.
 - `lvpm vi-run <VI> --set name=type:value --get name` sets controls, runs,
   and reads values back (types `bool|i32|dbl|str`, plus `type[]:` arrays).
 - `lvpm vi-save <VI>` loads and saves one VI, the relink primitive.

@@ -424,8 +424,9 @@ enum Cmd {
         #[arg(value_name = "ID", required = true)]
         ids: Vec<String>,
     },
-    /// Open a VI reference over VI Server and release it. Proves the transport
-    /// against a running LabVIEW without changing anything on disk.
+    /// Open a VI reference over VI Server, report its Execution:State and release
+    /// it. Proves the transport against a running LabVIEW without changing
+    /// anything on disk; a VI that opens but cannot run reports `state Bad`.
     ViProbe {
         /// VIs to open references to. Several are opened one after another
         /// on one connection and held until the last one is in, so a shared
@@ -1707,14 +1708,22 @@ fn cmd_vi_probe(env: &OpEnv, vis: &[PathBuf], timeout: u64) -> Result<()> {
     // Every reference stays open until the last VI is in: a hierarchy the
     // VIs share is then loaded once instead of once per VI.
     let mut held = Vec::new();
-    let mut failed = 0usize;
+    let (mut failed, mut broken) = (0usize, 0usize);
     for vi in vis {
         let name = vi.file_name().unwrap_or_default().to_string_lossy();
         let t0 = std::time::Instant::now();
         let ms = || t0.elapsed().as_secs_f64() * 1000.0;
         match conn.open_vi_reference(vi) {
             Ok(vi_ref) => {
-                println!("  opened {name} -> {vi_ref}  {:>7.0} ms", ms());
+                // A broken VI opens too: its Execution:State says which it is.
+                let state = match conn.exec_state(vi_ref) {
+                    Ok(state) => {
+                        broken += usize::from(state == viserver::ExecState::Bad);
+                        format!("state {state}")
+                    }
+                    Err(e) => format!("state unknown ({e:#})"),
+                };
+                println!("  opened {name} -> {vi_ref}  {:>7.0} ms  {state}", ms());
                 held.push(vi_ref);
             }
             Err(e) => {
@@ -1737,6 +1746,12 @@ fn cmd_vi_probe(env: &OpEnv, vis: &[PathBuf], timeout: u64) -> Result<()> {
         "  released + closed       {:>7.0} ms total",
         started.elapsed().as_secs_f64() * 1000.0
     );
+    if broken > 0 {
+        println!(
+            "  {broken} of {} VIs are broken (Execution:State Bad)",
+            vis.len()
+        );
+    }
     ensure!(failed == 0, "{failed} of {} VIs did not open", vis.len());
     Ok(())
 }
