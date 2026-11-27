@@ -2,7 +2,7 @@
 
 **Created**: 2026-11-26
 **Branch**: slice/55-sync-asks (from integration/fork 60923a4)
-**Status**: approved
+**Status**: implemented
 **Gherkin persistence**: plan-file-only
 <!-- As in #54: /build writes tests/features/fork-adoption/55-sync-asks.feature
      as the first, failing test of Slice 2 and adds it to FEATURE_FILES in
