@@ -287,7 +287,6 @@ fn goes_ahead(
         Answer::Asked(false) => {
             env.sink.emit(Event::SyncDeclined {
                 removing: package_refs(removals),
-                destination: env.destination_flags_as_typed(),
             });
             Ok(false)
         }
@@ -2978,13 +2977,11 @@ beta = \"*\"
         outcome.unwrap();
         assert_eq!(project.lock_bytes(), None, "a lock was written");
         assert_eq!(project.installed(), installed);
-        // The destination is the flags the test's env was given, as typed.
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                Event::SyncDeclined { removing, destination }
+                Event::SyncDeclined { removing }
                     if removing == &[PackageRef { name: "gamma".into(), version: "1.0".into() }]
-                        && destination.as_deref().is_some_and(|flags| flags.starts_with("--prefix "))
             )),
             "{events:?}"
         );

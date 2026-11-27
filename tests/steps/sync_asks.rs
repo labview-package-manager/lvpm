@@ -11,15 +11,9 @@ use crate::CliWorld;
 use crate::support::fixtures::{FixturePackage, SYNC_ASKS_PACKAGES};
 use crate::support::project::MANIFEST_FILE;
 use cucumber::{given, then, when};
+use lvpm_core::manifest_edit::{self, DependencyTable};
 
 const STDIN_TERMINAL: &str = "LVPM_TEST_STDIN_TERMINAL";
-
-fn package(name: &str, version: &str) -> &'static FixturePackage {
-    SYNC_ASKS_PACKAGES
-        .iter()
-        .find(|package| package.name == name && package.version == version)
-        .unwrap_or_else(|| panic!("{name} {version} is not a fixture of this feature"))
-}
 
 // ---- the project ----
 
@@ -39,15 +33,27 @@ async fn the_project_has_no_lock(world: &mut CliWorld) {
     assert!(world.lock_bytes().is_none(), "a lock exists");
 }
 
-/// Locked while alpha 2.0 was not on offer, so the lock holds alpha 1.0 only.
-#[given(regex = r#"^the project has an lvpm\.lock locking only "([^"]+)" (\S+)$"#)]
-async fn the_project_has_a_lock_of_one(world: &mut CliWorld, name: String, version: String) {
-    let newer = package("alpha", "2.0");
-    world.sandbox.remove_local_package(newer);
+/// Locked while the manifest also listed `name`, which it no longer does: the
+/// lock is outdated, so a sync that goes ahead rewrites it.
+#[given(regex = r#"^the project has an lvpm\.lock made when it also depended on "([^"]+)"$"#)]
+async fn the_project_has_an_outdated_lock(world: &mut CliWorld, name: String) {
+    world.depend(DependencyTable::Dependencies, &name, ">=1.0");
     world.lock_the_project();
-    world.sandbox.put_local_package(newer);
-    let locked = world.locked_versions();
-    assert_eq!(locked, [(name, version)], "what lvpm.lock holds");
+    manifest_edit::remove_file(
+        &world.sandbox.work_dir().join(MANIFEST_FILE),
+        &DependencyTable::Dependencies,
+        &name,
+    )
+    .expect("take the dependency out of the manifest");
+    let locked: Vec<String> = world
+        .locked_versions()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        locked.contains(&name),
+        "{name} is not in lvpm.lock: {locked:?}"
+    );
 }
 
 // ---- what dest holds ----

@@ -54,7 +54,7 @@ How Python's uv does it, for comparison: `uv sync` never asks. It removes extran
 ## Stances I took (not the user's decisions; open at the gate)
 
 - **Which removals ask: `NotInLock` only.** `DevOnly` (`--no-dev`) and `GroupsOnly` (group selection) follow from flags the user just typed, so they do not ask. A scenario pins that `--no-dev` removes without asking.
-- **"n" exits 0.** It prints `sync cancelled: nothing was changed` and a `next:` hint (`add it to lvpm.toml with lvpm add extra, or run lvpm sync --prefix dest --yes`; unquoted, so a quoted path does not nest quotes). The hint repeats the flags the user typed. With more than one package it drops the `add` half and says `add them to lvpm.toml`. The `--global` refusal names the same two ways out. This matches `venv remove`. A script never sees the question, because without a terminal there is none, so `lvpm sync && build` is not at risk.
+- **"n" exits 0.** It prints `sync cancelled: nothing was changed` and a `next:` hint (`add it to lvpm.toml with lvpm add extra, or run lvpm sync --prefix dest --yes`; unquoted, so a quoted path does not nest quotes). The hint repeats the command as typed (program name replaced by `lvpm`, each argument quoted as `shell_word` does) plus `--yes`, so `--group docs` or `--frozen` is not lost; the front end builds it from the process arguments, since core cannot see them. With more than one package it drops the `add` half and says `add them to lvpm.toml`. The `--global` refusal names the same two ways out. This matches `venv remove`. A script never sees the question, because without a terminal there is none, so `lvpm sync && build` is not at risk.
 - **The question** is `remove 2 packages (extra 1.0, zeta 0.3)? [y/N] ` on stderr. It names at most 5 packages and then `and N more`. For `--global` it names the LabVIEW target: `remove 1 package from LabVIEW 2026 (64-bit) (extra 1.0)? [y/N] `. The full plan (including any `--no-dev` removals and replacements, which "y" also runs) ends on the line just above the question, and "n" cancels all of it.
 - **The plan is printed once,** before the question, and not again after "y". On a sync that will ask, the `SyncMigration` note ("removing ...") is skipped, since the question says it. Where nothing asks (add/remove's commit, `--yes`, no terminal), the note stays.
 - **Core takes no input.** `ops::sync::sync_asking(env, opts, ask)` takes a front-end callback, as `uninstall`'s `Dependencies::Ask` does. `sync(env, opts)` stays and passes "always yes", so its callers do not change.
@@ -72,8 +72,8 @@ How Python's uv does it, for comparison: `uv sync` never asks. It removes extran
 - [ ] Without `--global`, a sync with no terminal or under `--json` (venv, prefix, headless LabVIEW) goes ahead without asking. Tested by acceptance (prefix) and a `sync_ask` unit test (venv, headless).
 - [ ] With no terminal or under `--json`, a `--global` sync without `--yes` that would remove a `NotInLock` package fails before any write or fetch (a core test checks neither happened). The error names the packages, the target as lvpm prints it (e.g. `LabVIEW 2026 (64-bit)`) and `--yes`. A `--global` sync with nothing to remove is not refused.
 - [ ] `LVPM_YES` follows docs/usage.md: `0`, `false`, `no`, `off` and empty are off; any other value is on.
-- [ ] The plan line comes before the question (core event-order test, and the acceptance output order).
-- [ ] The decline prints `next:` with `lvpm add` and the user's own flags plus `--yes`; one acceptance row asserts the `next:` line.
+- [ ] The plan line comes before the question (core event-order test only: the acceptance harness captures stdout and stderr separately, so it cannot see their order).
+- [ ] The decline prints `next:` with `lvpm add` and the command as the user typed it plus `--yes` (a `--no-dev` scenario and a unit test with `--group docs` and `--frozen` assert it); one acceptance row asserts the `next:` line.
 - [ ] `--dry-run` lists the removals, asks nothing, changes nothing, and is never refused.
 - [ ] Named `install`, `uninstall`, `add` and `remove` never ask, and do what they did before. The baseline outcomes are observed on today's build before Slice 2 and recorded in the plan; until then those rows are provisional.
 - [ ] A fetch failure after "y" leaves lvpm.lock as it was: an outdated lock byte-for-byte, a missing lock still missing.
@@ -387,11 +387,11 @@ by the Slice 1 callback-`Err` scenario and the Step 2.1/2.2 unit tests.
 
 **TEST**:
 - Write 55-sync-asks.feature first and see it fail.
-- Add the steps "in a terminal" (sets `LVPM_TEST_STDIN_TERMINAL`, and leaves `LVPM_TEST_TERMINAL` unset so the update notice stays off), "in a terminal with stdin closed", "with no terminal", "LVPM_YES is set to" and "the project has an lvpm.lock locking only".
+- Add the steps "in a terminal" (sets `LVPM_TEST_STDIN_TERMINAL`, and leaves `LVPM_TEST_TERMINAL` unset so the update notice stays off), "in a terminal with stdin closed", "with no terminal", "LVPM_YES is set to" and "the project has an lvpm.lock made when it also depended on" (an outdated lock, so that "n" has a rewrite to refuse).
 - Reuse `it asked`/`it did not ask`.
 - Add the file to FEATURE_FILES. Then make it pass.
 - The ask logic is a named function, `sync_ask(decision, target, input, output) -> impl Fn(&[SyncStep]) -> Result<Answer>`, taking the reader and writer as `confirm_dependencies` does. Its Ask path is tested with a fake reader, so it can be tested outside `cmd_sync`. Unit tests: `global=true` with no terminal, and `global=true` under `--json`. Each returns an `Err` containing "extra 1.0", the target and "--yes".
-- The refusal rendered through `render::sync::error` and `headless_error` matches the Step 2.3 golden.
+- The `--global` refusal is pinned by unit tests through main's error printer (`error_line`), plain and under `--json`, not by a golden: a golden needs a real LabVIEW.
 - A unit test that dry-run with `global=true` and no terminal is not refused.
 - A unit test of the options-to-`global` mapping: `--prefix` false, a venv false, headless without `--global` false, `--global` true.
 - The `LVPM_YES is set to` step treats an empty cell as unset, and every scenario starts with `LVPM_YES` cleared.
@@ -404,7 +404,7 @@ by the Slice 1 callback-`Err` scenario and the Step 2.1/2.2 unit tests.
 **Complexity**: standard
 **IMPLEMENT**:
 - Update tests that expect a removal "without a question", e.g. `an_extra_package_is_announced_and_then_removed_without_a_question` in sync.rs.
-- Add a golden for the decline output and one for the `--global` refusal.
+- Add a golden for the decline output. The `--global` refusal has none: it is pinned by unit tests through main's error printer, because a golden needs a real LabVIEW.
 - `tests/venv.rs` runs with no terminal: it must have no diff and pass.
 **TEST**: `cargo test --workspace` green; `git diff --stat tests/venv.rs` is empty.
 **REFACTOR**: Rename the tests whose names now lie.

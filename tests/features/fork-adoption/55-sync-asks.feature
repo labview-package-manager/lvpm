@@ -29,15 +29,23 @@ Feature: sync asks before it removes packages
     When I run "lvpm sync --prefix dest" in a terminal and answer "n"
     Then stdout, stderr and the exit code equal the recording "sync-declined"
 
+  Scenario: the next step is the command as typed, with --yes
+    Given dest has "alpha" 1.0 and "extra" 1.0 installed
+    When I run "lvpm sync --prefix dest --no-dev" in a terminal and answer "n"
+    Then the output says "next: add it to lvpm.toml with lvpm add extra, or run lvpm sync --prefix dest --no-dev --yes"
+
   Scenario: a closed stdin is "no"
     Given dest has "alpha" 1.0 and "extra" 1.0 installed
     When I run "lvpm sync --prefix dest" in a terminal with stdin closed
     Then it asked "[y/N]"
+    And the command succeeds
+    And the output says "sync cancelled: nothing was changed"
+    And the project has no lvpm.lock
     And dest's lvpm-installed packages are exactly "alpha" 1.0 and "extra" 1.0
 
-  Scenario: "n" leaves an existing lvpm.lock byte-for-byte
+  Scenario: "n" leaves an outdated lvpm.lock byte-for-byte
     Given dest has "alpha" 1.0 and "extra" 1.0 installed
-    And the project has an lvpm.lock locking only "alpha" 1.0
+    And the project has an lvpm.lock made when it also depended on "extra"
     When I run "lvpm sync --prefix dest" in a terminal and answer "n"
     Then the project's lvpm.lock is unchanged
     And dest's lvpm-installed packages are exactly "alpha" 1.0 and "extra" 1.0
@@ -95,7 +103,8 @@ Feature: sync asks before it removes packages
   Scenario: a bare install asks the same way
     Given dest has "alpha" 1.0 and "extra" 1.0 installed
     When I run "lvpm install --prefix dest" in a terminal and answer "n"
-    Then it asked "[y/N]"
+    Then it asked "remove 1 package (extra 1.0)? [y/N]"
+    And the output says "next: add it to lvpm.toml with lvpm add extra, or run lvpm install --prefix dest --yes"
     And dest's lvpm-installed packages are exactly "alpha" 1.0 and "extra" 1.0
 
   Scenario: with no terminal, a prefix goes ahead

@@ -37,10 +37,10 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 r.line(Stream::Out, "dry run: nothing changed");
             }
         }
-        Event::SyncDeclined {
-            removing,
-            destination,
-        } => r.line(Stream::Out, &declined(removing, destination.as_deref())),
+        Event::SyncDeclined { removing } => {
+            let text = declined(removing, &r.rerun);
+            r.line(Stream::Out, &text);
+        }
         Event::SyncNothingToDo => r.line(
             Stream::Out,
             "nothing to do: the destination already matches lvpm.lock",
@@ -78,13 +78,9 @@ fn migration(removing: &[PackageRef]) -> String {
     )
 }
 
-/// What the user said no to, and the two ways on: the manifest, or `--yes` with
-/// the destination flags they typed.
-fn declined(removing: &[PackageRef], destination: Option<&str>) -> String {
-    let sync = match destination {
-        Some(flags) => format!("lvpm sync {flags} --yes"),
-        None => "lvpm sync --yes".to_string(),
-    };
+/// What the user said no to, and the two ways on: the manifest, or `rerun`, the
+/// command they typed with `--yes`.
+fn declined(removing: &[PackageRef], rerun: &str) -> String {
     let add = match removing {
         [only] => format!(
             "add it to lvpm.toml with lvpm add {}",
@@ -92,7 +88,7 @@ fn declined(removing: &[PackageRef], destination: Option<&str>) -> String {
         ),
         _ => "add them to lvpm.toml".to_string(),
     };
-    format!("sync cancelled: nothing was changed\nnext: {add}, or run {sync}")
+    format!("sync cancelled: nothing was changed\nnext: {add}, or run {rerun}")
 }
 
 /// `sync: 2 to install, 1 to remove`: what is going to happen, in counts.
@@ -461,27 +457,24 @@ mod tests {
 
     #[test]
     fn a_decline_says_nothing_changed_and_the_two_ways_on_as_typed() {
-        let (mut renderer, out, _) = renderer();
-        renderer.render(&Event::SyncDeclined {
-            removing: vec![gone("extra")],
-            destination: Some("--prefix dest".into()),
-        });
-        renderer.render(&Event::SyncDeclined {
-            removing: vec![gone("extra"), gone("zeta")],
-            destination: Some("--prefix 'my dest'".into()),
-        });
-        renderer.render(&Event::SyncDeclined {
-            removing: vec![gone("extra")],
-            destination: None,
-        });
+        let declined = |removing: Vec<PackageRef>, rerun: &str| {
+            let (renderer, out, _) = renderer();
+            let mut renderer = renderer.rerun_with(rerun.into());
+            renderer.render(&Event::SyncDeclined { removing });
+            out.text()
+        };
         assert_eq!(
-            out.text(),
+            declined(vec![gone("extra")], "lvpm sync --prefix dest --yes"),
             "sync cancelled: nothing was changed\n\
-             next: add it to lvpm.toml with lvpm add extra, or run lvpm sync --prefix dest --yes\n\
-             sync cancelled: nothing was changed\n\
-             next: add them to lvpm.toml, or run lvpm sync --prefix 'my dest' --yes\n\
-             sync cancelled: nothing was changed\n\
-             next: add it to lvpm.toml with lvpm add extra, or run lvpm sync --yes\n"
+             next: add it to lvpm.toml with lvpm add extra, or run lvpm sync --prefix dest --yes\n"
+        );
+        assert_eq!(
+            declined(
+                vec![gone("extra"), gone("zeta")],
+                "lvpm install --prefix 'my dest' --group docs --yes"
+            ),
+            "sync cancelled: nothing was changed\n\
+             next: add them to lvpm.toml, or run lvpm install --prefix 'my dest' --group docs --yes\n"
         );
     }
 
