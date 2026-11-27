@@ -76,7 +76,7 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Answer yes to every prompt.
+    /// Answer yes to every question, including sync's question before it removes packages.
     // Derive gives a `bool` clap's strict true/false parser, which would refuse
     // LVPM_YES=1 and LVPM_YES=; the falsey parser is what a flag gets by default.
     #[arg(long, short = 'y', global = true, env = "LVPM_YES", value_parser = yes_parser())]
@@ -2304,6 +2304,17 @@ mod tests {
             let cli = Cli::try_parse_from(args).unwrap();
             assert!(cli.yes, "{args:?}");
         }
+    }
+
+    #[test]
+    fn the_yes_help_names_the_sync_question() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains(
+                "Answer yes to every question, including sync's question before it removes packages"
+            ),
+            "{help}"
+        );
     }
 
     #[test]

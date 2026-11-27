@@ -42,7 +42,8 @@ lvpm keeps upgrading in `lock`. The README says so and gives the two commands.
    remove` delete the venv without reading stdin. With `LVPM_YES=0` it asks.
 2. Under `--json`, `venv remove` without `--yes` or `LVPM_YES` still fails.
    Its message now names both `--yes` and `LVPM_YES`. With either one, it deletes.
-3. `lvpm sync --yes` parses. `sync` has no prompt, so the flag changes nothing.
+3. `lvpm sync --yes` parses. Since #55, sync asks before it removes a package
+   the lock does not keep, and `--yes` answers that question.
 4. With a faked list holding LabVIEW 2026 32-bit and 64-bit, bitness 32 picks
    the 32-bit one for `2026`, and bitness 64 picks the 64-bit one. A unit test
    in `target.rs` covers this.

@@ -1,6 +1,6 @@
 Feature: s10d: run unattended
-  `--yes` (or LVPM_YES) answers every prompt. Of lvpm's commands only
-  `venv remove` asks, so it is the one that shows the difference.
+  `--yes` (or LVPM_YES) answers every question. `venv remove` is the one
+  these scenarios use to show the difference.
 
   # --yes: `venv create` starts no LabVIEW, so these are not interactive.
   @labview

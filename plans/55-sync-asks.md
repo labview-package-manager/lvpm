@@ -484,8 +484,8 @@ graph TD
   - [x] Step 2.3: goldens and the tests whose names now lie
 
 ### Wave 3
-- [ ] Slice 3: docs
-  - [ ] Step 3.1: say it where sync is described
+- [x] Slice 3: docs
+  - [x] Step 3.1: say it where sync is described
 
 ## Plan Review Summary
 
