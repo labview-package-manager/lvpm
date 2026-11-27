@@ -701,6 +701,59 @@ fn uninstall_refuses_a_package_another_one_requires_and_a_script_must_say_what_h
     assert!(lab.record("app").is_file());
 }
 
+// Upstream's project uninstall with --no-save; here a project uninstall goes
+// through the lock (above), and --no-project is the one that keeps what the
+// manifest declares, or needs through what it declares.
+#[test]
+fn uninstall_keeps_packages_dependencies_and_the_manifest_in_step() {
+    let lab = Lab::new("uninstall-no-project");
+    lab.package("app", "1.0.0.1", "lib");
+    lab.package("lib", "1.0.0.1", "core");
+    lab.package("other", "1.0.0.1", "core");
+    lab.package("core", "1.0.0.1", "");
+    lab.write_manifest("[dependencies]\n");
+    lab.ok(&["venv", "create"]);
+    lab.ok(&["install", "app"]);
+    lab.ok(&["install", "other"]);
+
+    // Out of the manifest, as upstream's uninstall left it: what only app
+    // needs goes, and core stays for `other`, which the manifest declares. A
+    // declared app would keep its dependencies too (dependency::removal_plan).
+    lab.write_manifest("[dependencies]\nother = \"*\"\n");
+    let manifest = lab.manifest();
+    let removed = lab.ok(&["uninstall", "app", "--no-project", "--with-deps"]);
+    has(
+        &removed,
+        "keeping core: required by a package declared in lvpm.toml",
+    );
+    for (name, there) in [
+        ("app", false),
+        ("lib", false),
+        ("core", true),
+        ("other", true),
+    ] {
+        assert_eq!(lab.record(name).is_file(), there, "{name}");
+    }
+    assert!(!lab.file("app", "app.txt").exists());
+    assert_eq!(lab.manifest(), manifest);
+
+    // A dependency the manifest declares is the project's: kept.
+    lab.ok(&["install", "app", "--no-project"]);
+    lab.write_manifest("[dependencies]\nother = \"*\"\nlib = \"*\"\n");
+    has(
+        &lab.ok(&["uninstall", "app", "--no-project", "--with-deps"]),
+        "keeping lib: declared in lvpm.toml",
+    );
+    assert!(lab.record("lib").is_file());
+
+    // --no-project leaves the entry, and says so.
+    has(
+        &lab.ok(&["uninstall", "lib", "--no-project", "--keep-deps"]),
+        "lib is declared in lvpm.toml",
+    );
+    has(&lab.manifest(), "lib = \"*\"");
+}
+
 // The fork puts lvpm.toml and lvpm.lock back when the sync stops partway
 // (add_remove.rs), where upstream keeps the manifest edit; `lvpm sync` then
 // puts the destination back in line with them.

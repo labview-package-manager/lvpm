@@ -2612,4 +2612,132 @@ alpha = { index = \"defaults\", version = \"*\" }
         .to_string();
         assert!(why.starts_with("[dependency-groups.b] pkg:"), "{why}");
     }
+
+    #[test]
+    fn declared_dependency_names_include_unselected_groups() {
+        let project = parse(
+            "[dependencies]\nmain_package = \"*\"\n[dependency-groups.test]\ntest_package = \"*\"\n\
+             [dependency-groups.build]\nbuild_package = \"*\"\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = (project.tables())
+            .flat_map(|(_, lines)| lines.iter().map(|(name, _)| name.as_str()))
+            .collect();
+        assert_eq!(names, ["main_package", "test_package", "build_package"]);
+        // Upstream also counts the default selection's lines; gone: a selection names groups (ops/sync.rs).
+    }
+
+    #[test]
+    fn versions_that_are_not_versions_are_rejected() {
+        for bad in ["latest", "v1.0", "skip", "run", ">=abc", ">=", "1.0 beta"] {
+            assert!(Constraint::parse(bad).is_err(), "{bad:?}");
+        }
+        let e = Constraint::parse("latest").unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "\"latest\" is not a version — use an exact version such as \"1.2.3.4\", \">=x.y\" or \"*\""
+        );
+        for good in [
+            "1.0.1-1",
+            "2018.0.7.45",
+            ">=6.0.1",
+            "7.1.2.1547",
+            "*",
+            "",
+            "1.0.0b3",
+            ">= 1.0.0b3",
+        ] {
+            assert!(Constraint::parse(good).is_ok(), "{good:?}");
+        }
+        let err = parse("[dependencies]\nfoo = \"latest\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("[dependencies] foo"), "{err:#}");
+    }
+
+    #[test]
+    fn groups_parse_in_file_order_with_includes() {
+        let p = parse(
+            r#"
+[dependencies]
+delacor_lib_qmh = "7.1.2.1547"
+
+[dependency-groups.test]
+jki_lib_caraya = "*"
+oglib_error = ">=6.0"
+
+[dependency-groups.ci]
+include-groups = ["test"]
+ni_vi_analyzer_tests = "1.2.0.3"
+
+[dependency-groups.build]
+vipm_package_builder = "*"
+"#,
+        )
+        .unwrap();
+        let gnames: Vec<&str> = p.groups.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(gnames, ["test", "ci", "build"]);
+        assert_eq!(p.group_includes["ci"], ["test"]);
+        assert_eq!(
+            p.groups[1].1,
+            vec![(
+                "ni_vi_analyzer_tests".to_string(),
+                Constraint::Exact(Version::parse("1.2.0.3"))
+            )]
+        );
+        assert_eq!(
+            p.groups[0].1[1].1,
+            Constraint::AtLeast(Version::parse("6.0"))
+        );
+    }
+
+    #[test]
+    fn malformed_groups_are_rejected_when_read() {
+        // Upstream also refuses [dependencies.main]; gone: main is no reserved name, so it is a group.
+        for (manifest, says) in [
+            (
+                "[dependencies.t]\ninclude-groups = \"u\"\n",
+                "must be a list of group names",
+            ),
+            (
+                "[dependencies.t]\ninclude-groups = [\"u\"]\n",
+                "there is no group \"u\"",
+            ),
+            (
+                "[dependencies.t]\nx = 1.0\n",
+                "x: expected a quoted version or a table, got float",
+            ),
+        ] {
+            let err = format!("{:#}", parse(manifest).unwrap_err());
+            assert!(err.contains(says), "{manifest}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_table_that_looks_like_a_dependency_is_not_read_as_a_group() {
+        for (text, said) in [
+            (
+                "foo = { version = \"1\", hook = \"run\" }",
+                "[dependencies] foo: unknown key \"hook\"; expected version, github, index, hooks or relink",
+            ),
+            (
+                "foo = { hooks = \"skip\" }",
+                "[dependencies] foo: a table needs version",
+            ),
+            (
+                "foo = { relink = true }",
+                "[dependencies] foo: a table needs version",
+            ),
+        ] {
+            let msg = refusal("dependencies", text);
+            assert!(msg.starts_with(said), "{msg}");
+        }
+        let p = parse(
+            "[dependencies.test]\noglib_array = \"6.0.1.20\"\n\
+             jki_lib_caraya = { version = \"*\", hooks = \"run\" }\n\n\
+             [dependencies.ci]\ninclude-groups = [\"test\"]\n",
+        )
+        .unwrap();
+        assert!(p.dependencies.is_empty());
+        assert_eq!(p.groups.len(), 2);
+        assert_eq!(p.group_includes["ci"], ["test"]);
+    }
 }

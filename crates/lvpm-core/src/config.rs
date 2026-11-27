@@ -350,6 +350,26 @@ mod tests {
         assert!(resolve(&file, bad).is_err());
     }
 
+    #[test]
+    fn venv_title_from_file_is_overridden_by_environment_and_bad_values_fail() {
+        let file = FileConfig {
+            venv: VenvConfig {
+                dir: None,
+                title: Some("start".into()),
+            },
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            resolve(&file, |_| None).unwrap().venv_title,
+            TitlePosition::Start
+        );
+        let env = |k: &str| (k == "LVPM_CONFIG_VENV_TITLE").then(|| "Off".to_string());
+        assert_eq!(resolve(&file, env).unwrap().venv_title, TitlePosition::Off);
+        let bad = |k: &str| (k == "LVPM_CONFIG_VENV_TITLE").then(|| "middle".to_string());
+        let err = resolve(&file, bad).unwrap_err().to_string();
+        assert!(err.contains("end, start, off"), "{err}");
+    }
+
     use super::*;
 
     #[test]

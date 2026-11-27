@@ -194,4 +194,25 @@ mod tests {
         );
         assert!(lines[2].ends_with("---- failed: boom"), "{text}");
     }
+
+    #[test]
+    fn after_a_failed_write_later_records_are_dropped() {
+        struct Quiet;
+        impl EventSink for Quiet {
+            fn emit(&self, _: Event) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the log's folder should be: every write fails.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "").unwrap();
+        let log = blocker.join(FILE_NAME);
+        let sink = LogSink::new(Box::new(Quiet));
+        sink.attach(log.clone());
+        assert!(sink.lock().is_none());
+        // Even once the folder could be made, the dropped log stays dropped.
+        std::fs::remove_file(&blocker).unwrap();
+        sink.emit(Event::LinkfixPreparing);
+        assert!(!blocker.exists());
+        assert!(!log.exists());
+    }
 }

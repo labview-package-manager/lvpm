@@ -961,4 +961,185 @@ mod tests {
             );
         }
     }
+
+    // ---- ported from upstream's vipm_interop.rs; there the roots come from
+    // the packages' .spec files, here from the <Dependency> flag ----
+
+    #[test]
+    fn a_vipc_reads_its_target_packages_and_roots_from_the_specs() {
+        // Upstream's `ig_web&amp;crypto` is gone: an entity is refused here.
+        let packages = [
+            package_xml("ig_http_server-0.5.3.36", "false", "false", "false"),
+            package_xml("ig_stream_base-1.2.0.46", "false", "true", "false"),
+            package_xml("ig_web_crypto-0.1.0.9", "false", "true", "false"),
+            package_xml("delacor_lib_qmh-7.1.2.1547", "false", "false", "false"),
+        ]
+        .concat();
+        let v = read_xml("upstream-roots", &config_xml("26.1 (64-bit)", &packages)).unwrap();
+        assert_eq!(v.labview_year, Some(2026));
+        assert_eq!(v.packages[0].version, "0.5.3.36");
+        let seed = v.seed();
+        assert_eq!(
+            seed.deps,
+            [
+                ("ig_http_server".to_string(), ">=0.5.3.36".to_string()),
+                ("delacor_lib_qmh".to_string(), ">=7.1.2.1547".to_string()),
+            ],
+            "file order"
+        );
+        assert_eq!(seed.skipped, 2);
+    }
+
+    #[test]
+    fn included_packages_come_out_of_the_vipc_with_their_bytes() {
+        // Upstream's `.ogp` archive is gone: only a `.vip` is looked for. The
+        // `-1.1-1` name is in an_ogpm_release_suffix_stays_on_the_version.
+        let dir = Dir::new("upstream-included");
+        let my_lib = vip_bytes("my_lib", "1.0.0.1");
+        let packages = [
+            package_xml("my_lib-1.0.0.1", "true", "false", "false"),
+            package_xml("oglib_error-4.2.0.23", "false", "true", "false"),
+        ]
+        .concat();
+        let path = dir.vipc(&[
+            ("config.xml", config_xml("20.0", &packages).as_bytes()),
+            ("my_lib-1.0.0.1.vip", &my_lib),
+        ]);
+        let v = read(&path, "p.vipc").unwrap();
+        assert_eq!(v.labview_year, Some(2020));
+        let mut seed = v.seed();
+        v.embed(&path, "p.vipc", &mut seed).unwrap();
+        assert_eq!(seed.embedded.len(), 1);
+        assert_eq!(seed.embedded[0].name, "my_lib");
+        assert_eq!(seed.embedded[0].bytes, my_lib);
+        assert!(seed.not_embedded.is_empty());
+        assert_eq!(seed.deps, [("my_lib".to_string(), ">=1.0.0.1".to_string())]);
+
+        // Marked Included but not inside: upstream refuses; here it is left
+        // to the feeds (S10a AC10).
+        let path = dir.config(&config_xml(
+            "20.0",
+            &package_xml("gone-1.0", "true", "false", "false"),
+        ));
+        let v = read(&path, "p.vipc").unwrap();
+        let mut seed = v.seed();
+        v.embed(&path, "p.vipc", &mut seed).unwrap();
+        assert_eq!(seed.not_embedded, [("gone".to_string(), "1.0".to_string())]);
+    }
+
+    #[test]
+    #[ignore = "fork bug: a <Name> like jki_rsc_toolkits_palette-1.1-1 is split at its last '-', not by version::split_id; see #56"]
+    fn an_ogpm_release_suffix_stays_on_the_version() {
+        // Upstream's included_packages_come_out_of_the_vipc_with_their_bytes, first package.
+        let dir = Dir::new("upstream-ogpm-suffix");
+        let jki = vip_bytes("jki_rsc_toolkits_palette", "1.1-1");
+        let path = dir.vipc(&[
+            (
+                "config.xml",
+                config_xml(
+                    "20.0",
+                    &package_xml("jki_rsc_toolkits_palette-1.1-1", "true", "false", "false"),
+                )
+                .as_bytes(),
+            ),
+            ("jki_rsc_toolkits_palette-1.1-1.vip", &jki),
+        ]);
+        let v = read(&path, "p.vipc").unwrap();
+        assert_eq!(v.packages[0].name, "jki_rsc_toolkits_palette");
+        assert_eq!(
+            v.packages[0].version, "1.1-1",
+            "the OGPM release suffix stays on the version"
+        );
+        let mut seed = v.seed();
+        v.embed(&path, "p.vipc", &mut seed).unwrap();
+        assert_eq!(seed.embedded[0].name, "jki_rsc_toolkits_palette");
+        assert_eq!(seed.embedded[0].bytes, jki);
+    }
+
+    #[test]
+    fn a_carried_package_is_named_by_its_own_spec_when_config_xml_disagrees() {
+        // A name differing only in case is the same package.
+        let dir = Dir::new("upstream-carried");
+        let same = vip_bytes("Same", "1.0.0.1");
+        let path = dir.vipc(&[
+            (
+                "config.xml",
+                config_xml(
+                    "24.3",
+                    &package_xml("same-1.0.0.1", "true", "false", "false"),
+                )
+                .as_bytes(),
+            ),
+            ("same-1.0.0.1.vip", &same),
+        ]);
+        let v = read(&path, "p.vipc").unwrap();
+        let mut seed = v.seed();
+        v.embed(&path, "p.vipc", &mut seed).unwrap();
+        assert_eq!(
+            (&seed.embedded[0].name[..], &seed.embedded[0].version[..]),
+            ("same", "1.0.0.1")
+        );
+
+        // Another version inside: upstream renames the pin; here it is refused.
+        let rebuilt = vip_bytes("rebuilt", "1.0.0.2");
+        let path = dir.vipc(&[
+            (
+                "config.xml",
+                config_xml(
+                    "24.3",
+                    &package_xml("rebuilt-1.0.0.1", "true", "false", "false"),
+                )
+                .as_bytes(),
+            ),
+            ("rebuilt-1.0.0.1.vip", &rebuilt),
+        ]);
+        let v = read(&path, "p.vipc").unwrap();
+        let err = v
+            .embed(&path, "p.vipc", &mut v.seed())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "p.vipc: embedded rebuilt-1.0.0.1.vip is rebuilt 1.0.0.2, not rebuilt 1.0.0.1"
+        );
+
+        // A carried file that is not a package stops the import.
+        let path = dir.vipc(&[
+            (
+                "config.xml",
+                config_xml("24.3", &package_xml("junk-1.0", "true", "false", "false")).as_bytes(),
+            ),
+            ("junk-1.0.vip", b"not a zip"),
+        ]);
+        let v = read(&path, "p.vipc").unwrap();
+        let err = format!("{:#}", v.embed(&path, "p.vipc", &mut v.seed()).unwrap_err());
+        assert!(err.contains("junk-1.0.vip"), "{err}");
+    }
+
+    #[test]
+    fn empty_and_malformed_configurations() {
+        let v = read_xml("upstream-empty", &config_xml("25.3 (64-bit)", "")).unwrap();
+        assert!(v.packages.is_empty() && v.seed().deps.is_empty());
+        assert_eq!(v.labview_year, Some(2025));
+        let dir = Dir::new("upstream-malformed");
+        let path = dir.0.join("p.vipc");
+        std::fs::write(&path, "not a zip").unwrap();
+        let err = format!("{:#}", read(&path, "p.vipc").unwrap_err());
+        assert!(err.contains("not a zip file"), "{err}");
+        let err = read_xml("upstream-unclosed", "<VI_Package_Configuration><Target>").unwrap_err();
+        assert!(err.contains("<Target> is not closed"), "{err}");
+        let two = "<VI_Package_Configuration><Target></Target><Target></Target></VI_Package_Configuration>";
+        let err = read_xml("upstream-two", two).unwrap_err();
+        assert!(err.contains("more than one <Target>"), "{err}");
+    }
+
+    #[test]
+    fn targets_map_to_years_from_2009() {
+        // Upstream's is_vipc is gone.
+        assert_eq!(year("26.1 (64-bit)"), Some(2026));
+        assert_eq!(year("13.0"), Some(2013));
+        assert_eq!(year("9.0"), Some(2009));
+        assert_eq!(year("8.6"), None);
+        assert_eq!(year("LabVIEW"), None);
+    }
 }

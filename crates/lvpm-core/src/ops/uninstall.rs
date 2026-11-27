@@ -1012,4 +1012,47 @@ mod tests {
         assert_eq!(snapshot(&dir), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The venv's manifest declares packages in [dependencies] and in every
+    /// named group, and `--with-deps` keeps each of them.
+    #[test]
+    fn uninstall_roots_include_main_and_all_named_groups() {
+        use crate::ops::testing::{Recorded, env_on, scratch_dir, venv_in};
+        let repo = scratch_dir("uninstall-roots");
+        let store = venv_in(&repo).store().store_dir();
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            repo.join(project::FILE_NAME),
+            "[dependencies]\nmain_package = \"*\"\n\n\
+             [dependency-groups.test]\ntest_package = \"*\"\n",
+        )
+        .unwrap();
+        for (name, deps) in [
+            ("app", &["main_package", "test_package"][..]),
+            ("main_package", &[]),
+            ("test_package", &[]),
+        ] {
+            let record = serde_json::json!({
+                "name": name, "version": "1.0", "display_name": null, "installed_at": 0,
+                "target": "venv", "files": [], "skipped_hooks": [], "dependencies": deps,
+            });
+            std::fs::write(store.join(format!("{name}.json")), record.to_string()).unwrap();
+        }
+
+        let sink = Recorded::default();
+        let env = env_on(&sink, &repo);
+        uninstall(&env, Some("app"), false, Dependencies::Remove, false).unwrap();
+        assert!(!store.join("app.json").exists());
+        for name in ["main_package", "test_package"] {
+            assert!(store.join(format!("{name}.json")).is_file(), "{name}");
+            let kept = Event::DependencyKept {
+                name: name.into(),
+                why: KeptBecause::Declared {
+                    manifest: project::FILE_NAME.into(),
+                },
+            };
+            assert!(sink.events().contains(&kept), "{name}: {:?}", sink.events());
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 }

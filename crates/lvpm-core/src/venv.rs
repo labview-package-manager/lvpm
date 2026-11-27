@@ -843,4 +843,53 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&repo);
     }
+
+    #[test]
+    fn environment_paths_and_package_names_are_scoped_to_the_new_layout() {
+        let dir = scratch_dir("paths");
+        let target = LvTarget {
+            version: 26.3,
+            bitness: 64,
+            path: dir.join("LabVIEW"),
+        };
+        let v = Venv {
+            repo: dir.clone(),
+            dir: dir.clone(),
+            target,
+            port: 3456,
+            manifest: None,
+        };
+        assert_eq!(v.packages_dir(), dir.join("packages"));
+        assert_eq!(v.ini_path(), dir.join("labview.ini"));
+        assert_eq!(v.objcache_dir(), dir.join("objcache"));
+        assert_eq!(v.data_dir(), dir.join("data"));
+        assert_eq!(v.temp_dir(), dir.join("temp"));
+        assert_eq!(v.pid_path(), dir.join("labview.pid"));
+        // Refused names: addon_folder_names_allow_ampersand_and_refuse_paths.
+        for pkg in ["pkg", "pkg&extra"] {
+            assert_eq!(
+                v.roots_for_pkg(pkg).unwrap().application,
+                dir.join("packages").join(pkg).join("1")
+            );
+        }
+
+        std::fs::write(v.ini_path(), "[LabVIEW]\ncustom=True\n").unwrap();
+        crate::launch::write_ini(&v, &[]).unwrap();
+        let ini = std::fs::read_to_string(v.ini_path()).unwrap();
+        let location = v.packages_dir().to_string_lossy().into_owned();
+        let location = if location.contains(' ') {
+            format!("\"{location}\"")
+        } else {
+            location
+        };
+        assert!(
+            ini.lines()
+                .any(|line| line == format!("LVAddons.AdditionalLocations={location}")),
+            "{ini}"
+        );
+        assert!(ini.contains("custom=True"));
+        assert!(v.packages_dir().is_dir());
+        assert!(!dir.join(".lvpm").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
