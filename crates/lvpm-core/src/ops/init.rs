@@ -541,7 +541,8 @@ fn merge_nipm(text: &str, source: &Table) -> Result<(String, usize), InitError> 
         .ok_or_else(|| anyhow!("[nipm.dependencies] in lvpm.toml is not a table"))?;
     let mut added = 0;
     for (key, value) in source.iter() {
-        if !deps.contains_key(key) {
+        // NI package names are case-insensitive: `NI-VISA` is `ni-visa`.
+        if !deps.iter().any(|(have, _)| project::same_name(have, key)) {
             deps.insert(key, value.clone());
             added += 1;
         }
@@ -2291,7 +2292,6 @@ Alpha = \"1.0\"
     }
 
     #[test]
-    #[ignore = "fork bug: merge_nipm matches NI package names case-sensitively and adds a duplicate; see #56"]
     fn a_nipm_entry_differing_only_in_case_is_already_there() {
         // Upstream's nipm_entries_are_copied_as_written, last assert.
         let (scratch, root) = folder("import-nipm-case", "App");

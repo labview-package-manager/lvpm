@@ -253,14 +253,18 @@ fn named(package: &str) -> Result<(String, Constraint)> {
 }
 
 /// Depth-first over the dependency graph, from every root at once. No
-/// conflict resolution: the first resolution of a name wins, and a floor
-/// resolves to the newest version satisfying it. Roots are seeded in reverse so
-/// the plan comes out in the order they were written.
+/// conflict resolution: every name resolves once, a floor to the newest
+/// version satisfying it. A dependency's floor is the highest any package in
+/// the plan asks of that name: a pass takes the first request for a name, so
+/// when a later one asks for more the walk starts again with the higher floor,
+/// until no pass finds a higher one. Roots are seeded in reverse so the plan
+/// comes out in the order they were written.
 ///
 /// A root asks for what its constraint says; a dependency carried by a
 /// package is always a floor. A dependency the installed version already
-/// satisfies stays as it is, and a root that nothing lists fails the whole
-/// resolution, with every such root named.
+/// satisfies stays as it is; an install record that cannot be read fails the
+/// resolution. A root that nothing lists fails the whole resolution, with
+/// every such root named.
 pub fn resolve_greedy(
     env: &OpEnv,
     store: &Roots,
@@ -268,63 +272,37 @@ pub fn resolve_greedy(
     wanted: &[(String, Constraint)],
     no_deps: bool,
 ) -> Result<InstallPlan> {
-    let lv_gate = store.target.as_ref().map(|t| t.version);
-    let mut queue: Vec<(String, Req, bool)> = wanted
-        .iter()
-        .rev()
-        .map(|(n, c)| (n.clone(), Req::from(c), true))
-        .collect();
-    let mut done: HashSet<String> = HashSet::new();
-    let mut entries: Vec<PlannedPackage> = Vec::new();
-    let mut unresolved: Vec<String> = Vec::new();
-
-    while let Some((n, req, is_root)) = queue.pop() {
-        if !done.insert(project::name_key(&n)) {
-            continue;
-        }
-        // A dependency the installed version already satisfies stays as it
-        // is: `install foo` upgrades foo, not everything foo happens to need.
-        // Roots go through — asking for a package means asking for the
-        // version the index resolves, and the install loop decides whether
-        // that is a no-op, an upgrade, or a refused downgrade.
-        if !is_root
-            && let Req::Floor(floor) = &req
-            && let Ok(have) = install::read_manifest(store, &n)
-            && floor
-                .as_ref()
-                .is_none_or(|f| f.admits(&Version::parse(&have.version)))
-        {
-            env.sink.emit(Event::DependencySatisfied {
-                name: have.name,
-                version: have.version,
-            });
-            continue;
-        }
-        let entry = match &req {
-            Req::Exact(v) => idx
-                .versions_of(&n)
-                .into_iter()
-                .find(|e| &e.version == v)
-                .cloned(),
-            Req::Floor(floor) => idx.best(&n, floor.as_ref(), lv_gate).cloned(),
-        };
-
-        let Some(entry) = entry else {
-            if is_root {
-                // One missing root must not throw away fifty good ones:
-                // collect them all and fail once, with the whole list.
-                unresolved.push(format!("{n}{req}"));
-            } else {
-                env.sink.emit(Event::DependencyUnresolved { name: n });
-            }
-            continue;
-        };
-        if !no_deps {
-            for r in &entry.requires {
-                queue.push((r.name.clone(), Req::Floor(r.floor()), false));
+    // Floors only rise and the index is finite, so this ends; the bound is a
+    // guard, not a limit expected to be reached.
+    let mut floors: HashMap<String, Floor> = HashMap::new();
+    let mut pass = None;
+    for _ in 0..32 {
+        let this = greedy_pass(store, idx, wanted, no_deps, &floors)?;
+        let mut raised = false;
+        for (key, floor) in &this.seen {
+            if floors.get(key).is_none_or(|have| above(floor, have)) {
+                floors.insert(key.clone(), floor.clone());
+                raised = true;
             }
         }
-        entries.push(PlannedPackage::unchecked(entry));
+        if !raised {
+            pass = Some(this);
+            break;
+        }
+    }
+    let Some(GreedyPass {
+        entries,
+        unresolved,
+        events,
+        ..
+    }) = pass
+    else {
+        bail!("dependency floors did not settle after 32 passes");
+    };
+    // Only the last pass's events: an earlier one may have kept a version
+    // a higher floor then replaced.
+    for e in events {
+        env.sink.emit(e);
     }
 
     if !unresolved.is_empty() {
@@ -361,6 +339,110 @@ pub fn resolve_greedy(
             .collect(),
     });
     Ok(InstallPlan { entries })
+}
+
+/// What one walk of [`resolve_greedy`] planned and said, and the highest
+/// floor it saw asked of each name.
+struct GreedyPass {
+    entries: Vec<PlannedPackage>,
+    unresolved: Vec<String>,
+    events: Vec<Event>,
+    seen: HashMap<String, Floor>,
+}
+
+/// Whether `a` asks for more than `b`.
+fn above(a: &Floor, b: &Floor) -> bool {
+    a.version > b.version || (a.version == b.version && a.exclusive && !b.exclusive)
+}
+
+/// One walk, with every dependency's floor raised to `floors`'s entry for its name.
+fn greedy_pass(
+    store: &Roots,
+    idx: &Index,
+    wanted: &[(String, Constraint)],
+    no_deps: bool,
+    floors: &HashMap<String, Floor>,
+) -> Result<GreedyPass> {
+    let lv_gate = store.target.as_ref().map(|t| t.version);
+    let mut queue: Vec<(String, Req, bool)> = wanted
+        .iter()
+        .rev()
+        .map(|(n, c)| (n.clone(), Req::from(c), true))
+        .collect();
+    let mut done: HashSet<String> = HashSet::new();
+    let mut pass = GreedyPass {
+        entries: Vec::new(),
+        unresolved: Vec::new(),
+        events: Vec::new(),
+        seen: HashMap::new(),
+    };
+
+    while let Some((n, mut req, is_root)) = queue.pop() {
+        let key = project::name_key(&n);
+        if let Req::Floor(Some(f)) = &req
+            && pass.seen.get(&key).is_none_or(|have| above(f, have))
+        {
+            pass.seen.insert(key.clone(), f.clone());
+        }
+        if !done.insert(key.clone()) {
+            continue;
+        }
+        // A root keeps its own constraint; only a dependency is raised.
+        if !is_root
+            && let Req::Floor(floor) = &mut req
+            && let Some(high) = floors.get(&key)
+            && floor.as_ref().is_none_or(|f| above(high, f))
+        {
+            *floor = Some(high.clone());
+        }
+        // A dependency the installed version already satisfies stays as it
+        // is: `install foo` upgrades foo, not everything foo happens to need.
+        // Roots go through — asking for a package means asking for the
+        // version the index resolves, and the install loop decides whether
+        // that is a no-op, an upgrade, or a refused downgrade.
+        if !is_root
+            && let Req::Floor(floor) = &req
+            && install::is_installed(store, &n)
+        {
+            let have = install::read_manifest(store, &n)?;
+            if floor
+                .as_ref()
+                .is_none_or(|f| f.admits(&Version::parse(&have.version)))
+            {
+                pass.events.push(Event::DependencySatisfied {
+                    name: have.name,
+                    version: have.version,
+                });
+                continue;
+            }
+        }
+        let entry = match &req {
+            Req::Exact(v) => idx
+                .versions_of(&n)
+                .into_iter()
+                .find(|e| &e.version == v)
+                .cloned(),
+            Req::Floor(floor) => idx.best(&n, floor.as_ref(), lv_gate).cloned(),
+        };
+
+        let Some(entry) = entry else {
+            if is_root {
+                // One missing root must not throw away fifty good ones:
+                // collect them all and fail once, with the whole list.
+                pass.unresolved.push(format!("{n}{req}"));
+            } else {
+                pass.events.push(Event::DependencyUnresolved { name: n });
+            }
+            continue;
+        };
+        if !no_deps {
+            for r in &entry.requires {
+                queue.push((r.name.clone(), Req::Floor(r.floor()), false));
+            }
+        }
+        pass.entries.push(PlannedPackage::unchecked(entry));
+    }
+    Ok(pass)
 }
 
 /// Put every package of the plan on disk, in order.
@@ -1561,7 +1643,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fork bug: resolve_greedy swallows an unreadable install record and resolves the dependency anyway; see #56"]
     fn an_unreadable_install_record_of_a_dependency_fails_the_resolution() {
         // Upstream's skips_dependencies_when_requested_and_propagates_read_errors, second half.
         let (dir, store) = greedy_store("greedy-read-error", None, &[]);
@@ -1576,7 +1657,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fork bug: resolve_greedy keeps the first floor's installed version and ignores a higher floor met later; see #56"]
     fn the_highest_floor_wins_over_an_earlier_satisfied_one() {
         // `a` asks for shared >= 1, which installed 2 satisfies; `b`, met
         // later, asks for shared >= 3. The installed 2 must not stand.
@@ -1597,7 +1677,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fork bug: resolve_greedy resolves the first floor it meets and drops a higher floor met later, so nothing is reported unresolved; see #56"]
     fn no_version_at_the_highest_floor_is_reported_unresolved() {
         // Second half of upstream's the_highest_floor_wins_over_an_earlier_satisfied_one.
         // Nothing at or above the highest floor for this LabVIEW: say so.

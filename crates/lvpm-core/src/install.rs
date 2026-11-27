@@ -195,7 +195,8 @@ pub fn read_manifest(roots: &Roots, name: &str) -> Result<Manifest> {
     let p = manifest_path(roots, name);
     let text = std::fs::read_to_string(&p)
         .with_context(|| format!("{name} is not installed in this target ({})", p.display()))?;
-    Ok(serde_json::from_str(&text)?)
+    serde_json::from_str(&text)
+        .with_context(|| format!("{} is not a valid install record", p.display()))
 }
 
 /// Records written before lvpm kept a dependency list. Uninstall cannot say
