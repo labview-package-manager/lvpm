@@ -468,7 +468,7 @@ graph TD
 
 ### Wave 2
 - [ ] Slice 2: the CLI asks, goes ahead or refuses
-  - [ ] Step 2.1: the decision, as one pure function
+  - [x] Step 2.1: the decision, as one pure function
   - [ ] Step 2.2: wire cmd_sync, render the question and the cancel
   - [ ] Step 2.3: goldens and the tests whose names now lie
 

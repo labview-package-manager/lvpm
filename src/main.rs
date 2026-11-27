@@ -1381,7 +1381,6 @@ fn cmd_uninstall(
 ) -> Result<()> {
     use ops::uninstall::Dependencies;
     let ask = |names: &[String]| {
-        use std::io::IsTerminal;
         // Under --json stdin is no place for an answer.
         ensure!(
             !cli.json,
@@ -1391,7 +1390,7 @@ fn cmd_uninstall(
         let stdin = std::io::stdin();
         confirm_dependencies(
             names,
-            stdin.is_terminal(),
+            stdin_is_terminal(),
             &mut stdin.lock(),
             &mut std::io::stderr(),
         )
@@ -1594,16 +1593,64 @@ fn confirm_dependencies(
         "dependencies can be removed: {}. Pass --with-deps or --keep-deps in non-interactive mode",
         names.join(", ")
     );
-    write!(
+    read_yes(
+        input,
         output,
-        "remove unshared dependencies ({}) too? [y/N] ",
-        names.join(", ")
-    )?;
+        &format!(
+            "remove unshared dependencies ({}) too? [y/N] ",
+            names.join(", ")
+        ),
+    )
+}
+
+/// Put a question and read one line: "y" or "yes" in any case is yes, and
+/// anything else, an empty line or end of input is no.
+fn read_yes(
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    question: &str,
+) -> Result<bool> {
+    write!(output, "{question}")?;
     output.flush()?;
     let mut answer = String::new();
     input.read_line(&mut answer)?;
     let answer = answer.trim();
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+}
+
+/// Is stdin a terminal, so that someone can answer a question? Debug builds
+/// (what `cargo test` runs) also treat `LVPM_TEST_STDIN_TERMINAL` being set as
+/// yes. It is not `LVPM_TEST_TERMINAL`, which says output is a terminal and
+/// turns on the update notice.
+fn stdin_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    (cfg!(debug_assertions) && std::env::var_os("LVPM_TEST_STDIN_TERMINAL").is_some())
+        || std::io::stdin().is_terminal()
+}
+
+/// What `sync` does about the packages it would remove.
+#[derive(Debug, PartialEq, Eq)]
+// shortcut: nothing calls Removal or on_removal until Step 2.2 wires cmd_sync.
+#[allow(dead_code)]
+enum Removal {
+    GoAhead,
+    Ask,
+    Refuse,
+}
+
+/// The flags half of the rule for a removal that asks. "No removal" and
+/// `--dry-run` are decided before this. `--yes` answers; a terminal (and not
+/// `--json`) is asked; with none, a `--global` target is refused and anything
+/// else goes ahead.
+// shortcut: nothing calls on_removal until Step 2.2 wires cmd_sync.
+#[allow(dead_code)]
+fn on_removal(yes: bool, json: bool, terminal: bool, global: bool) -> Removal {
+    match (yes, terminal && !json, global) {
+        (true, _, _) => Removal::GoAhead,
+        (false, true, _) => Removal::Ask,
+        (false, false, true) => Removal::Refuse,
+        (false, false, false) => Removal::GoAhead,
+    }
 }
 
 /// Ask whether to delete the venv: core takes no input, so the front end asks.
@@ -2256,5 +2303,65 @@ mod tests {
                 UpgradeTarget::parse("alpha").unwrap(),
             ]
         ));
+    }
+
+    #[test]
+    fn on_removal_decides_from_all_sixteen_flag_combinations() {
+        use Removal::{Ask, GoAhead, Refuse};
+        // (yes, json, terminal, global) -> what sync does
+        let table = [
+            ((false, false, false, false), GoAhead),
+            ((false, false, false, true), Refuse),
+            ((false, false, true, false), Ask),
+            ((false, false, true, true), Ask),
+            ((false, true, false, false), GoAhead),
+            ((false, true, false, true), Refuse),
+            ((false, true, true, false), GoAhead),
+            ((false, true, true, true), Refuse),
+            ((true, false, false, false), GoAhead),
+            ((true, false, false, true), GoAhead),
+            ((true, false, true, false), GoAhead),
+            ((true, false, true, true), GoAhead),
+            ((true, true, false, false), GoAhead),
+            ((true, true, false, true), GoAhead),
+            ((true, true, true, false), GoAhead),
+            ((true, true, true, true), GoAhead),
+        ];
+        for ((yes, json, terminal, global), expected) in table {
+            assert_eq!(
+                on_removal(yes, json, terminal, global),
+                expected,
+                "yes={yes} json={json} terminal={terminal} global={global}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_dependencies_keeps_its_wording_and_refuses_without_a_terminal() {
+        let names = ["beta".to_string(), "gamma".to_string()];
+        let mut out = Vec::new();
+        assert!(confirm_dependencies(&names, true, &mut "y\n".as_bytes(), &mut out).unwrap());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "remove unshared dependencies (beta, gamma) too? [y/N] "
+        );
+        let refused = confirm_dependencies(&names, false, &mut "y\n".as_bytes(), &mut Vec::new());
+        assert!(refused.unwrap_err().to_string().contains("beta, gamma"));
+    }
+
+    #[test]
+    fn read_yes_puts_the_question_and_says_yes_only_to_y_or_yes() {
+        let answered = |line: &str| {
+            let mut out = Vec::new();
+            let said = read_yes(&mut line.as_bytes(), &mut out, "go? [y/N] ").unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), "go? [y/N] ");
+            said
+        };
+        for yes in ["y\n", "Y\n", "yes\n", "YES\n", " y \n", "y"] {
+            assert!(answered(yes), "{yes:?}");
+        }
+        for no in ["n\n", "\n", "", "yes please\n", "nope\n"] {
+            assert!(!answered(no), "{no:?}");
+        }
     }
 }
