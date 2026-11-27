@@ -2287,6 +2287,28 @@ Alpha = \"1.0\"
     }
 
     #[test]
+    #[ignore = "fork bug: merge_nipm matches NI package names case-sensitively and adds a duplicate; see #56"]
+    fn a_nipm_entry_differing_only_in_case_is_already_there() {
+        // Upstream's nipm_entries_are_copied_as_written, last assert.
+        let (scratch, root) = folder("import-nipm-case", "App");
+        let manifest = root.join("lvpm.toml");
+        let before = "[project]\nname = \"x\"\n\n[nipm.dependencies]\nni-visa = '24.0'\n";
+        std::fs::write(&manifest, before).unwrap();
+        std::fs::write(
+            root.join("vipm.toml"),
+            "[nipm.dependencies]\nNI-VISA = '25.0'\n",
+        )
+        .unwrap();
+        let sink = Recorded::default();
+        let env = env_on(&sink, &root);
+        let done = import(&env, Path::new("vipm.toml"), false, None, false).unwrap();
+        let after = std::fs::read_to_string(&manifest).unwrap();
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert_eq!(done.nipm_added, 0);
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn an_import_that_fails_part_way_leaves_the_manifest_as_it_was() {
         let (scratch, root) = folder("import-part-way", "App");
         let manifest = root.join("lvpm.toml");

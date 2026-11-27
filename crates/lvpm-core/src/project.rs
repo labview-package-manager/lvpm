@@ -2692,18 +2692,23 @@ vipm_package_builder = "*"
     #[test]
     fn malformed_groups_are_rejected_when_read() {
         // Upstream also refuses [dependencies.main]; gone: main is no reserved name, so it is a group.
-        assert!(
-            parse("[dependencies.t]\ninclude-groups = \"u\"\n").is_err(),
-            "not an array"
-        );
-        assert!(
-            parse("[dependencies.t]\ninclude-groups = [\"u\"]\n").is_err(),
-            "unknown include"
-        );
-        assert!(
-            parse("[dependencies.t]\nx = 1.0\n").is_err(),
-            "unquoted version"
-        );
+        for (manifest, says) in [
+            (
+                "[dependencies.t]\ninclude-groups = \"u\"\n",
+                "must be a list of group names",
+            ),
+            (
+                "[dependencies.t]\ninclude-groups = [\"u\"]\n",
+                "there is no group \"u\"",
+            ),
+            (
+                "[dependencies.t]\nx = 1.0\n",
+                "x: expected a quoted version or a table, got float",
+            ),
+        ] {
+            let err = format!("{:#}", parse(manifest).unwrap_err());
+            assert!(err.contains(says), "{manifest}: {err}");
+        }
     }
 
     #[test]
