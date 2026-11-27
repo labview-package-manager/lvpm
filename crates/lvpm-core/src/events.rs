@@ -153,6 +153,8 @@ pub enum Event {
     /// The manifest lists NI Package Manager dependencies, which lvpm does not
     /// install.
     NipmNotInstalled { count: usize },
+    /// The manifest's `[dependency-groups]` this install leaves out, in file order.
+    GroupsNotSelected { groups: Vec<String> },
     /// A package is already installed at the version resolution chose.
     PackageAlreadyInstalled { name: String, version: String },
     /// A newer version is installed than the one resolution chose, and the
@@ -795,6 +797,8 @@ pub enum RemoveReason {
     /// `lvpm.lock` lists it, but only groups need it, and this sync selects
     /// none of them. The groups are on the step.
     GroupsOnly,
+    /// `lvpm.lock` lists it for `[dependencies]`, and `--only` leaves those out.
+    DependenciesOnly,
 }
 
 /// A file a dry run would write.

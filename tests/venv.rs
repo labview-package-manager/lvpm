@@ -383,7 +383,6 @@ tester = \"*\"
 }
 
 #[test]
-#[ignore = "#68"]
 fn manifest_install_brings_in_main_and_the_selected_groups_only() {
     let lab = Lab::new("groups");
     lab.package("app", "1.0.0.1", "lib");
@@ -414,6 +413,21 @@ fn manifest_install_brings_in_main_and_the_selected_groups_only() {
     );
     lab.ok(&["install", "--only", "test"]);
     assert!(lab.record("tester").is_file());
+}
+
+#[test]
+#[ignore = "#55"]
+fn manifest_install_keeps_what_is_no_longer_listed_and_refuses_an_empty_selection() {
+    let lab = Lab::new("groups-additive");
+    lab.package("app", "1.0.0.1", "lib");
+    lab.package("lib", "1.0.0.1", "");
+    lab.write_manifest(
+        "[dependencies]
+app = \"*\"
+",
+    );
+    lab.ok(&["venv", "create"]);
+    lab.ok(&["install"]);
 
     // Additive: a package no longer listed stays until uninstalled.
     lab.write_manifest("[dependencies]\nlib = \"*\"\n");

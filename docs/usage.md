@@ -360,7 +360,8 @@ with `--global`. Packages from `[dev-dependencies]` are synced too; `--no-dev`
 leaves them out and uninstalls them if they are there. `--group <name>` (repeat
 it for more) also syncs a `[dependency-groups.<name>]`, and a package that only
 unselected groups need is uninstalled; a name the manifest does not define fails
-and lists the defined ones. `--group dev` with `--no-dev` is refused. A bare
+and lists the defined ones. `--group dev` with `--no-dev` is refused. `--with`, `--without` and `--only`
+select groups by the same rules, and a group brings its `include-groups`. A bare
 `lvpm install` takes the same flags. Groups are described in
 [manifest.md](https://github.com/ThatsTheEnd/lvpm/blob/main/docs/manifest.md#named-dependency-groups).
 

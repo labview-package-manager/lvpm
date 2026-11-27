@@ -24,6 +24,11 @@ group, and `[dependencies.dev]` as `[dev-dependencies]`, with a warning that
 names the header to write. An edit to a group in the old form is refused
 until the header is renamed.
 
+Amended on 2026-11-26 (labview-package-manager/lvpm#68): a group may take in
+others with `include-groups = [...]`, as PEP 735 has it, and `lvpm install`
+and `sync` select groups with `--with`, `--without` and `--only`. The
+expansion happens at sync time; the lock records each group's own lines.
+
 ## Context
 
 S1 adds `lvpm build`, so `lvpm.toml` needs keys that describe a package. The

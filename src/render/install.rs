@@ -161,6 +161,13 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                  Manager packages and lvpm does not install them.\n"
             ),
         ),
+        Event::GroupsNotSelected { groups } => r.line(
+            Stream::Err,
+            &format!(
+                "groups not selected: {} (--with <GROUP> adds one)",
+                groups.join(", ")
+            ),
+        ),
         Event::PackageAlreadyInstalled { name, version } => r.line(
             Stream::Out,
             &format!("= {name} {version} already installed"),

@@ -35,6 +35,7 @@ lvpm [--labview-version YYYY] [--prefix DIR | --project DIR] [--global] [--refre
   search <query>                search the indexes
   list                          what lvpm installed into the target
   install [<pkg>[@ver]] [--no-project] [--dev] [--group NAME] [--index NAME]
+          [--with GROUPS] [--without GROUPS] [--only GROUPS] [--no-dev]
           [--manifest FILE] [--dry-run] [--no-deps]
           [--no-linkfix] [--relink] [--resave] [--no-hooks | --hooks] [--allow-downgrade]
           [--relink-timeout SECS] [--relink-progress NAME] [--keep-open]

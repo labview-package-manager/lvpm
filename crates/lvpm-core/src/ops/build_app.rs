@@ -152,6 +152,7 @@ fn wanted_in_the_venv() -> Selection {
         no_dev: true,
         groups: Vec::new(),
         keep_listed: true,
+        ..Selection::default()
     }
 }
 

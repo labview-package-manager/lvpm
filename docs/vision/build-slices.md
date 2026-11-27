@@ -703,7 +703,9 @@ not one upstream reads; this is on the upstream agenda above.
 `[dependencies.<name>]` is read as a group again, with a warning naming the
 current header; `add`, `remove`, `import` and an upgrade refuse to edit it
 until it is renamed.
-`include-groups` and `--with` / `--without` / `--only` are still not ported.
+
+*Amended 2026-11-26 (labview-package-manager/lvpm#68):* `include-groups` and
+`--with` / `--without` / `--only` are ported; see manifest.md.
 
 In scope:
 - `[dependency-groups.<name>]` tables shaped like `[dependencies]`; names are
@@ -721,7 +723,8 @@ In scope:
   never uninstall a package the new lock still lists.
 - `--json` events keep `dev` and add `group` and `created_table` where they apply.
 
-Out of scope: `include-groups`, `--with` / `--without` / `--only`, `--only-group`,
+Out of scope (`include-groups` and `--with` / `--without` / `--only` came with
+labview-package-manager/lvpm#68): `--only-group`,
 `--all-groups`, a configurable default set of groups (`[project] default-groups`),
 groups on a global `lvpm install`, installing a `vipm.toml`'s packages.
 
