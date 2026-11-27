@@ -217,7 +217,7 @@ pub fn sync_asking(
         announce_migration(env, &plan);
     }
     if plan.is_empty() {
-        settled.write_lock(env)?;
+        settled.write_lock(env, &lock_path)?;
         // In line with the lock, but the merged palette addon may still be
         // owed: the fix `lvpm launch` points at for a stale one.
         if let crate::ops::Destination::Venv(v) = &dest
@@ -240,22 +240,12 @@ pub fn sync_asking(
         steps: plan.steps.clone(),
         dry_run: false,
     });
-    if asks {
-        match ask(&removals).map_err(SyncError::Other)? {
-            Answer::Asked(false) => {
-                env.sink.emit(Event::SyncDeclined {
-                    removing: package_refs(&removals),
-                });
-                return Ok(());
-            }
-            Answer::Asked(true) => {}
-            Answer::NotAsked if settled.first_sync => announce_migration(env, &plan),
-            Answer::NotAsked => {}
-        }
+    if asks && !goes_ahead(env, ask, &plan, &removals, settled.first_sync)? {
+        return Ok(());
     }
 
     let planned = fetch_locked(env, project, &plan.wanted)?;
-    settled.write_lock(env)?;
+    settled.write_lock(env, &lock_path)?;
     // The first change is a removal or an install, and every archive is in
     // hand: this is where cancelling stops being possible. The lock write has
     // said so already when there was a lock to write.
@@ -281,6 +271,33 @@ pub fn sync_asking(
     )?;
     finish(env, &mut session, &applied, &opts.install)?;
     Ok(())
+}
+
+/// Put `removals` to `ask`: whether the sync goes ahead. On a "no" it says so
+/// and stops; a front end that went ahead without asking is followed by the
+/// note of a first sync, which the question would have said itself.
+fn goes_ahead(
+    env: &OpEnv,
+    ask: &dyn Fn(&[SyncStep]) -> anyhow::Result<Answer>,
+    plan: &SyncPlan,
+    removals: &[SyncStep],
+    first_sync: bool,
+) -> Result<bool, SyncError> {
+    match ask(removals).map_err(SyncError::Other)? {
+        Answer::Asked(false) => {
+            env.sink.emit(Event::SyncDeclined {
+                removing: package_refs(removals),
+            });
+            Ok(false)
+        }
+        Answer::Asked(true) => Ok(true),
+        Answer::NotAsked => {
+            if first_sync {
+                announce_migration(env, plan);
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// Fail, before any lock is read or written, when a selected group is not dev
@@ -327,11 +344,19 @@ impl Settled {
     /// Write the lock this sync made, if it made one: the one place it is
     /// written, once the archives are in hand, so that a sync that fails
     /// before it changes anything leaves `lvpm.lock` as it was.
-    fn write_lock(&mut self, env: &OpEnv) -> Result<(), SyncError> {
-        match self.pending.take() {
-            Some(pending) => Ok(pending.write(env)?),
-            None => Ok(()),
+    fn write_lock(&mut self, env: &OpEnv, lock_path: &Path) -> Result<(), SyncError> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        // Said here and not when the lock was found missing: a sync that is
+        // declined, or whose fetch fails, writes none.
+        if self.first_sync {
+            env.sink.emit(Event::SyncLockMissing {
+                path: lock_path.to_path_buf(),
+                dry_run: false,
+            });
         }
+        Ok(pending.write(env)?)
     }
 }
 
@@ -370,10 +395,11 @@ fn settle_lock(
             }
             read => {
                 let missing = matches!(read, Err(LockError::NoLock { .. }));
-                if missing {
+                // A dry run writes nothing, so it says now what a sync says at the write.
+                if missing && opts.install.dry_run {
                     env.sink.emit(Event::SyncLockMissing {
                         path: lock_path.to_path_buf(),
-                        dry_run: opts.install.dry_run,
+                        dry_run: true,
                     });
                 }
                 let (lock, pending) = new_lock(env, found, lock_path, opts.install.dry_run)?;
@@ -2796,7 +2822,7 @@ beta = \"*\"
         assert_ne!(
             project.lock_bytes().unwrap(),
             before,
-            "the lock is as it was"
+            "the lock was not rewritten"
         );
         let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
         let nothing = position(&events, |e| e == &Event::SyncNothingToDo);
@@ -2987,18 +3013,15 @@ beta = \"*\"
     #[test]
     fn an_accepted_sync_removes_the_package_and_writes_the_lock() {
         let project = project_whose_new_lock_drops_gamma("accepted");
-        let before = project.lock_bytes().unwrap();
         let question = Question::answering(Answer::Asked(true));
 
         let (outcome, events) = project.sync_asked(&SyncOptions::default(), &question);
 
         outcome.unwrap();
         assert_eq!(project.installed(), pairs(BETA_AND_ALPHA));
-        assert_ne!(
-            project.lock_bytes().unwrap(),
-            before,
-            "the lock is as it was"
-        );
+        let locked = Lockfile::read(&project.lock_path()).unwrap();
+        let names: Vec<&str> = locked.packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "beta"], "the new lock was not written");
         assert!(
             !events
                 .iter()
@@ -3156,6 +3179,117 @@ beta = \"*\"
             (project.lock_bytes(), project.installed()),
             (lock, installed)
         );
+    }
+
+    #[test]
+    fn a_declined_first_sync_does_not_say_it_is_writing_a_lock() {
+        let project = project_whose_new_lock_drops_gamma("declined-no-lock-note");
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (_, events) = project.sync_asked(
+            &SyncOptions::default(),
+            &Question::answering(Answer::Asked(false)),
+        );
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::SyncLockMissing { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_first_sync_that_goes_ahead_says_it_is_writing_a_lock_just_before_it_does() {
+        let project = project_whose_new_lock_drops_gamma("lock-note-before-write");
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (outcome, events) = project.sync_asked(
+            &SyncOptions::default(),
+            &Question::answering(Answer::Asked(true)),
+        );
+
+        outcome.unwrap();
+        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
+        let said = position(&events, |e| matches!(e, Event::SyncLockMissing { .. }));
+        let changed = position(&events, |e| matches!(e, Event::LockChanged { .. }));
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        assert!(
+            planned < said && said < changed && changed < written,
+            "{events:?}"
+        );
+    }
+
+    /// Takes the cache away once the plan is said, and notes whether the cache
+    /// is back, as the fetch of the archives puts it, when the lock is written.
+    struct CacheBackWhenLockWritten {
+        cache: PathBuf,
+        back: Mutex<Option<bool>>,
+    }
+
+    impl EventSink for CacheBackWhenLockWritten {
+        fn emit(&self, event: Event) {
+            match event {
+                Event::SyncPlanned { .. } => {
+                    std::fs::remove_dir_all(&self.cache).unwrap();
+                }
+                Event::LockWritten { .. } => {
+                    *self.back.lock().unwrap() = Some(self.cache.exists());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn the_lock_is_written_after_the_archives_are_fetched_into_the_cache() {
+        let project = project("fetch-then-lock", &["beta"]);
+        let sink = CacheBackWhenLockWritten {
+            cache: project.root.join("cache"),
+            back: Mutex::new(None),
+        };
+
+        sync(&project.sync_env(&sink), &SyncOptions::default()).unwrap();
+
+        assert_eq!(
+            *sink.back.lock().unwrap(),
+            Some(true),
+            "the lock was written before the archives were fetched"
+        );
+    }
+
+    #[test]
+    fn a_fetch_that_fails_after_a_yes_leaves_the_lock_and_the_package_to_be_removed_as_they_were() {
+        for lock_there in [true, false] {
+            let project = project_with_an_unresolved_requirement("yes-then-fetch-fails");
+            project.write_manifest(&["alpha", "gamma"]);
+            project.sync(&SyncOptions::default()).0.unwrap();
+            // beta is new, gamma is dropped, and beta's archive is about to be lost.
+            project.write_manifest(&["beta"]);
+            if !lock_there {
+                std::fs::remove_file(project.lock_path()).unwrap();
+            }
+            let (lock, installed) = (project.lock_bytes(), project.installed());
+            let question = Question::answering(Answer::Asked(true));
+            let sink = LoseArchivesOnceLocked::of(&project);
+
+            let outcome = sync_asking(&project.sync_env(&sink), &SyncOptions::default(), &|r| {
+                question.put(r)
+            });
+
+            assert!(
+                matches!(outcome, Err(SyncError::Archives(_))),
+                "lock there {lock_there}: {outcome:?}"
+            );
+            assert_eq!(question.asked().len(), 1, "lock there {lock_there}");
+            assert_eq!(project.lock_bytes(), lock, "lock there {lock_there}");
+            assert_eq!(project.installed(), installed, "lock there {lock_there}");
+            assert_eq!(
+                installed,
+                pairs(&[("alpha", "2.0"), ("gamma", "1.0")]),
+                "gamma is still installed"
+            );
+        }
     }
 
     #[test]

@@ -36,7 +36,7 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 r.line(Stream::Out, "dry run: nothing changed");
             }
         }
-        // Placeholder wording: Step 2.2 words the decline and its `next:` hint.
+        // shortcut: placeholder wording with no `next:` hint, Step 2.2 words the decline.
         Event::SyncDeclined { .. } => r.line(Stream::Out, "sync cancelled: nothing was changed"),
         Event::SyncNothingToDo => r.line(
             Stream::Out,
