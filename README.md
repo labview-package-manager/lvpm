@@ -79,9 +79,17 @@ The script verifies the release zip's SHA-256 and puts `lvpm.exe` in
 need no elevation. If PowerShell refuses to run the script, allow it with
 [Set-ExecutionPolicy](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/set-executionpolicy?view=powershell-7.6).
 
-On Linux x64, download `lvpm-x86_64-unknown-linux-gnu.tar.gz` from the same
-page. Script options, the checksum steps, Linux and building from source are
-in [docs/install.md](docs/install.md).
+On Linux x64:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/labview-package-manager/lvpm/main/scripts/install.sh
+sh install.sh
+```
+
+It verifies the release tarball's SHA-256 and puts `lvpm` in `~/.local/bin`
+(`/usr/local/bin` as root), adding that to `PATH` in `~/.profile`. Script
+options, the checksum steps and building from source are in
+[docs/install.md](docs/install.md).
 
 ## Quick start
 
