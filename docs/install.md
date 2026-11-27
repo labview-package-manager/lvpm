@@ -69,7 +69,7 @@ tarball; `sh install.sh --help` lists every option. It needs curl, tar,
 gzip, sed, awk and sha256sum, and no root.
 
 By hand: download `lvpm-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256` from the
-newest [release](https://github.com/ThatsTheEnd/lvpm/releases), then:
+newest [release](https://github.com/labview-package-manager/lvpm/releases), then:
 
 ```sh
 sha256sum -c lvpm-x86_64-unknown-linux-gnu.tar.gz.sha256

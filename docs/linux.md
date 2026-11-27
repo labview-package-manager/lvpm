@@ -155,8 +155,8 @@ What Linux still needs, most important first.
    And a VI that links a subVI in a different case does not load on Linux.
 4. **Releases.** A release carries a Linux tarball, built against Ubuntu
    22.04's glibc rather than the static musl build above, and
-   `scripts/install.sh` installs it as `install.ps1` installs the zip. CI
-   installs each build with it inside NI's 2025 and 2026 Linux images.
+   `scripts/install.sh` installs it as `install.ps1` installs the zip. PR CI
+   installs each PR build with it inside NI's 2025 and 2026 Linux images.
 5. **Not measured.** LabVIEW for Linux before 2026 (the `.conf` directory
    name, `readme/UNINSTALL`, `LVAddons.AdditionalLocations` from 2024 Q1 on);
    other distributions (RHEL, openSUSE); Community edition; an interactive IDE
