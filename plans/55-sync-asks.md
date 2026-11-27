@@ -462,9 +462,9 @@ graph TD
 ## Build Progress
 
 ### Wave 1
-- [ ] Slice 1: core holds the lock in memory and asks through a callback
+- [x] Slice 1: core holds the lock in memory and asks through a callback
   - [x] Step 1.1: a pending lock, written after the fetch
-  - [ ] Step 1.2: sync_asking, called only when a NotInLock removal is planned
+  - [x] Step 1.2: sync_asking, called only when a NotInLock removal is planned
 
 ### Wave 2
 - [ ] Slice 2: the CLI asks, goes ahead or refuses

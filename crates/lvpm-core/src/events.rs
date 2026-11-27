@@ -552,6 +552,8 @@ pub enum Event {
     SyncMigration { removing: Vec<PackageRef> },
     /// What the sync does, before it does it; on a dry run, instead.
     SyncPlanned { steps: Vec<SyncStep>, dry_run: bool },
+    /// The user said no to the removals of `removing`, and nothing was changed.
+    SyncDeclined { removing: Vec<PackageRef> },
     /// The destination already holds exactly what the lock lists.
     SyncNothingToDo,
 

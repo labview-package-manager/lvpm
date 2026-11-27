@@ -173,6 +173,7 @@ impl Renderer {
             | Event::SyncUnresolved { .. }
             | Event::SyncMigration { .. }
             | Event::SyncPlanned { .. }
+            | Event::SyncDeclined { .. }
             | Event::SyncNothingToDo => sync::render(self, event),
             Event::VenvLabviewStarting { .. }
             | Event::VenvLabviewStillStarting { .. }

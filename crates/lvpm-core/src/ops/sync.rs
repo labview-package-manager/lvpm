@@ -146,16 +146,38 @@ impl Selection {
     }
 }
 
+/// What the front end did about the question [`sync_asking`] puts to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// The user was asked, and said yes or no.
+    Asked(bool),
+    /// The front end went ahead without asking: `--yes`, or no terminal.
+    NotAsked,
+}
+
 /// Make the destination `env` settles hold exactly the packages `lvpm.lock`
 /// lists: install what is missing, replace what is at another version or from
-/// another archive, and take out what the lock does not list, saying so first
-/// and asking nothing.
+/// another archive, and take out what the lock does not list, saying so first.
+/// It asks nothing: [`sync_asking`] is the sync that does.
 ///
 /// Every archive is in hand before the first change, so a missing or altered
 /// archive fails the sync with the destination, and `lvpm.lock`, as they were:
 /// a lock made here is written once the archives are in hand. A dry run reports
 /// the plan, and changes nothing.
 pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
+    sync_asking(env, opts, &|_| Ok(Answer::NotAsked))
+}
+
+/// [`sync`], except that a plan that removes a package the lock does not list
+/// is put to `ask` once it is said, and before anything is written or fetched.
+/// `ask` gets those removals, and answers for the user. "No" ends the sync with
+/// `SyncDeclined` and nothing changed, and so does an error of `ask`, which is
+/// the sync's error. A dry run and a plan with no such removal ask nothing.
+pub fn sync_asking(
+    env: &OpEnv,
+    opts: &SyncOptions,
+    ask: &dyn Fn(&[SyncStep]) -> anyhow::Result<Answer>,
+) -> Result<(), SyncError> {
     if opts.headless_implied {
         env.sink.emit(Event::HeadlessImpliesLocked);
     }
@@ -188,7 +210,10 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
 
     let selection = opts.selection();
     let plan = plan_sync(&settled.lock, &install::list_installed(&store)?, &selection);
-    if settled.first_sync {
+    // A sync that asks says what it removes in its question, after the plan.
+    let removals = removals_to_ask(&plan);
+    let asks = !removals.is_empty() && !opts.install.dry_run;
+    if settled.first_sync && !asks {
         announce_migration(env, &plan);
     }
     if plan.is_empty() {
@@ -209,6 +234,24 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
             dry_run: true,
         });
         return Ok(());
+    }
+
+    env.sink.emit(Event::SyncPlanned {
+        steps: plan.steps.clone(),
+        dry_run: false,
+    });
+    if asks {
+        match ask(&removals).map_err(SyncError::Other)? {
+            Answer::Asked(false) => {
+                env.sink.emit(Event::SyncDeclined {
+                    removing: package_refs(&removals),
+                });
+                return Ok(());
+            }
+            Answer::Asked(true) => {}
+            Answer::NotAsked if settled.first_sync => announce_migration(env, &plan),
+            Answer::NotAsked => {}
+        }
     }
 
     let planned = fetch_locked(env, project, &plan.wanted)?;
@@ -380,35 +423,51 @@ fn new_lock(
 /// The first sync of a project removes what the lock it just made does not
 /// list, which nobody asked for in so many words: say so.
 pub(super) fn announce_migration(env: &OpEnv, plan: &SyncPlan) {
-    let removing: Vec<PackageRef> = plan
-        .steps
-        .iter()
-        .filter_map(|step| match step {
-            SyncStep::Remove {
-                name,
-                version,
-                reason: RemoveReason::NotInLock,
-                ..
-            } => Some(PackageRef {
-                name: name.clone(),
-                version: version.clone(),
-            }),
-            _ => None,
-        })
-        .collect();
+    let removing = package_refs(&removals_to_ask(plan));
     if !removing.is_empty() {
         env.sink.emit(Event::SyncMigration { removing });
     }
 }
 
+/// The removals a sync asks about: those of a package the lock does not list.
+/// What `--no-dev` and a group selection take out follows from what the user
+/// typed, and is not asked about.
+fn removals_to_ask(plan: &SyncPlan) -> Vec<SyncStep> {
+    (plan.steps.iter())
+        .filter(|step| {
+            matches!(
+                step,
+                SyncStep::Remove {
+                    reason: RemoveReason::NotInLock,
+                    ..
+                }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// The packages the removals take out.
+fn package_refs(removals: &[SyncStep]) -> Vec<PackageRef> {
+    (removals.iter())
+        .filter_map(|step| match step {
+            SyncStep::Remove { name, version, .. } => Some(PackageRef {
+                name: name.clone(),
+                version: version.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Put the destination right: take out what the plan removes, then install and
 /// replace what it lists, the archives of `planned` being already in hand.
-/// What the plan does is said first. The relink, the hooks and the palette
-/// refresh are left to [`finish`], which spends what this leaves in the
-/// session.
+/// The relink, the hooks and the palette refresh are left to [`finish`], which
+/// spends what this leaves in the session.
 ///
-/// The caller has called `begin_unpack` before its first write, which may be the
-/// lock's: this changes the destination and takes no cancel.
+/// The caller has said what the plan does (`SyncPlanned`), and has called
+/// `begin_unpack` before its first write, which may be the lock's: this changes
+/// the destination and takes no cancel.
 ///
 /// A change that fails stops the rest. The error says which packages are done
 /// and which are not, so that running the sync again can finish it.
@@ -421,10 +480,6 @@ pub fn apply_sync(
     planned: Vec<PlannedPackage>,
     opts: &SyncOptions,
 ) -> Result<Applied, SyncError> {
-    env.sink.emit(Event::SyncPlanned {
-        steps: plan.steps.clone(),
-        dry_run: false,
-    });
     change(env, session, plan, planned, opts)
         .map_err(|cause| incomplete(session, lock, plan, selection, &cause))
 }
@@ -2165,9 +2220,9 @@ beta = \"*\"
         assert!(
             !events.iter().any(|event| matches!(
                 event,
-                Event::SyncPlanned { .. } | Event::PackageStart { .. }
+                Event::PackageStart { .. } | Event::PackageRemoved { .. }
             )),
-            "nothing was announced or started: {events:?}"
+            "nothing was started: {events:?}"
         );
     }
 
@@ -2782,7 +2837,7 @@ beta = \"*\"
     }
 
     #[test]
-    fn a_first_sync_says_what_it_takes_out_before_it_writes_the_lock_and_then_announces_the_plan() {
+    fn a_first_sync_announces_the_plan_and_then_what_it_takes_out_before_it_writes_the_lock() {
         let project = project("event-order", &["beta", "gamma"]);
         project.sync(&SyncOptions::default()).0.unwrap();
         std::fs::remove_file(project.lock_path()).unwrap();
@@ -2792,11 +2847,11 @@ beta = \"*\"
         outcome.unwrap();
 
         let hashing = position(&events, |e| matches!(e, Event::LockHashing { .. }));
+        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
         let migration = position(&events, |e| matches!(e, Event::SyncMigration { .. }));
         let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
-        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
         assert!(
-            hashing < migration && migration < written && written < planned,
+            hashing < planned && planned < migration && migration < written,
             "{events:?}"
         );
     }
@@ -2819,6 +2874,375 @@ beta = \"*\"
         assert!(matches!(outcome, Err(SyncError::Cancelled)), "{outcome:?}");
         assert_eq!(project.lock_bytes(), None, "a lock was written");
         assert_eq!(project.installed(), installed);
+    }
+
+    // ---- the question a sync puts before it removes ----
+
+    /// A front end that gives `answer`, and keeps what it was asked.
+    struct Question {
+        answer: Result<Answer, &'static str>,
+        asked: std::cell::RefCell<Vec<Vec<SyncStep>>>,
+    }
+
+    impl Question {
+        fn answering(answer: Answer) -> Self {
+            Question {
+                answer: Ok(answer),
+                asked: Default::default(),
+            }
+        }
+
+        fn failing(why: &'static str) -> Self {
+            Question {
+                answer: Err(why),
+                asked: Default::default(),
+            }
+        }
+
+        fn put(&self, removals: &[SyncStep]) -> anyhow::Result<Answer> {
+            self.asked.borrow_mut().push(removals.to_vec());
+            self.answer.map_err(|why| anyhow::anyhow!(why))
+        }
+
+        fn asked(&self) -> Vec<Vec<SyncStep>> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    impl Scratch {
+        fn sync_asked(
+            &self,
+            opts: &SyncOptions,
+            question: &Question,
+        ) -> (Result<(), SyncError>, Vec<Event>) {
+            let sink = Recorder::default();
+            let outcome = sync_asking(&self.sync_env(&sink), opts, &|removals| {
+                question.put(removals)
+            });
+            (outcome, sink.events())
+        }
+    }
+
+    /// beta and gamma are synced, and then the manifest asks for beta alone:
+    /// the lock is outdated, and the one it makes drops gamma, which is installed.
+    fn project_whose_new_lock_drops_gamma(tag: &str) -> Scratch {
+        let project = project(tag, &["beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["beta"]);
+        project
+    }
+
+    fn planned_count(events: &[Event]) -> usize {
+        let planned = |event: &&Event| matches!(event, Event::SyncPlanned { dry_run: false, .. });
+        events.iter().filter(planned).count()
+    }
+
+    const BETA_AND_ALPHA: &[(&str, &str)] = &[("alpha", "2.0"), ("beta", "1.0")];
+
+    #[test]
+    fn a_declined_sync_with_no_lock_writes_none_removes_nothing_and_says_so() {
+        let project = project_whose_new_lock_drops_gamma("declined-no-lock");
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let installed = project.installed();
+        let question = Question::answering(Answer::Asked(false));
+
+        let (outcome, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+        outcome.unwrap();
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert_eq!(project.installed(), installed);
+        assert!(
+            events.contains(&Event::SyncDeclined {
+                removing: vec![PackageRef {
+                    name: "gamma".into(),
+                    version: "1.0".into()
+                }]
+            }),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::SyncMigration { .. } | Event::PackageRemoved { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_declined_sync_leaves_an_outdated_lock_as_it_was() {
+        let project = project_whose_new_lock_drops_gamma("declined-outdated");
+        let (lock, installed) = (project.lock_bytes().unwrap(), project.installed());
+        let question = Question::answering(Answer::Asked(false));
+
+        project
+            .sync_asked(&SyncOptions::default(), &question)
+            .0
+            .unwrap();
+
+        assert_eq!(project.lock_bytes(), Some(lock));
+        assert_eq!(project.installed(), installed);
+    }
+
+    #[test]
+    fn an_accepted_sync_removes_the_package_and_writes_the_lock() {
+        let project = project_whose_new_lock_drops_gamma("accepted");
+        let before = project.lock_bytes().unwrap();
+        let question = Question::answering(Answer::Asked(true));
+
+        let (outcome, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+        outcome.unwrap();
+        assert_eq!(project.installed(), pairs(BETA_AND_ALPHA));
+        assert_ne!(
+            project.lock_bytes().unwrap(),
+            before,
+            "the lock is as it was"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::SyncDeclined { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn the_question_is_put_once_with_exactly_the_packages_the_lock_does_not_list() {
+        let project = project("asked-two", &["alpha", "beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["alpha"]);
+        let question = Question::answering(Answer::Asked(false));
+
+        project
+            .sync_asked(&SyncOptions::default(), &question)
+            .0
+            .unwrap();
+
+        assert_eq!(
+            question.asked(),
+            [[
+                remove("beta", "1.0", RemoveReason::NotInLock),
+                remove("gamma", "1.0", RemoveReason::NotInLock)
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_failing_question_stops_the_sync_with_its_error_before_any_change() {
+        let project = project_whose_new_lock_drops_gamma("question-fails");
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let installed = project.installed();
+        let question = Question::failing("needs --yes");
+
+        let (outcome, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+        assert!(
+            matches!(&outcome, Err(SyncError::Other(why)) if why.to_string() == "needs --yes"),
+            "{outcome:?}"
+        );
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert_eq!(project.installed(), installed);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::LockWritten { .. }
+                    | Event::PackageStart { .. }
+                    | Event::PackageRemoved { .. }
+                    | Event::SyncMigration { .. }
+                    | Event::SyncDeclined { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn no_question_is_put_when_nothing_is_removed_or_what_is_removed_follows_from_the_flags() {
+        let no_dev = SyncOptions {
+            no_dev: true,
+            ..SyncOptions::default()
+        };
+        let dry_run = SyncOptions {
+            install: InstallOptions {
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+            ..SyncOptions::default()
+        };
+        let dev_only = || {
+            let project = project("no-ask-dev-only", &["alpha"]);
+            std::fs::write(
+                project.root.join(crate::project::FILE_NAME),
+                format!("{MANIFEST_HEAD}[dependencies]\nalpha = \"*\"\n\n[dev-dependencies]\ngamma = \"*\"\n"),
+            )
+            .unwrap();
+            project.sync(&SyncOptions::default()).0.unwrap();
+            project
+        };
+        let replaced = || {
+            let project = project("no-ask-replace", &["alpha"]);
+            project.sync(&SyncOptions::default()).0.unwrap();
+            std::fs::write(
+                project.root.join(crate::project::FILE_NAME),
+                format!("{MANIFEST_HEAD}[dependencies]\nalpha = \"1.0\"\n"),
+            )
+            .unwrap();
+            project
+        };
+        let group_dropped = || {
+            let project = project_with_a_ci_group("no-ask-group");
+            project.sync(&selecting(&["ci"])).0.unwrap();
+            project
+        };
+        let cases = [
+            (
+                "a package to install",
+                project("no-ask-install", &["beta"]),
+                SyncOptions::default(),
+            ),
+            ("a version to replace", replaced(), SyncOptions::default()),
+            ("a dev-only package", dev_only(), no_dev),
+            (
+                "a group no longer selected",
+                group_dropped(),
+                SyncOptions::default(),
+            ),
+            (
+                "a dry run that would remove",
+                project_whose_new_lock_drops_gamma("no-ask-dry-run"),
+                dry_run,
+            ),
+        ];
+        for (label, project, opts) in cases {
+            let question = Question::answering(Answer::Asked(false));
+
+            let (outcome, events) = project.sync_asked(&opts, &question);
+
+            outcome.unwrap_or_else(|why| panic!("{label}: {why}"));
+            assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new(), "{label}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::SyncDeclined { .. })),
+                "{label}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_says_it_would_remove_the_package_and_asks_nothing_and_changes_nothing() {
+        let project = project_whose_new_lock_drops_gamma("dry-run-no-ask");
+        let (lock, installed) = (project.lock_bytes(), project.installed());
+        let question = Question::answering(Answer::Asked(false));
+        let opts = SyncOptions {
+            install: InstallOptions {
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+            ..SyncOptions::default()
+        };
+
+        let (outcome, events) = project.sync_asked(&opts, &question);
+
+        outcome.unwrap();
+        assert!(
+            events.contains(&Event::SyncPlanned {
+                steps: vec![remove("gamma", "1.0", RemoveReason::NotInLock)],
+                dry_run: true
+            }),
+            "{events:?}"
+        );
+        assert_eq!(
+            (project.lock_bytes(), project.installed()),
+            (lock, installed)
+        );
+    }
+
+    #[test]
+    fn a_dry_run_of_a_first_sync_still_says_what_it_would_take_out() {
+        let project = project_whose_new_lock_drops_gamma("dry-run-first-sync");
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let opts = SyncOptions {
+            install: InstallOptions {
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+            ..SyncOptions::default()
+        };
+
+        let (outcome, events) =
+            project.sync_asked(&opts, &Question::answering(Answer::Asked(false)));
+
+        outcome.unwrap();
+        let migration = position(&events, |e| matches!(e, Event::SyncMigration { .. }));
+        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
+        assert!(migration < planned, "{events:?}");
+    }
+
+    #[test]
+    fn the_plan_is_announced_once_whichever_way_the_question_is_answered() {
+        let answers = [
+            ("yes", Question::answering(Answer::Asked(true))),
+            ("no", Question::answering(Answer::Asked(false))),
+            ("not asked", Question::answering(Answer::NotAsked)),
+            ("an error", Question::failing("needs --yes")),
+        ];
+        for (label, question) in answers {
+            let project = project_whose_new_lock_drops_gamma("planned-once");
+
+            let (_, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+            assert_eq!(planned_count(&events), 1, "{label}: {events:?}");
+        }
+    }
+
+    #[test]
+    fn the_question_comes_after_the_plan_and_before_any_write_and_a_note_follows_only_when_not_asked()
+     {
+        for (answer, says_what_it_takes_out) in
+            [(Answer::Asked(true), false), (Answer::NotAsked, true)]
+        {
+            let project = project_whose_new_lock_drops_gamma("question-order");
+            std::fs::remove_file(project.lock_path()).unwrap();
+            let sink = Recorder::default();
+            let put_after = std::cell::Cell::new(None);
+            let ask = |_: &[SyncStep]| {
+                put_after.set(Some(sink.events().len()));
+                Ok(answer)
+            };
+
+            sync_asking(&project.sync_env(&sink), &SyncOptions::default(), &ask).unwrap();
+
+            let (events, put_after) = (sink.events(), put_after.get().unwrap());
+            let before = &events[..put_after];
+            let after = &events[put_after..];
+            assert!(
+                before
+                    .iter()
+                    .any(|e| matches!(e, Event::SyncPlanned { dry_run: false, .. })),
+                "{answer:?}: {events:?}"
+            );
+            assert!(
+                !before.iter().any(|e| matches!(
+                    e,
+                    Event::LockWritten { .. }
+                        | Event::PackageRemoved { .. }
+                        | Event::SyncMigration { .. }
+                )),
+                "{answer:?}: {events:?}"
+            );
+            assert!(
+                after.iter().any(|e| matches!(e, Event::LockWritten { .. })),
+                "{answer:?}: {events:?}"
+            );
+            assert_eq!(
+                after
+                    .iter()
+                    .any(|e| matches!(e, Event::SyncMigration { .. })),
+                says_what_it_takes_out,
+                "{answer:?}: {events:?}"
+            );
+        }
     }
 
     // ---- a LabVIEW installation that is not there: --global and headless ----

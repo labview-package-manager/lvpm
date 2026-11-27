@@ -451,7 +451,7 @@ fn floor(
 /// other projects, or the user, put into the installation, or what they may
 /// still use (the dependencies the relock drops). A headless project that
 /// resolves to the installation without `--global` is not guarded: it chose it.
-// shortcut: temporary until #55 asks instead; it also refuses the dependencies the edit drops, since lvpm cannot tell who put them there.
+// #55 made `sync` and a bare `install` ask and left this guard on purpose: a named add, remove, install or uninstall does not ask. It also refuses the dependencies the edit drops, since lvpm cannot tell who put them there.
 fn refuse_foreign_packages(
     env: &OpEnv,
     dest: &Destination,
@@ -591,6 +591,10 @@ fn commit(
         match plan.is_empty() {
             true => env.sink.emit(Event::SyncNothingToDo),
             false => {
+                env.sink.emit(Event::SyncPlanned {
+                    steps: plan.steps.clone(),
+                    dry_run: false,
+                });
                 let mut session = InstallSession::new(dest);
                 let applied = apply_sync(
                     env,
@@ -1777,6 +1781,32 @@ alpha = \"1.0\"
         );
         assert_eq!(world.locked(), ["alpha 2.0", "beta 1.0"]);
         assert_eq!(world.installed(), ["alpha 2.0", "beta 1.0"]);
+    }
+
+    #[test]
+    fn a_removal_that_takes_a_package_out_announces_the_plan_once_after_the_lock_is_written() {
+        let world = World::new("plan-once", PROJECT);
+        let setup = Recorder::default();
+        add(
+            &world.env(&setup),
+            "gamma",
+            ci(),
+            None,
+            &InstallOptions::default(),
+        )
+        .unwrap();
+        let sink = Recorder::default();
+
+        remove(&world.env(&sink), "gamma", ci(), &InstallOptions::default()).unwrap();
+
+        let events = sink.events();
+        let planned = |event: &&Event| matches!(event, Event::SyncPlanned { dry_run: false, .. });
+        assert_eq!(events.iter().filter(planned).count(), 1, "{events:?}");
+        let position = |wanted: fn(&Event) -> bool| events.iter().position(wanted).unwrap();
+        let written = position(|e| matches!(e, Event::LockWritten { .. }));
+        let announced = position(|e| matches!(e, Event::SyncPlanned { .. }));
+        let removed = position(|e| matches!(e, Event::PackageRemoved { .. }));
+        assert!(written < announced && announced < removed, "{events:?}");
     }
 
     #[test]

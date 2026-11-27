@@ -36,6 +36,8 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 r.line(Stream::Out, "dry run: nothing changed");
             }
         }
+        // Placeholder wording: Step 2.2 words the decline and its `next:` hint.
+        Event::SyncDeclined { .. } => r.line(Stream::Out, "sync cancelled: nothing was changed"),
         Event::SyncNothingToDo => r.line(
             Stream::Out,
             "nothing to do: the destination already matches lvpm.lock",
