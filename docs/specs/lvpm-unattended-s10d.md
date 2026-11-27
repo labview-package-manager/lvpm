@@ -19,9 +19,10 @@ lvpm keeps upgrading in `lock`. The README says so and gives the two commands.
 - **`--yes` / `-y`**: a global flag on `Cli` in `src/main.rs`, also set by
   `LVPM_YES` through clap's `env` feature. clap reads `0`, `false`, `no`, `off`
   and the empty string as false. It replaces `VenvCmd::Remove`'s own `yes`, so
-  `lvpm venv remove -y` keeps parsing. `venv remove` is the only prompt
-  (`confirm_removal`). The `--json` refusal stays: without `--yes`, `venv
-  remove` fails under `--json`.
+  `lvpm venv remove -y` keeps parsing. There are three prompts: `venv remove`
+  (`confirm_removal`), uninstall's dependency question (`confirm_dependencies`)
+  and sync's removal question (`sync_ask`). The `--json` refusal stays: without
+  `--yes`, `venv remove` fails under `--json`.
 - **`--labview-bitness <32|64>`**: a global flag. It goes into
   `DestinationFlags::labview_bitness: Option<u8>`. A new function in
   `crates/lvpm-core/src/target.rs` narrows a target list to one bitness. It
@@ -42,8 +43,9 @@ lvpm keeps upgrading in `lock`. The README says so and gives the two commands.
    remove` delete the venv without reading stdin. With `LVPM_YES=0` it asks.
 2. Under `--json`, `venv remove` without `--yes` or `LVPM_YES` still fails.
    Its message now names both `--yes` and `LVPM_YES`. With either one, it deletes.
-3. `lvpm sync --yes` parses. Since #55, sync asks before it removes a package
-   the lock does not keep, and `--yes` answers that question.
+3. `lvpm sync --yes` parses. In a terminal,
+   sync asks before it removes a package the lock does not keep, and `--yes`
+   answers that question.
 4. With a faked list holding LabVIEW 2026 32-bit and 64-bit, bitness 32 picks
    the 32-bit one for `2026`, and bitness 64 picks the 64-bit one. A unit test
    in `target.rs` covers this.
@@ -62,7 +64,7 @@ lvpm keeps upgrading in `lock`. The README says so and gives the two commands.
 | Term | Definition | Status | Source |
 |------|------------|--------|--------|
 | bitness | 32 or 64, the `LvTarget::bitness` of a detected installation | `verified` | `target.rs`; user answered the venv-clash question in those terms |
-| prompt | a question lvpm reads an answer to from stdin | `verified` | only `confirm_removal` in `src/main.rs` today |
+| prompt | a question lvpm reads an answer to from stdin | `verified` | three in `src/main.rs`: `confirm_removal` (`venv remove`), `confirm_dependencies` (uninstall's dependency question) and `sync_ask` (sync's removal question) |
 
 ## Ambiguity Log
 
@@ -71,7 +73,7 @@ lvpm keeps upgrading in `lock`. The README says so and gives the two commands.
 | `lvpm update`: alias of `lock --upgrade` + `sync`, or left out | `requires-stakeholder-input` | human | Left out, with a README note. Matches uv, which has no `update` command. |
 | Env var for `--yes` | `requires-stakeholder-input` | human | `LVPM_YES`, through clap `env`. Matches uv's `UV_*` env vars. |
 | `--labview-bitness` against a venv bound to another bitness | `requires-stakeholder-input` | human | Error. Stricter than uv, which recreates the venv. |
-| Which prompts `--yes` answers | `inferable` | inference | `venv remove` is the only stdin read. The `uninstall --all` prompt in docs/cli.md §9 is proposed and not built. Out of scope. |
+| Which prompts `--yes` answers | `inferable` | inference | The stdin reads are `venv remove`, uninstall's dependency question and sync's removal question. The `uninstall --all` prompt in docs/cli.md §9 is proposed and not built. Out of scope. |
 | `--yes` on `lvpm tui` | `inferable` | inference | Not refused: it has no destination meaning, and `LVPM_YES` in a shell must not break `lvpm tui`. |
 | Default with no `--labview-bitness` | `inferable` | inference | Unchanged (AC 5). Out of scope per the issue: "any change to resolution". |
 | Does `lvpm targets` honour the flag | `inferable` | inference | Yes. It lists what lvpm can pick from, and the same narrowing applies. |

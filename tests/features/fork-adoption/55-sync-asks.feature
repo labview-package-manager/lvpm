@@ -5,17 +5,17 @@ Feature: sync asks before it removes packages
     Given fixture packages "alpha" 1.0, "alpha" 2.0, "extra" 1.0 and "zeta" 1.0
     And a project whose lvpm.toml says labview = ">=2026"
     And the project depends on "alpha" ">=1.0"
-    And the project has no lvpm.lock
 
   Scenario Outline: sync asks before removing, and "no" changes nothing
-    Given dest has "alpha" 1.0 and "extra" 1.0 installed
+    Given the project has no lvpm.lock
+    And dest has "alpha" 1.0 and "extra" 1.0 installed
     When I run "lvpm sync --prefix dest" in a terminal and answer "<answer>"
     Then it asked "remove 1 package (extra 1.0)? [y/N]"
     And the command succeeds
     And the output says "sync cancelled: nothing was changed"
     And the output says "next: add it to lvpm.toml with lvpm add extra, or run lvpm sync --prefix dest --yes"
     And dest's lvpm-installed packages are exactly "alpha" 1.0 and "extra" 1.0
-    And the project has no lvpm.lock
+    And no lvpm.lock exists
 
     Examples:
       | answer    |
@@ -35,28 +35,30 @@ Feature: sync asks before it removes packages
     Then the output says "next: add it to lvpm.toml with lvpm add extra, or run lvpm sync --prefix dest --no-dev --yes"
 
   Scenario: a closed stdin is "no"
-    Given dest has "alpha" 1.0 and "extra" 1.0 installed
+    Given the project has no lvpm.lock
+    And dest has "alpha" 1.0 and "extra" 1.0 installed
     When I run "lvpm sync --prefix dest" in a terminal with stdin closed
     Then it asked "[y/N]"
     And the command succeeds
     And the output says "sync cancelled: nothing was changed"
-    And the project has no lvpm.lock
+    And no lvpm.lock exists
     And dest's lvpm-installed packages are exactly "alpha" 1.0 and "extra" 1.0
 
   Scenario: "n" leaves an outdated lvpm.lock byte-for-byte
     Given dest has "alpha" 1.0 and "extra" 1.0 installed
     And the project has an lvpm.lock made when it also depended on "extra"
     When I run "lvpm sync --prefix dest" in a terminal and answer "n"
-    Then the project's lvpm.lock is unchanged
+    Then lvpm.lock is byte-identical to before
     And dest's lvpm-installed packages are exactly "alpha" 1.0 and "extra" 1.0
 
   Scenario Outline: "y" goes ahead
-    Given dest has "alpha" 1.0 and "extra" 1.0 installed
+    Given the project has no lvpm.lock
+    And dest has "alpha" 1.0 and "extra" 1.0 installed
     When I run "lvpm sync --prefix dest" in a terminal and answer "<answer>"
     Then it asked "[y/N]"
     And the command succeeds
     And dest's lvpm-installed packages are exactly "alpha" 2.0
-    And the project has an lvpm.lock
+    And lvpm.lock lists exactly "alpha" 2.0
 
     Examples:
       | answer |
@@ -86,6 +88,7 @@ Feature: sync asks before it removes packages
     And LVPM_YES is set to "0"
     When I run "lvpm sync --prefix dest" in a terminal and answer "n"
     Then it asked "[y/N]"
+    And dest's lvpm-installed packages are exactly "alpha" 1.0 and "extra" 1.0
 
   Scenario Outline: nothing to remove, nothing to ask
     Given <dest>

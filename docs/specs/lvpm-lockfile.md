@@ -109,7 +109,9 @@ to the per-user `sources.local` do not affect staleness.
 - **Sync** makes the destination equal the lock exactly. It installs missing
   packages, replaces packages whose version differs, and uninstalls the
   lvpm-installed packages the lock does not list. Before it acts, it prints
-  each change with its reason, and it does not prompt.
+  each change with its reason, and it does not prompt. (Changed later: in a
+  terminal, sync asks before it removes a package the lock does not list. See
+  docs/usage.md, "Syncing".)
 - **Destination:** the project's venv. On a headless machine with no venv,
   it is the LabVIEW installation that the existing headless rules pick. With
   `--global` on a workstation, it is the LabVIEW installation too. In every
@@ -322,7 +324,7 @@ lvpm's existing docs (see the log).
 | `install <pkg>` in a project | `requires-stakeholder-input` | human | Becomes `add` |
 | Command vocabulary | `requires-stakeholder-input` | human | uv-style: `lock [--upgrade, --upgrade-package, --check]`, `sync [--locked, --frozen]`; bare `install` = sync |
 | CI strictness | `requires-stakeholder-input` | human | Headless implies `--locked` |
-| Confirmation before removing extras | `requires-stakeholder-input` | human | List, then proceed (no prompt) |
+| Confirmation before removing extras | `requires-stakeholder-input` | human | List, then proceed (no prompt). Changed later: in a terminal sync asks before removing a package the lock does not list; see docs/usage.md, "Syncing" |
 | Where sync fetches from | `requires-stakeholder-input` | human | Cache or any configured source, by SHA-256 |
 | Locked local-only package missing elsewhere | `requires-stakeholder-input` | human | Fail with a hint (`cache add` / `sources.local`) |
 | Manifest without `labview` | `requires-stakeholder-input` | human | Refuse to lock |

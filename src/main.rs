@@ -329,6 +329,10 @@ enum Cmd {
     /// missing, replace what is at another version, and uninstall what the
     /// lock does not list, saying so first.
     ///
+    /// In a terminal it asks before removing a package the lock does not list;
+    /// without one it goes ahead, except that --global needs --yes. --yes
+    /// answers the question.
+    ///
     /// With no lvpm.lock, or one that is out of date, a new one is made first.
     Sync {
         #[command(flatten)]
@@ -1011,11 +1015,12 @@ fn error_line(error: &anyhow::Error, json: bool) -> String {
 }
 
 fn run(cli: &Cli) -> Result<Report> {
+    // `args_os`, since `args` panics on an argument that is not Unicode.
+    let rerun =
+        render::rerun_command(std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()));
     let console: Box<dyn EventSink> = match cli.json {
         true => Box::new(render::json::JsonSink),
-        false => Box::new(render::CliSink::stdio(render::rerun_command(
-            std::env::args(),
-        ))),
+        false => Box::new(render::CliSink::stdio(rerun.clone())),
     };
     let log = logfile::LogSink::new(console);
     let env = op_env(cli, &log)?;
@@ -1032,12 +1037,12 @@ fn run(cli: &Cli) -> Result<Report> {
         .and_then(Result::ok)
         .flatten();
     log.attach(logfile::path(&env.config.log_dir, on_venv.as_ref()));
-    let result = dispatch(cli, env);
+    let result = dispatch(cli, env, &rerun);
     log.finish(&result);
     result
 }
 
-fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
+fn dispatch(cli: &Cli, mut env: OpEnv<'_>, rerun: &str) -> Result<Report> {
     match &cli.cmd {
         Cmd::Tui => unreachable!("main runs the TUI before any sink is made"),
         Cmd::TitleWatch { .. } => unreachable!("main runs title-watch before any sink is made"),
@@ -1086,7 +1091,9 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
             let mode = route::install_mode(&env, &request)
                 .map_err(|why| anyhow!(render::sync::route_error(&why)))?;
             match (mode, package.as_deref()) {
-                (InstallMode::Sync, _) => cmd_sync(&env, cli, &sync.options(apply, env.headless)),
+                (InstallMode::Sync, _) => {
+                    cmd_sync(&env, cli, &sync.options(apply, env.headless), rerun)
+                }
                 // A named install in a project is an add, and always names one.
                 (InstallMode::Add, Some(spec)) => {
                     let table = saved_into(*dev, &sync.group)?;
@@ -1098,9 +1105,8 @@ fn dispatch(cli: &Cli, mut env: OpEnv<'_>) -> Result<Report> {
             }
             .map(|()| Report::done("install"))
         }
-        Cmd::Sync { apply, sync } => {
-            cmd_sync(&env, cli, &sync.options(apply, env.headless)).map(|()| Report::done("sync"))
-        }
+        Cmd::Sync { apply, sync } => cmd_sync(&env, cli, &sync.options(apply, env.headless), rerun)
+            .map(|()| Report::done("sync")),
         Cmd::Relink {
             package,
             all,
@@ -1528,22 +1534,33 @@ fn cmd_build(env: &OpEnv, no_check: bool, app: bool, package: bool, json: bool) 
 /// `sync` and a bare `install`: asks, goes ahead or refuses before it removes a
 /// package lvpm.lock does not keep (see [`on_removal`]). A dry run is never
 /// asked or refused: core puts the question only to a sync that would remove.
-fn cmd_sync(env: &OpEnv, cli: &Cli, options: &SyncOptions) -> Result<()> {
+fn cmd_sync(env: &OpEnv, cli: &Cli, options: &SyncOptions, rerun: &str) -> Result<()> {
     let global = env.flags.global;
     let decision = on_removal(cli.yes, cli.json, stdin_is_terminal(), global);
-    let target = global.then(|| global_target(env));
-    let at = AskWhere {
+    // An error finding the roots is dropped here: `sync_asking` finds them
+    // too, and reports it.
+    let target = global.then(|| global_target(env.flagged_roots().ok().and_then(|r| r.target)));
+    let ask_context = AskContext {
         json: cli.json,
         target: target.as_deref(),
-        rerun: &render::rerun_command(std::env::args()),
+        rerun,
     };
-    let stdin = std::io::stdin();
-    let ask = sync_ask(decision, &at, stdin.lock(), std::io::stderr());
-    ops::sync::sync_asking(env, options, &ask).map_err(|why| {
-        anyhow!(match options.headless_implied {
-            true => render::sync::headless_error(&why),
-            false => render::sync::error(&why),
-        })
+    // The terminal is taken when the question is put, not for the whole sync.
+    let ask = sync_ask(
+        decision,
+        &ask_context,
+        || std::io::stdin().lock(),
+        std::io::stderr(),
+    );
+    ops::sync::sync_asking(env, options, &ask)
+        .map_err(|why| sync_failure(&why, options.headless_implied))
+}
+
+/// What `lvpm sync` prints of an error of core.
+fn sync_failure(why: &lvpm_core::errors::SyncError, headless_implied: bool) -> anyhow::Error {
+    anyhow!(match headless_implied {
+        true => render::sync::headless_error(why),
+        false => render::sync::error(why),
     })
 }
 
@@ -1662,7 +1679,7 @@ fn stdin_is_terminal() -> bool {
 
 /// What `sync` does about the packages it would remove.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum Removal {
+enum OnRemoval {
     GoAhead,
     Ask,
     Refuse,
@@ -1672,29 +1689,27 @@ enum Removal {
 /// `--dry-run` are decided before this. `--yes` answers; a terminal (and not
 /// `--json`) is asked; with none, a `--global` target is refused and anything
 /// else goes ahead.
-fn on_removal(yes: bool, json: bool, terminal: bool, global: bool) -> Removal {
+fn on_removal(yes: bool, json: bool, terminal: bool, global: bool) -> OnRemoval {
     match (yes, terminal && !json, global) {
-        (true, _, _) => Removal::GoAhead,
-        (false, true, _) => Removal::Ask,
-        (false, false, true) => Removal::Refuse,
-        (false, false, false) => Removal::GoAhead,
+        (true, _, _) => OnRemoval::GoAhead,
+        (false, true, _) => OnRemoval::Ask,
+        (false, false, true) => OnRemoval::Refuse,
+        (false, false, false) => OnRemoval::GoAhead,
     }
 }
 
-/// The LabVIEW a `--global` sync would change, as `LabVIEW 2026 (64-bit)`.
-fn global_target(env: &OpEnv) -> String {
-    env.flagged_roots()
-        .ok()
-        .and_then(|roots| roots.target)
-        .map_or_else(
-            || "the LabVIEW installation".to_string(),
-            |target| format!("LabVIEW {} ({}-bit)", target.year(), target.bitness),
-        )
+/// The LabVIEW a `--global` sync would change, as `LabVIEW 2026 (64-bit)`, or
+/// a name for it when no target is found.
+fn global_target(target: Option<target::LvTarget>) -> String {
+    target.map_or_else(
+        || "the LabVIEW installation".to_string(),
+        |target| format!("LabVIEW {} ({}-bit)", target.year(), target.bitness),
+    )
 }
 
 /// Where the sync that may ask is going, for the words of its question and of
 /// its refusal.
-struct AskWhere<'a> {
+struct AskContext<'a> {
     /// `--json` is on: why a refusal says there is no terminal.
     json: bool,
     /// The LabVIEW a `--global` sync would change, as `LabVIEW 2026 (64-bit)`;
@@ -1706,50 +1721,35 @@ struct AskWhere<'a> {
 
 /// What a sync does when it would remove `removals`, as the callback of
 /// [`ops::sync::sync_asking`]: go ahead unasked, ask on `output` and read the
-/// answer from `input`, or fail with the way out.
+/// answer from what `input` gives when the question is put, or fail with the
+/// way out. The wording is [`render::sync`]'s.
 fn sync_ask<R: std::io::BufRead, W: std::io::Write>(
-    decision: Removal,
-    at: &AskWhere,
-    input: R,
+    decision: OnRemoval,
+    ask_context: &AskContext,
+    input: impl Fn() -> R,
     output: W,
 ) -> impl Fn(&[SyncStep]) -> Result<Answer> {
-    let (json, target, rerun) = (at.json, at.target.map(str::to_string), at.rerun.to_string());
-    let io = RefCell::new((input, output));
+    let (json, target, rerun) = (
+        ask_context.json,
+        ask_context.target.map(str::to_string),
+        ask_context.rerun.to_string(),
+    );
+    let output = RefCell::new(output);
     move |removals| {
-        if decision == Removal::GoAhead {
+        if decision == OnRemoval::GoAhead {
             return Ok(Answer::NotAsked);
         }
-        let names: Vec<String> = (removals.iter())
-            .filter_map(|step| match step {
-                SyncStep::Remove { name, version, .. } => Some(format!("{name} {version}")),
-                _ => None,
-            })
-            .collect();
-        let packages = format!(
-            "{} package{}",
-            names.len(),
-            if names.len() == 1 { "" } else { "s" }
-        );
-        let (list, from) = (
-            render::sync::package_list(&names),
-            target.as_ref().map(|target| format!(" from {target}")),
-        );
-        if decision == Removal::Refuse {
-            let why = match json {
-                true => "--json gives no terminal to ask in",
-                false => "no terminal to ask in",
-            };
-            bail!(
-                "sync would remove {packages}{}: {list}\n{why}\nnext: {rerun}",
-                from.unwrap_or_default()
-            );
+        let removing = ops::sync::package_refs(removals);
+        if decision == OnRemoval::Refuse {
+            bail!(render::sync::removal_refusal(
+                &removing,
+                target.as_deref(),
+                json,
+                &rerun
+            ));
         }
-        let (input, output) = &mut *io.borrow_mut();
-        let question = format!(
-            "remove {packages}{} ({list})? [y/N] ",
-            from.unwrap_or_default()
-        );
-        read_yes(input, output, &question).map(Answer::Asked)
+        let question = render::sync::removal_question(&removing, target.as_deref());
+        read_yes(&mut input(), &mut *output.borrow_mut(), &question).map(Answer::Asked)
     }
 }
 
@@ -2418,7 +2418,7 @@ mod tests {
 
     #[test]
     fn on_removal_decides_from_all_sixteen_flag_combinations() {
-        use Removal::{Ask, GoAhead, Refuse};
+        use OnRemoval::{Ask, GoAhead, Refuse};
         // (yes, json, terminal, global) -> what sync does
         let table = [
             ((false, false, false, false), GoAhead),
@@ -2489,9 +2489,9 @@ mod tests {
         assert_eq!(said.unwrap_err().to_string(), "stdin is gone");
         // The sync gets that error, not an answer, so it stops before any change.
         let (result, _) = put_from(
-            Removal::Ask,
-            &at(false, None, ""),
-            broken(),
+            OnRemoval::Ask,
+            &context(false, None, ""),
+            broken,
             &[removal("extra", "1.0")],
         );
         assert_eq!(result.unwrap_err().to_string(), "stdin is gone");
@@ -2510,27 +2510,31 @@ mod tests {
 
     /// What `sync_ask` answers to `removals`, and what it wrote to stderr.
     fn put(
-        decision: Removal,
-        at: &AskWhere,
+        decision: OnRemoval,
+        ask_context: &AskContext,
         typed_answer: &str,
         removals: &[SyncStep],
     ) -> (Result<Answer>, String) {
-        put_from(decision, at, typed_answer.as_bytes(), removals)
+        put_from(decision, ask_context, || typed_answer.as_bytes(), removals)
     }
 
-    fn put_from(
-        decision: Removal,
-        at: &AskWhere,
-        input: impl std::io::BufRead,
+    fn put_from<R: std::io::BufRead>(
+        decision: OnRemoval,
+        ask_context: &AskContext,
+        input: impl Fn() -> R,
         removals: &[SyncStep],
     ) -> (Result<Answer>, String) {
         let mut written = Vec::new();
-        let answer = sync_ask(decision, at, input, &mut written)(removals);
+        let answer = sync_ask(decision, ask_context, input, &mut written)(removals);
         (answer, String::from_utf8(written).unwrap())
     }
 
-    fn at(json: bool, target: Option<&'static str>, rerun: &'static str) -> AskWhere<'static> {
-        AskWhere {
+    fn context(
+        json: bool,
+        target: Option<&'static str>,
+        rerun: &'static str,
+    ) -> AskContext<'static> {
+        AskContext {
             json,
             target,
             rerun,
@@ -2542,20 +2546,20 @@ mod tests {
         let one = [removal("extra", "1.0")];
         let two = [removal("extra", "1.0"), removal("zeta", "1.0")];
         for (answer, said) in [("y\n", true), ("YES\n", true), ("n\n", false), ("", false)] {
-            let (result, written) = put(Removal::Ask, &at(false, None, ""), answer, &one);
+            let (result, written) = put(OnRemoval::Ask, &context(false, None, ""), answer, &one);
             assert_eq!(result.unwrap(), Answer::Asked(said), "{answer:?}");
             assert_eq!(written, "remove 1 package (extra 1.0)? [y/N] ");
         }
-        let (_, written) = put(Removal::Ask, &at(false, None, ""), "n\n", &two);
+        let (_, written) = put(OnRemoval::Ask, &context(false, None, ""), "n\n", &two);
         assert_eq!(written, "remove 2 packages (extra 1.0, zeta 1.0)? [y/N] ");
-        let global = at(false, Some(LABVIEW), "lvpm sync --global --yes");
-        let (_, written) = put(Removal::Ask, &global, "n\n", &one);
+        let global = context(false, Some(LABVIEW), "lvpm sync --global --yes");
+        let (_, written) = put(OnRemoval::Ask, &global, "n\n", &one);
         assert_eq!(
             written,
             "remove 1 package from LabVIEW 2026 (64-bit) (extra 1.0)? [y/N] "
         );
         let seven: Vec<SyncStep> = (1..=7).map(|n| removal(&format!("p{n}"), "1.0")).collect();
-        let (_, written) = put(Removal::Ask, &at(false, None, ""), "n\n", &seven);
+        let (_, written) = put(OnRemoval::Ask, &context(false, None, ""), "n\n", &seven);
         assert_eq!(
             written,
             "remove 7 packages (p1 1.0, p2 1.0, p3 1.0, p4 1.0, p5 1.0 and 2 more)? [y/N] "
@@ -2568,11 +2572,11 @@ mod tests {
         let extra = [removal("extra", "1.0")];
         for json in [false, true] {
             let decision = on_removal(false, json, false, false);
-            let (result, written) = put(decision, &at(json, None, ""), "", &extra);
+            let (result, written) = put(decision, &context(json, None, ""), "", &extra);
             assert_eq!(result.unwrap(), Answer::NotAsked, "json={json}");
             assert_eq!(written, "", "json={json}");
         }
-        let global = at(false, Some(LABVIEW), "lvpm sync --global --yes");
+        let global = context(false, Some(LABVIEW), "lvpm sync --global --yes");
         let (result, written) = put(on_removal(true, false, true, true), &global, "", &extra);
         assert_eq!((result.unwrap(), written.as_str()), (Answer::NotAsked, ""));
     }
@@ -2585,7 +2589,7 @@ mod tests {
             (true, "--json gives no terminal to ask in"),
         ] {
             let decision = on_removal(false, json, false, true);
-            let global = at(json, Some(LABVIEW), "lvpm sync --global --yes");
+            let global = context(json, Some(LABVIEW), "lvpm sync --global --yes");
             let (result, written) = put(decision, &global, "y\n", &removals);
             assert_eq!(
                 result.unwrap_err().to_string(),
@@ -2596,13 +2600,13 @@ mod tests {
             );
             assert_eq!(written, "", "a refusal asks nothing");
         }
-        let typed = at(
+        let typed = context(
             false,
             Some(LABVIEW),
             "lvpm install --labview-version 2025 --global --group docs --yes",
         );
         let two = [removal("extra", "1.0"), removal("zeta", "1.0")];
-        let (result, _) = put(Removal::Refuse, &typed, "", &two);
+        let (result, _) = put(OnRemoval::Refuse, &typed, "", &two);
         assert_eq!(
             result.unwrap_err().to_string(),
             "sync would remove 2 packages from LabVIEW 2026 (64-bit): extra 1.0, zeta 1.0\n\
@@ -2613,25 +2617,44 @@ mod tests {
 
     #[test]
     fn the_refusal_comes_back_through_the_sync_error_printers_whole() {
-        let global = at(true, Some(LABVIEW), "lvpm sync --global --yes");
-        let (result, _) = put(Removal::Refuse, &global, "", &[removal("extra", "1.0")]);
+        let global = context(true, Some(LABVIEW), "lvpm sync --global --yes");
+        let (result, _) = put(OnRemoval::Refuse, &global, "", &[removal("extra", "1.0")]);
         let refusal = result.unwrap_err();
         let text = refusal.to_string();
         // What core hands back for an error of the callback.
         let error = lvpm_core::errors::SyncError::Other(refusal);
-        assert_eq!(render::sync::error(&error), text);
-        assert_eq!(render::sync::headless_error(&error), text);
+        for headless_implied in [false, true] {
+            assert_eq!(sync_failure(&error, headless_implied).to_string(), text);
+        }
         assert_eq!(text.lines().count(), 3, "{text}");
     }
 
     #[test]
-    fn global_is_the_flag_the_user_typed_and_nothing_a_venv_or_headless_adds() {
+    fn the_s10d_spec_says_sync_asks_and_not_that_it_has_no_prompt() {
+        let spec = include_str!("../docs/specs/lvpm-unattended-s10d.md");
+        assert!(spec.contains("sync asks before it removes a package the lock does not keep"));
+        assert!(!spec.contains("`sync` has no prompt"));
+    }
+
+    #[test]
+    fn global_target_names_the_labview_year_and_bitness_or_falls_back() {
+        let target = target::LvTarget {
+            version: 26.3,
+            bitness: 64,
+            path: PathBuf::from("LV"),
+        };
+        assert_eq!(global_target(Some(target)), LABVIEW);
+        assert_eq!(global_target(None), "the LabVIEW installation");
+    }
+
+    #[test]
+    fn global_parses_into_the_destination_flags_only_when_it_is_typed() {
         let global = |args: &[&str]| {
             let args = ["lvpm", "sync"].into_iter().chain(args.iter().copied());
             destination_flags(&Cli::try_parse_from(args).unwrap()).global
         };
         assert!(!global(&["--prefix", "dest"]));
-        // In a venv, or on a headless machine, `sync` has no flag to say so.
+        // No flag typed, no `--global`: a venv or a headless LabVIEW adds none.
         assert!(!global(&[]));
         assert!(!global(&["--labview-version", "2026"]));
         assert!(global(&["--global"]));
@@ -2654,12 +2677,12 @@ mod tests {
                 r#"{"error":"sync would remove 1 package from LabVIEW 2026 (64-bit): extra 1.0\n--json gives no terminal to ask in\nnext: lvpm sync --global --yes"}"#,
             ),
         ] {
-            let global = at(json, Some(LABVIEW), "lvpm sync --global --yes");
+            let global = context(json, Some(LABVIEW), "lvpm sync --global --yes");
             let decision = on_removal(false, json, false, true);
             let (result, _) = put(decision, &global, "", &[removal("extra", "1.0")]);
             // What cmd_sync makes of the error of core, and what main prints of that.
             let error = lvpm_core::errors::SyncError::Other(result.unwrap_err());
-            let shown = anyhow!(render::sync::error(&error));
+            let shown = sync_failure(&error, false);
             assert_eq!(error_line(&shown, json), line, "json={json}");
         }
     }

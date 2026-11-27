@@ -1,5 +1,5 @@
-//! Steps of the sync-asks scenarios (labview-package-manager/lvpm#55): `lvpm
-//! sync` in or out of a terminal, with a stray package in `dest`.
+//! Steps of the sync-asks scenarios: `lvpm sync` in or out of a terminal, with a
+//! stray package in `dest`.
 //!
 //! "In a terminal" is stdin only: a debug `lvpm` treats `LVPM_TEST_STDIN_TERMINAL`
 //! as a terminal. `LVPM_TEST_TERMINAL`, which turns on the update notice, stays
@@ -100,28 +100,6 @@ async fn run_with_no_terminal(world: &mut CliWorld, command_line: String) {
 }
 
 // ---- what it did ----
-
-#[then(regex = r#"^the project's lvpm\.lock is unchanged$"#)]
-async fn the_lock_is_unchanged(world: &mut CliWorld) {
-    let before = world.lock.before.as_ref().expect("a lock was noted before");
-    let after = world.lock_bytes().expect("the lock is still there");
-    assert!(
-        after == *before,
-        "the lock changed:\n{}\n---\n{}",
-        String::from_utf8_lossy(before),
-        String::from_utf8_lossy(&after)
-    );
-}
-
-#[then("the project has an lvpm.lock")]
-async fn the_project_has_a_lock(world: &mut CliWorld) {
-    assert!(world.lock_bytes().is_some(), "no lvpm.lock");
-}
-
-#[then("the project has no lvpm.lock")]
-async fn the_project_still_has_no_lock(world: &mut CliWorld) {
-    assert!(world.lock_bytes().is_none(), "an lvpm.lock exists");
-}
 
 #[then("dest has no lvpm-installed packages")]
 async fn dest_holds_nothing(world: &mut CliWorld) {

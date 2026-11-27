@@ -171,7 +171,7 @@ Feature: sync decides on removals before it changes anything
 
 **Complexity**: standard
 **IMPLEMENT**:
-- `sync_asking(env, opts, ask: &dyn Fn(&[SyncStep]) -> anyhow::Result<Answer>)`, where `Answer { Asked(bool), NotAsked }`. `NotAsked` means the front end went ahead without a question (`--yes`, no terminal). The callback gets the `Remove` steps whose reason is `NotInLock`, so the front end can name versions. One fn, `removals_to_ask(plan)`, builds that list; `announce_migration`, the callback and `SyncDeclined` all use it. `sync(env, opts)` wraps it with `&|_| Ok(true)`. `cmd_sync` is the only caller of `sync_asking`, so `tests/steps/cancel.rs` and `hook_policy.rs` do not change.
+- `sync_asking(env, opts, ask: &dyn Fn(&[SyncStep]) -> anyhow::Result<Answer>)`, where `Answer { Asked(bool), NotAsked }`. `NotAsked` means the front end went ahead without a question (`--yes`, no terminal). The callback gets the `Remove` steps whose reason is `NotInLock`, so the front end can name versions. One fn, `removals_to_ask(plan)`, builds that list; `announce_migration`, the callback and `SyncDeclined` all use it. `sync(env, opts)` wraps it with `&|_| Ok(Answer::NotAsked)`. `cmd_sync` is the only caller of `sync_asking`, so `tests/steps/cancel.rs` and `hook_policy.rs` do not change.
 - `SyncPlanned { dry_run: false }` moves out of `apply_sync`. `sync` emits it before the question. `commit` in add_remove.rs emits it itself, right before its `apply_sync`, after `announce_written`, so the order it emits in stays the same.
 - The callback is called after the plan event and before any write or fetch.
 - A "no" emits `Event::SyncDeclined { removing }` and returns Ok.
@@ -420,7 +420,7 @@ by the Slice 1 callback-`Err` scenario and the Step 2.1/2.2 unit tests.
 
 **Complexity**: trivial
 **IMPLEMENT**:
-- Replace "`sync` has no prompt" in docs/specs/lvpm-unattended-s10d.md with the three-line rule and the table.
+- Replace "`sync` has no prompt" in docs/specs/lvpm-unattended-s10d.md with one sentence (sync asks before it removes a package the lock does not keep). The full rule is in docs/usage.md and docs/cli.md.
 - Update the book's sync pages: grep `docs/` for `lvpm sync` and "will be removed". Say that stdin must be a terminal, and that `--no-dev` and group removals do not ask.
 - Change the `--yes` help text in src/main.rs to say it answers sync's question too.
 **TEST**: `grep -c 'has no prompt' docs/specs/lvpm-unattended-s10d.md` is 0. The `--yes` help text holds the exact new sentence, asserted in the help golden that /build names before the step. Full suite green.

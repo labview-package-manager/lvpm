@@ -240,16 +240,12 @@ pub fn sync_asking(
         steps: plan.steps.clone(),
         dry_run: false,
     });
-    if asks && !goes_ahead(env, ask, &plan, &removals, settled.first_sync)? {
+    if asks && !confirm_removals(env, ask, &plan, &removals, settled.first_sync)? {
         return Ok(());
     }
 
     let planned = fetch_locked(env, project, &plan.wanted)?;
     settled.write_lock(env, &lock_path)?;
-    // The first change is a removal or an install, and every archive is in
-    // hand: this is where cancelling stops being possible. The lock write has
-    // said so already when there was a lock to write.
-    env.cancel.begin_unpack()?;
     // The project's own lines allow hooks; a dependency's manifest never does.
     let opts = &SyncOptions {
         install: InstallOptions {
@@ -276,7 +272,7 @@ pub fn sync_asking(
 /// Put `removals` to `ask`: whether the sync goes ahead. On a "no" it says so
 /// and stops; a front end that went ahead without asking is followed by the
 /// note of a first sync, which the question would have said itself.
-fn goes_ahead(
+fn confirm_removals(
     env: &OpEnv,
     ask: &dyn Fn(&[SyncStep]) -> anyhow::Result<Answer>,
     plan: &SyncPlan,
@@ -474,7 +470,7 @@ fn removals_to_ask(plan: &SyncPlan) -> Vec<SyncStep> {
 }
 
 /// The packages the removals take out.
-fn package_refs(removals: &[SyncStep]) -> Vec<PackageRef> {
+pub fn package_refs(removals: &[SyncStep]) -> Vec<PackageRef> {
     (removals.iter())
         .filter_map(|step| match step {
             SyncStep::Remove { name, version, .. } => Some(PackageRef {
@@ -491,9 +487,7 @@ fn package_refs(removals: &[SyncStep]) -> Vec<PackageRef> {
 /// The relink, the hooks and the palette refresh are left to [`finish`], which
 /// spends what this leaves in the session.
 ///
-/// The caller has said what the plan does (`SyncPlanned`), and has called
-/// `begin_unpack` before its first write, which may be the lock's: this changes
-/// the destination and takes no cancel.
+/// The caller has said what the plan does (`SyncPlanned`).
 ///
 /// A change that fails stops the rest. The error says which packages are done
 /// and which are not, so that running the sync again can finish it.
@@ -506,6 +500,9 @@ pub fn apply_sync(
     planned: Vec<PlannedPackage>,
     opts: &SyncOptions,
 ) -> Result<Applied, SyncError> {
+    // The first change is a removal or an install, and every archive is in
+    // hand: this is where cancelling stops being possible.
+    env.cancel.begin_unpack()?;
     change(env, session, plan, planned, opts)
         .map_err(|cause| incomplete(session, lock, plan, selection, &cause))
 }
@@ -2958,6 +2955,16 @@ beta = \"*\"
         project
     }
 
+    fn dry_run() -> SyncOptions {
+        SyncOptions {
+            install: InstallOptions {
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+            ..SyncOptions::default()
+        }
+    }
+
     fn planned_count(events: &[Event]) -> usize {
         let planned = |event: &&Event| matches!(event, Event::SyncPlanned { dry_run: false, .. });
         events.iter().filter(planned).count()
@@ -3084,13 +3091,6 @@ beta = \"*\"
             no_dev: true,
             ..SyncOptions::default()
         };
-        let dry_run = SyncOptions {
-            install: InstallOptions {
-                dry_run: true,
-                ..InstallOptions::default()
-            },
-            ..SyncOptions::default()
-        };
         let dev_only = || {
             let project = project("no-ask-dev-only", &["alpha"]);
             std::fs::write(
@@ -3132,8 +3132,14 @@ beta = \"*\"
             (
                 "a dry run that would remove",
                 project_whose_new_lock_drops_gamma("no-ask-dry-run"),
-                dry_run,
+                dry_run(),
             ),
+        ];
+        // What the flags remove is planned all the same: the guard of the cases
+        // that go ahead without a question for that reason.
+        let guarded = [
+            ("a dev-only package", RemoveReason::DevOnly),
+            ("a group no longer selected", RemoveReason::GroupsOnly),
         ];
         for (label, project, opts) in cases {
             let question = Question::answering(Answer::Asked(false));
@@ -3141,6 +3147,18 @@ beta = \"*\"
             let (outcome, events) = project.sync_asked(&opts, &question);
 
             outcome.unwrap_or_else(|why| panic!("{label}: {why}"));
+            if let Some((_, reason)) = guarded.iter().find(|(name, _)| *name == label) {
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        Event::SyncPlanned { steps, dry_run: false }
+                            if steps.iter().any(|step| matches!(
+                                step, SyncStep::Remove { reason: why, .. } if why == reason
+                            ))
+                    )),
+                    "{label}: no removal for {reason:?} was planned: {events:?}"
+                );
+            }
             assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new(), "{label}");
             assert!(
                 !events
@@ -3156,15 +3174,8 @@ beta = \"*\"
         let project = project_whose_new_lock_drops_gamma("dry-run-no-ask");
         let (lock, installed) = (project.lock_bytes(), project.installed());
         let question = Question::answering(Answer::Asked(false));
-        let opts = SyncOptions {
-            install: InstallOptions {
-                dry_run: true,
-                ..InstallOptions::default()
-            },
-            ..SyncOptions::default()
-        };
 
-        let (outcome, events) = project.sync_asked(&opts, &question);
+        let (outcome, events) = project.sync_asked(&dry_run(), &question);
 
         outcome.unwrap();
         assert!(
@@ -3174,6 +3185,7 @@ beta = \"*\"
             }),
             "{events:?}"
         );
+        assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new());
         assert_eq!(
             (project.lock_bytes(), project.installed()),
             (lock, installed)
@@ -3185,15 +3197,8 @@ beta = \"*\"
         // The CLI's answer to `--global` without a terminal: an error.
         let project = project_whose_new_lock_drops_gamma("dry-run-not-refused");
         let question = Question::failing("needs --yes");
-        let opts = SyncOptions {
-            install: InstallOptions {
-                dry_run: true,
-                ..InstallOptions::default()
-            },
-            ..SyncOptions::default()
-        };
 
-        let (outcome, _) = project.sync_asked(&opts, &question);
+        let (outcome, _) = project.sync_asked(&dry_run(), &question);
 
         outcome.unwrap();
         assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new());
@@ -3204,11 +3209,18 @@ beta = \"*\"
         let project = project_whose_new_lock_drops_gamma("declined-no-lock-note");
         std::fs::remove_file(project.lock_path()).unwrap();
 
-        let (_, events) = project.sync_asked(
+        let (outcome, events) = project.sync_asked(
             &SyncOptions::default(),
             &Question::answering(Answer::Asked(false)),
         );
 
+        outcome.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::SyncDeclined { .. })),
+            "the sync was not declined: {events:?}"
+        );
         assert!(
             !events
                 .iter()
@@ -3277,6 +3289,68 @@ beta = \"*\"
     }
 
     #[test]
+    fn a_declined_sync_has_fetched_nothing_even_with_a_package_to_install() {
+        // gamma is installed and goes; alpha is not and would be fetched.
+        let project = project("declined-no-fetch", &["gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["alpha"]);
+        let installed = project.installed();
+        let question = Question::answering(Answer::Asked(false));
+        let sink = CacheBackWhenLockWritten {
+            cache: project.root.join("cache"),
+            back: Mutex::new(None),
+        };
+
+        sync_asking(&project.sync_env(&sink), &SyncOptions::default(), &|r| {
+            question.put(r)
+        })
+        .unwrap();
+
+        assert_eq!(
+            question.asked(),
+            [[remove("gamma", "1.0", RemoveReason::NotInLock)]]
+        );
+        assert!(
+            !project.root.join("cache").exists(),
+            "the archives were fetched before the question"
+        );
+        assert_eq!(project.installed(), installed);
+    }
+
+    #[test]
+    fn a_locked_or_frozen_sync_asks_once_about_a_stray_package_and_a_no_changes_nothing() {
+        for policy in [LockPolicy::Locked, LockPolicy::Frozen] {
+            let project = project("locked-stray", &["beta", "gamma"]);
+            project.sync(&SyncOptions::default()).0.unwrap();
+            // The lock follows the manifest, and gamma is left installed.
+            project.write_manifest(&["beta"]);
+            locking_lock(&project);
+            let (lock, installed) = (project.lock_bytes(), project.installed());
+            let question = Question::answering(Answer::Asked(false));
+
+            let (outcome, events) = project.sync_asked(&with(policy), &question);
+
+            outcome.unwrap();
+            assert_eq!(
+                question.asked(),
+                [[remove("gamma", "1.0", RemoveReason::NotInLock)]],
+                "{policy:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::SyncDeclined { .. })),
+                "{policy:?}: {events:?}"
+            );
+            assert_eq!(
+                (project.lock_bytes(), project.installed()),
+                (lock, installed),
+                "{policy:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_fetch_that_fails_after_a_yes_leaves_the_lock_and_the_package_to_be_removed_as_they_were() {
         for lock_there in [true, false] {
             let project = project_with_an_unresolved_requirement("yes-then-fetch-fails");
@@ -3314,16 +3388,9 @@ beta = \"*\"
     fn a_dry_run_of_a_first_sync_still_says_what_it_would_take_out() {
         let project = project_whose_new_lock_drops_gamma("dry-run-first-sync");
         std::fs::remove_file(project.lock_path()).unwrap();
-        let opts = SyncOptions {
-            install: InstallOptions {
-                dry_run: true,
-                ..InstallOptions::default()
-            },
-            ..SyncOptions::default()
-        };
 
         let (outcome, events) =
-            project.sync_asked(&opts, &Question::answering(Answer::Asked(false)));
+            project.sync_asked(&dry_run(), &Question::answering(Answer::Asked(false)));
 
         outcome.unwrap();
         let migration = position(&events, |e| matches!(e, Event::SyncMigration { .. }));

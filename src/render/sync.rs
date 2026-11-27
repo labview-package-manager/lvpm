@@ -38,7 +38,8 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
             }
         }
         Event::SyncDeclined { removing } => {
-            let text = declined(removing, &r.rerun);
+            // The names come from feeds.
+            let text = super::printable(declined(removing, &r.rerun));
             r.line(Stream::Out, &text);
         }
         Event::SyncNothingToDo => r.line(
@@ -53,28 +54,69 @@ fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
+/// How many packages `package_list` names before `and N more`.
+const PACKAGES_NAMED: usize = 5;
+
 /// `extra 1.0, zeta 1.0`: the first five of `packages`, then `and N more`. The
 /// question sync asks and the note of a first sync name packages this way.
-pub fn package_list(packages: &[String]) -> String {
-    let (shown, rest) = packages.split_at(packages.len().min(5));
+fn package_list(packages: &[String]) -> String {
+    let (shown, rest) = packages.split_at(packages.len().min(PACKAGES_NAMED));
     match rest.len() {
         0 => shown.join(", "),
         more => format!("{} and {more} more", shown.join(", ")),
     }
 }
 
-/// The first sync of a project: what the new lock does not list goes. It reads
-/// as the question sync asks, `remove 1 package (gamma 1.0)?`, would.
-fn migration(removing: &[PackageRef]) -> String {
+/// `2 packages` and `extra 1.0, zeta 1.0`: how many packages go, and which.
+fn counted_and_listed(removing: &[PackageRef]) -> (String, String) {
     let names: Vec<String> = removing
         .iter()
         .map(|package| format!("{} {}", package.name, package.version))
         .collect();
+    (
+        format!("{} package{}", names.len(), plural(names.len())),
+        package_list(&names),
+    )
+}
+
+/// The first sync of a project: what the new lock does not list goes. It reads
+/// as the question sync asks, `remove 1 package (gamma 1.0)?`, would.
+fn migration(removing: &[PackageRef]) -> String {
+    let (packages, list) = counted_and_listed(removing);
+    format!("note: {packages} not in lvpm.lock will be removed ({list})")
+}
+
+/// The question a sync that would remove `removing` puts: `target` is the
+/// LabVIEW a `--global` sync would change.
+pub fn removal_question(removing: &[PackageRef], target: Option<&str>) -> String {
+    let (packages, list) = counted_and_listed(removing);
+    let from = target.map(|target| format!(" from {target}"));
+    // The names come from feeds.
+    super::printable(format!(
+        "remove {packages}{} ({list})? [y/N] ",
+        from.unwrap_or_default()
+    ))
+}
+
+/// What a sync that would remove `removing` says when it cannot ask: why not,
+/// and `rerun`, the command to go ahead. `json` is on when `--json` is why.
+pub fn removal_refusal(
+    removing: &[PackageRef],
+    target: Option<&str>,
+    json: bool,
+    rerun: &str,
+) -> String {
+    let (packages, list) = counted_and_listed(removing);
+    let from = target.map(|target| format!(" from {target}"));
+    let why = match json {
+        true => "--json gives no terminal to ask in",
+        false => "no terminal to ask in",
+    };
     format!(
-        "note: {} package{} not in lvpm.lock will be removed ({})",
-        removing.len(),
-        plural(removing.len()),
-        package_list(&names)
+        "sync would remove {packages}{}: {list}
+{why}
+next: {rerun}",
+        from.unwrap_or_default()
     )
 }
 
@@ -476,6 +518,24 @@ mod tests {
             "sync cancelled: nothing was changed\n\
              next: add them to lvpm.toml, or run lvpm install --prefix 'my dest' --group docs --yes\n"
         );
+    }
+
+    #[test]
+    fn what_a_feed_calls_a_package_cannot_send_escapes_to_the_terminal() {
+        let evil = PackageRef {
+            name: "x\u{1b}[31m".into(),
+            version: "1.0".into(),
+        };
+        assert_eq!(
+            removal_question(std::slice::from_ref(&evil), None),
+            "remove 1 package (x?[31m 1.0)? [y/N] "
+        );
+        let (renderer, out, _) = renderer();
+        let mut renderer = renderer.rerun_with("lvpm sync --yes".into());
+        renderer.render(&Event::SyncDeclined {
+            removing: vec![evil],
+        });
+        assert!(!out.text().contains('\u{1b}'), "{:?}", out.text());
     }
 
     #[test]
