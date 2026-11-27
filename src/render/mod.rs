@@ -32,6 +32,7 @@ pub mod venv;
 pub mod viserver;
 
 use lvpm_core::events::{Event, EventSink};
+use lvpm_core::ops::env::shell_word;
 use std::io::Write;
 use std::sync::{Mutex, PoisonError};
 
@@ -50,6 +51,9 @@ pub struct Renderer {
     /// The begun line of the package being installed, written again in full
     /// when a resave's lines came between it and its end.
     package_line: String,
+    /// The command the user typed with `--yes` added, for the `next:` hint of a
+    /// sync they declined; see [`rerun_command`].
+    rerun: String,
 }
 
 impl Renderer {
@@ -59,7 +63,15 @@ impl Renderer {
             err,
             open: None,
             package_line: String::new(),
+            rerun: String::new(),
         }
+    }
+
+    /// Say `command` where a hint tells the user to run the command again with
+    /// `--yes`.
+    pub fn rerun_with(mut self, command: String) -> Renderer {
+        self.rerun = command;
+        self
     }
 
     pub fn render(&mut self, event: &Event) {
@@ -174,6 +186,7 @@ impl Renderer {
             | Event::SyncUnresolved { .. }
             | Event::SyncMigration { .. }
             | Event::SyncPlanned { .. }
+            | Event::SyncDeclined { .. }
             | Event::SyncNothingToDo => sync::render(self, event),
             Event::VenvLabviewStarting { .. }
             | Event::VenvLabviewStillStarting { .. }
@@ -268,17 +281,38 @@ pub fn printable(text: String) -> String {
     text.chars().map(shown).collect()
 }
 
+/// The command line as typed, with `--yes` added, as the hint of a command that
+/// asked and was told no: `lvpm sync --prefix dest --group docs --yes`. `args`
+/// are the process's, program name first; core cannot see them.
+pub fn rerun_command(args: impl IntoIterator<Item = String>) -> String {
+    let word = |arg: String| {
+        // `shell_word` quotes a word that leads with `-`, and a flag needs none.
+        let bare = arg.trim_start_matches('-');
+        if bare.len() < arg.len() && shell_word(bare) == bare {
+            arg
+        } else {
+            shell_word(&arg)
+        }
+    };
+    let typed = args.into_iter().skip(1).map(word);
+    std::iter::once("lvpm".to_string())
+        .chain(typed)
+        .chain(["--yes".to_string()])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The sink the CLI hands to core: a renderer on the process's own streams.
 pub struct CliSink(Mutex<Renderer>);
 
 impl CliSink {
     /// The CLI has one terminal, so it makes one sink and hands it to
     /// everything, through the `OpEnv`.
-    pub fn stdio() -> CliSink {
-        CliSink(Mutex::new(Renderer::new(
-            Box::new(std::io::stdout()),
-            Box::new(std::io::stderr()),
-        )))
+    pub fn stdio(rerun: String) -> CliSink {
+        CliSink(Mutex::new(
+            Renderer::new(Box::new(std::io::stdout()), Box::new(std::io::stderr()))
+                .rerun_with(rerun),
+        ))
     }
 }
 
@@ -321,6 +355,28 @@ mod tests {
         let (out, err) = (Capture::default(), Capture::default());
         let renderer = Renderer::new(Box::new(out.clone()), Box::new(err.clone()));
         (renderer, out, err)
+    }
+
+    #[test]
+    fn the_rerun_command_is_what_was_typed_with_yes_added() {
+        let rerun = |typed: &[&str]| rerun_command(typed.iter().map(|word| word.to_string()));
+        assert_eq!(
+            rerun(&[r"C:\bin\lvpm.exe", "install", "--prefix", "dest"]),
+            "lvpm install --prefix dest --yes"
+        );
+        // What narrows the sync survives, so the rerun removes no more than the sync would have.
+        assert_eq!(
+            rerun(&["lvpm", "sync", "--prefix", "dest", "--group", "docs"]),
+            "lvpm sync --prefix dest --group docs --yes"
+        );
+        assert_eq!(
+            rerun(&["lvpm", "sync", "--frozen", "--no-dev", "-p", "my dest"]),
+            "lvpm sync --frozen --no-dev -p 'my dest' --yes"
+        );
+        assert_eq!(
+            rerun(&["lvpm", "sync", "--prefix=my dest", "-x'y"]),
+            "lvpm sync '--prefix=my dest' '-x''y' --yes"
+        );
     }
 
     #[test]

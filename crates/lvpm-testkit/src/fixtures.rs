@@ -230,6 +230,15 @@ pub const INSTALL_PACKAGES: &[FixturePackage] = &[
     text_package("caraya", "1.0", &[], "20.0"),
 ];
 
+/// The packages the sync-asks scenarios publish: alpha 1.0 and 2.0, and extra 1.0
+/// and zeta 1.0, which a destination holds without the lock listing them.
+pub const SYNC_ASKS_PACKAGES: &[FixturePackage] = &[
+    text_package("alpha", "1.0", &[], "20.0"),
+    text_package("alpha", "2.0", &[], "20.0"),
+    text_package("extra", "1.0", &[], "20.0"),
+    text_package("zeta", "1.0", &[], "20.0"),
+];
+
 /// A delta 1.0, which the add scenarios install by hand, outside the lock.
 pub const DELTA_1: FixturePackage = text_package("delta", "1.0", &[], "20.0");
 

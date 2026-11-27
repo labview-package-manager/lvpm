@@ -986,12 +986,10 @@ async fn says_a_lock_is_being_written(world: &mut CliWorld) {
     );
 }
 
-#[then(
-    regex = r#"^it says (\d+) installed packages? not in the lock will be removed, naming "([^"]+)"$"#
-)]
+#[then(regex = r#"^it says (\d+) packages? not in lvpm\.lock will be removed, naming "([^"]+)"$"#)]
 async fn says_what_the_first_sync_removes(world: &mut CliWorld, count: usize, name: String) {
     let plural = if count == 1 { "" } else { "s" };
-    let said = format!("{count} installed package{plural} not in lvpm.lock will be removed");
+    let said = format!("{count} package{plural} not in lvpm.lock will be removed");
     let line = world
         .output()
         .stdout

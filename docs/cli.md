@@ -182,12 +182,15 @@ value now fails with a message pointing to `unset`.
 
 ### 9. Confirmation
 
-`venv remove` asks unless `-y`; `uninstall --all` removes everything
-without asking.
+`venv remove` asks unless `-y`; `sync` asks in a terminal before it removes a
+package `lvpm.lock` does not list, unless `-y`; `uninstall --all` removes
+everything without asking.
 
 Proposed: commands that remove more than the user named ask, unless
 `-y/--yes` is given or stdin is not a terminal (CI never blocks). Applies
-to `uninstall --all` and `venv remove`. Breaking: an interactive
+to `uninstall --all`, `venv remove` and `sync` (removals of packages
+`lvpm.lock` does not list; a `--global` sync without a terminal needs `--yes`
+instead of going ahead, see docs/usage.md, "Syncing"). Breaking: an interactive
 `uninstall --all` now asks.
 
 ### 10. Output streams, verbosity and colour

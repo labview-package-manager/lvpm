@@ -46,7 +46,7 @@ Flags that apply to every command:
 | `--global`                 | Write into the LabVIEW installation itself, even from inside a project that has a venv. Alone, it picks the project's LabVIEW, the venv's, or the only installation; not with `--prefix` ([Writing into LabVIEW itself](#writing-into-labview-itself)) |
 | `--prefix <DIR>`           | Install into a scratch directory instead of LabVIEW (files and linkfix only; nothing to relink or run hooks with) |
 | `--refresh`                | Ask each index whether it changed (a conditional request) instead of trusting the cache in `%LOCALAPPDATA%\lvpm\cache` |
-| `--yes` / `-y`             | Answer yes to every prompt (`venv remove`, and `uninstall` about dependencies). `LVPM_YES` does the same; `0`, `false`, `no`, `off` or empty leaves it off |
+| `--yes` / `-y`             | Answer yes to every question (`venv remove`, `uninstall` about dependencies, and `sync` before it removes packages). `LVPM_YES` does the same; `0`, `false`, `no`, `off` or empty leaves it off |
 | `--labview-bitness <32\|64>` | Use only 32- or 64-bit LabVIEW installations, to pick one when both of a version are installed; a venv bound to the other bitness is an error (`--global` skips the venv) |
 | `--json`                   | Write JSON Lines to stdout for a script or front end ([JSON output and exit codes](https://github.com/ThatsTheEnd/lvpm#json-output-and-exit-codes)). Not taken by `app-probe`, `vi-probe`, `vi-save` or `vi-run` (exit 2) |
 
@@ -349,7 +349,12 @@ refuse it and name `lvpm lock`. `lvpm lock`, a plain `lvpm sync`, and a named
 
 **Syncing.** `lvpm sync` installs what is missing, replaces what is at another
 version, and uninstalls the lvpm-installed packages the lock does not list. It
-prints each change and why before it acts, and does not ask. `--dry-run`
+prints each change and why before it acts. Before it removes a package that
+`lvpm.lock` does not list, it asks `remove 1 package (extra 1.0)? [y/N] `, and
+only when stdin is a terminal; "n" cancels the whole sync and changes nothing,
+not even the lock. Without a terminal, or with `--json`, it goes ahead, except
+that a `--global` sync then needs `--yes`. `--yes` or `LVPM_YES` answers the
+question. Removals that `--no-dev` or `--group` select do not ask. `--dry-run`
 prints that plan and changes nothing, not even the lock. Each archive is taken
 from the cache by SHA-256, else from any source with the same name and version
 whose SHA-256 matches; one that does not match is never installed. If none

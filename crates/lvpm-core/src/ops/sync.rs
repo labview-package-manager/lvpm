@@ -177,15 +177,38 @@ impl Selection {
     }
 }
 
+/// What the front end did about the question [`sync_asking`] puts to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// The user was asked, and said yes or no.
+    Asked(bool),
+    /// The front end went ahead without asking: `--yes`, or no terminal.
+    NotAsked,
+}
+
 /// Make the destination `env` settles hold exactly the packages `lvpm.lock`
 /// lists: install what is missing, replace what is at another version or from
-/// another archive, and take out what the lock does not list, saying so first
-/// and asking nothing.
+/// another archive, and take out what the lock does not list, saying so first.
+/// It asks nothing: [`sync_asking`] is the sync that does.
 ///
 /// Every archive is in hand before the first change, so a missing or altered
-/// archive fails the sync with the destination as it was. A dry run reports
+/// archive fails the sync with the destination, and `lvpm.lock`, as they were:
+/// a lock made here is written once the archives are in hand. A dry run reports
 /// the plan, and changes nothing.
 pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
+    sync_asking(env, opts, &|_| Ok(Answer::NotAsked))
+}
+
+/// [`sync`], except that a plan that removes a package the lock does not list
+/// is put to `ask` once it is said, and before anything is written or fetched.
+/// `ask` gets those removals, and answers for the user. "No" ends the sync with
+/// `SyncDeclined` and nothing changed, and so does an error of `ask`, which is
+/// the sync's error. A dry run and a plan with no such removal ask nothing.
+pub fn sync_asking(
+    env: &OpEnv,
+    opts: &SyncOptions,
+    ask: &dyn Fn(&[SyncStep]) -> anyhow::Result<Answer>,
+) -> Result<(), SyncError> {
     if opts.headless_implied {
         env.sink.emit(Event::HeadlessImpliesLocked);
     }
@@ -219,19 +242,23 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
     announce_target(env, &store);
 
     let lock_path = manifest_path.with_file_name(lockfile::FILE_NAME);
-    let (lock, first_sync) = settle_lock(env, &found, &lock_path, opts)?;
-    refuse_groups_the_lock_lacks(project, &lock, &selection)?;
+    let mut settled = settle_lock(env, &found, &lock_path, opts)?;
+    refuse_groups_the_lock_lacks(project, &settled.lock, &selection)?;
     if !project.nipm.is_empty() {
         env.sink.emit(Event::NipmNotInstalled {
             count: project.nipm.len(),
         });
     }
 
-    let plan = plan_sync(&lock, &install::list_installed(&store)?, &selection);
-    if first_sync {
+    let plan = plan_sync(&settled.lock, &install::list_installed(&store)?, &selection);
+    // A sync that asks says what it removes in its question, after the plan.
+    let removals = removals_to_ask(&plan);
+    let asks = !removals.is_empty() && !opts.install.dry_run;
+    if settled.first_sync && !asks {
         announce_migration(env, &plan);
     }
     if plan.is_empty() {
+        settled.write_lock(env, &lock_path)?;
         // In line with the lock, but the merged palette addon may still be
         // owed: the fix `lvpm launch` points at for a stale one.
         if let crate::ops::Destination::Venv(v) = &dest
@@ -250,7 +277,16 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
         return Ok(());
     }
 
+    env.sink.emit(Event::SyncPlanned {
+        steps: plan.steps.clone(),
+        dry_run: false,
+    });
+    if asks && !confirm_removals(env, ask, &plan, &removals, settled.first_sync)? {
+        return Ok(());
+    }
+
     let planned = fetch_locked(env, project, &plan.wanted)?;
+    settled.write_lock(env, &lock_path)?;
     // The project's own lines allow hooks; a dependency's manifest never does.
     let opts = &SyncOptions {
         install: InstallOptions {
@@ -261,9 +297,44 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
         ..opts.clone()
     };
     let mut session = InstallSession::new(dest);
-    let applied = apply_sync(env, &mut session, &lock, &plan, &selection, planned, opts)?;
+    let applied = apply_sync(
+        env,
+        &mut session,
+        &settled.lock,
+        &plan,
+        &selection,
+        planned,
+        opts,
+    )?;
     finish(env, &mut session, &applied, &opts.install)?;
     Ok(())
+}
+
+/// Put `removals` to `ask`: whether the sync goes ahead. On a "no" it says so
+/// and stops; a front end that went ahead without asking is followed by the
+/// note of a first sync, which the question would have said itself.
+fn confirm_removals(
+    env: &OpEnv,
+    ask: &dyn Fn(&[SyncStep]) -> anyhow::Result<Answer>,
+    plan: &SyncPlan,
+    removals: &[SyncStep],
+    first_sync: bool,
+) -> Result<bool, SyncError> {
+    match ask(removals).map_err(SyncError::Other)? {
+        Answer::Asked(false) => {
+            env.sink.emit(Event::SyncDeclined {
+                removing: package_refs(removals),
+            });
+            Ok(false)
+        }
+        Answer::Asked(true) => Ok(true),
+        Answer::NotAsked => {
+            if first_sync {
+                announce_migration(env, plan);
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// Fail, before any lock is read or written, when a selected group is not dev
@@ -319,8 +390,47 @@ fn refuse_groups_the_lock_lacks(
     }
 }
 
+/// The lock a sync goes by, and what is left to do about it.
+struct Settled {
+    lock: Lockfile,
+    /// The project's first sync: the lock was made because there was none.
+    first_sync: bool,
+    /// A lock made here and not yet written: see [`Settled::write_lock`].
+    pending: Option<locking::PendingLock>,
+}
+
+impl Settled {
+    /// A lock that is there already and is used as it is.
+    fn kept(lock: Lockfile) -> Settled {
+        Settled {
+            lock,
+            first_sync: false,
+            pending: None,
+        }
+    }
+
+    /// Write the lock this sync made, if it made one: the one place it is
+    /// written, once the archives are in hand, so that a sync that fails
+    /// before it changes anything leaves `lvpm.lock` as it was.
+    fn write_lock(&mut self, env: &OpEnv, lock_path: &Path) -> Result<(), SyncError> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        // Said here and not when the lock was found missing: a sync that is
+        // declined, or whose fetch fails, writes none.
+        if self.first_sync {
+            env.sink.emit(Event::SyncLockMissing {
+                path: lock_path.to_path_buf(),
+                dry_run: false,
+            });
+        }
+        Ok(pending.write(env)?)
+    }
+}
+
 /// The lock this sync goes by, and whether it is the project's first: made
-/// here because there was none. A dry run makes it without writing it.
+/// here because there was none. It is made, not written: [`Settled::write_lock`]
+/// writes it. A dry run makes it and never writes it.
 ///
 /// A lock that was there is warned about for the requirements it records as
 /// unresolved; one made here has said so already, as it was made.
@@ -329,7 +439,7 @@ fn settle_lock(
     found: &(PathBuf, Project),
     lock_path: &Path,
     opts: &SyncOptions,
-) -> Result<(Lockfile, bool), SyncError> {
+) -> Result<Settled, SyncError> {
     let project = &found.1;
     match opts.lock {
         LockPolicy::Frozen => {
@@ -338,29 +448,34 @@ fn settle_lock(
             if let Some(reason) = lock.format_is_outdated() {
                 return Err(LockError::Stale(reason).into());
             }
-            Ok((warn_unresolved(env, lock), false))
+            Ok(Settled::kept(warn_unresolved(env, lock)))
         }
         LockPolicy::Locked => {
             let lock = locking::read_lock(lock_path)?;
             match lock.staleness(project) {
                 Some(reason) => Err(LockError::Stale(reason).into()),
-                None => Ok((warn_unresolved(env, lock), false)),
+                None => Ok(Settled::kept(warn_unresolved(env, lock))),
             }
         }
         LockPolicy::Update => match locking::read_lock(lock_path) {
             Ok(lock) if lock.staleness(project).is_none() => {
-                Ok((warn_unresolved(env, lock), false))
+                Ok(Settled::kept(warn_unresolved(env, lock)))
             }
             read => {
                 let missing = matches!(read, Err(LockError::NoLock { .. }));
-                if missing {
+                // A dry run writes nothing, so it says now what a sync says at the write.
+                if missing && opts.install.dry_run {
                     env.sink.emit(Event::SyncLockMissing {
                         path: lock_path.to_path_buf(),
-                        dry_run: opts.install.dry_run,
+                        dry_run: true,
                     });
                 }
-                let lock = new_lock(env, found, lock_path, opts.install.dry_run)?;
-                Ok((lock, missing))
+                let (lock, pending) = new_lock(env, found, lock_path, opts.install.dry_run)?;
+                Ok(Settled {
+                    lock,
+                    first_sync: missing,
+                    pending,
+                })
             }
         },
     }
@@ -377,58 +492,74 @@ fn warn_unresolved(env: &OpEnv, lock: Lockfile) -> Lockfile {
     lock
 }
 
-/// The lock the manifest resolves to now: written beside it, or on a dry run
-/// only said how it would differ from the one there.
+/// The lock the manifest resolves to now, and the write of it that is owed:
+/// none on a dry run, which only says how the lock would differ from the one
+/// there.
 fn new_lock(
     env: &OpEnv,
     found: &(PathBuf, Project),
     lock_path: &Path,
     dry_run: bool,
-) -> Result<Lockfile, LockError> {
-    if !dry_run {
-        // shortcut: the lock is written, and cancel refused, before the
-        // archives are fetched, so a fetch that fails leaves the new lock with
-        // nothing synced. Lock in memory and write it with the sync if that bites.
-        return locking::lock(env);
-    }
+) -> Result<(Lockfile, Option<locking::PendingLock>), LockError> {
     let previous = Lockfile::read(lock_path).ok();
     let (lock, changes, after) = locking::relock(env, found, previous.as_ref())?;
-    if !changes.is_empty() {
-        env.sink.emit(Event::LockWouldChange { changes });
+    if dry_run {
+        if !changes.is_empty() {
+            env.sink.emit(Event::LockWouldChange { changes });
+        }
+        after.into_iter().for_each(|event| env.sink.emit(event));
+        return Ok((lock, None));
     }
-    after.into_iter().for_each(|event| env.sink.emit(event));
-    Ok(lock)
+    let pending = locking::PendingLock::new(lock_path.to_path_buf(), &lock, changes, after)?;
+    Ok((lock, Some(pending)))
 }
 
 /// The first sync of a project removes what the lock it just made does not
 /// list, which nobody asked for in so many words: say so.
 pub(super) fn announce_migration(env: &OpEnv, plan: &SyncPlan) {
-    let removing: Vec<PackageRef> = plan
-        .steps
-        .iter()
-        .filter_map(|step| match step {
-            SyncStep::Remove {
-                name,
-                version,
-                reason: RemoveReason::NotInLock,
-                ..
-            } => Some(PackageRef {
-                name: name.clone(),
-                version: version.clone(),
-            }),
-            _ => None,
-        })
-        .collect();
+    let removing = package_refs(&removals_to_ask(plan));
     if !removing.is_empty() {
         env.sink.emit(Event::SyncMigration { removing });
     }
 }
 
+/// The removals a sync asks about: those of a package the lock does not list.
+/// What `--no-dev` and a group selection take out follows from what the user
+/// typed, and is not asked about.
+fn removals_to_ask(plan: &SyncPlan) -> Vec<SyncStep> {
+    (plan.steps.iter())
+        .filter(|step| {
+            matches!(
+                step,
+                SyncStep::Remove {
+                    reason: RemoveReason::NotInLock,
+                    ..
+                }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// The packages the removals take out.
+pub fn package_refs(removals: &[SyncStep]) -> Vec<PackageRef> {
+    (removals.iter())
+        .filter_map(|step| match step {
+            SyncStep::Remove { name, version, .. } => Some(PackageRef {
+                name: name.clone(),
+                version: version.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Put the destination right: take out what the plan removes, then install and
 /// replace what it lists, the archives of `planned` being already in hand.
-/// What the plan does is said first. The relink, the hooks and the palette
-/// refresh are left to [`finish`], which spends what this leaves in the
-/// session.
+/// The relink, the hooks and the palette refresh are left to [`finish`], which
+/// spends what this leaves in the session.
+///
+/// The caller has said what the plan does (`SyncPlanned`).
 ///
 /// A change that fails stops the rest. The error says which packages are done
 /// and which are not, so that running the sync again can finish it.
@@ -444,10 +575,6 @@ pub fn apply_sync(
     // The first change is a removal or an install, and every archive is in
     // hand: this is where cancelling stops being possible.
     env.cancel.begin_unpack()?;
-    env.sink.emit(Event::SyncPlanned {
-        steps: plan.steps.clone(),
-        dry_run: false,
-    });
     change(env, session, plan, planned, opts)
         .map_err(|cause| incomplete(session, lock, plan, selection, &cause))
 }
@@ -1907,7 +2034,6 @@ mod tests {
 
     #[test]
     fn a_cancel_during_the_last_sources_load_is_a_cancel_and_not_a_missing_archive() {
-        use super::super::testing::CancelOn;
         let scratch = Scratch::new("cancelled-last-load");
         let project = manifest(
             "dead = \"http://127.0.0.1:1/feed\"
@@ -2058,6 +2184,7 @@ mod tests {
 
     // ---- the whole operation, on real files ----
 
+    use super::super::testing::CancelOn;
     use crate::events::EventSink;
     use crate::target::Roots;
     use std::sync::Mutex;
@@ -2178,7 +2305,7 @@ mod tests {
     }
 
     #[test]
-    fn an_extra_package_is_announced_and_then_removed_without_a_question() {
+    fn an_extra_package_is_announced_and_then_removed_when_the_front_end_does_not_ask() {
         let project = project("extra", &["beta", "gamma"]);
         project.sync(&SyncOptions::default()).0.unwrap();
         project.write_manifest(&["beta"]);
@@ -2361,9 +2488,9 @@ beta = \"*\"
         assert!(
             !events.iter().any(|event| matches!(
                 event,
-                Event::SyncPlanned { .. } | Event::PackageStart { .. }
+                Event::PackageStart { .. } | Event::PackageRemoved { .. }
             )),
-            "nothing was announced or started: {events:?}"
+            "nothing was started: {events:?}"
         );
     }
 
@@ -2836,6 +2963,791 @@ beta = \"*\"
                 required_by: "beta".into()
             }]
         );
+    }
+
+    // ---- the lock is written once the archives are in hand ----
+
+    /// Takes the folder and the cache away when the lock has been made, which
+    /// `project_with_an_unresolved_requirement` says by `RequirementUnresolved`
+    /// as its last word: the one event between making the lock and fetching
+    /// the archives the sync installs.
+    struct LoseArchivesOnceLocked {
+        folder: PathBuf,
+        cache: PathBuf,
+    }
+
+    impl LoseArchivesOnceLocked {
+        fn of(project: &Scratch) -> Self {
+            LoseArchivesOnceLocked {
+                folder: project.folder(),
+                cache: project.root.join("cache"),
+            }
+        }
+    }
+
+    impl EventSink for LoseArchivesOnceLocked {
+        fn emit(&self, event: Event) {
+            if matches!(event, Event::RequirementUnresolved { .. }) {
+                std::fs::remove_dir_all(&self.folder).ok();
+                std::fs::remove_dir_all(&self.cache).ok();
+            }
+        }
+    }
+
+    fn position(events: &[Event], wanted: impl Fn(&Event) -> bool) -> usize {
+        events
+            .iter()
+            .position(wanted)
+            .unwrap_or_else(|| panic!("event missing in {events:?}"))
+    }
+
+    #[test]
+    fn a_fetch_that_fails_after_the_lock_is_made_leaves_a_missing_lock_missing() {
+        let project = project_with_an_unresolved_requirement("fetch-fails-no-lock");
+        let sink = LoseArchivesOnceLocked::of(&project);
+
+        let outcome = sync(&project.sync_env(&sink), &SyncOptions::default());
+
+        assert!(
+            matches!(outcome, Err(SyncError::Archives(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert!(project.installed().is_empty());
+    }
+
+    #[test]
+    fn a_fetch_that_fails_after_the_lock_is_made_leaves_an_outdated_lock_as_it_was() {
+        let project = project_with_an_unresolved_requirement("fetch-fails-outdated");
+        project.sync(&SyncOptions::default()).0.unwrap();
+        let (lock, installed) = (project.lock_bytes().unwrap(), project.installed());
+        // gamma is new: the lock is outdated, and the sync has an archive to fetch.
+        project.write_manifest(&["beta", "gamma"]);
+        let sink = LoseArchivesOnceLocked::of(&project);
+
+        let outcome = sync(&project.sync_env(&sink), &SyncOptions::default());
+
+        assert!(
+            matches!(outcome, Err(SyncError::Archives(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(project.lock_bytes(), Some(lock));
+        assert_eq!(project.installed(), installed);
+    }
+
+    #[test]
+    fn a_first_sync_whose_destination_already_matches_still_writes_the_lock() {
+        let project = project("first-nothing-to-do", &["beta"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        assert!(project.lock_path().is_file(), "no lock was written");
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        let nothing = position(&events, |e| e == &Event::SyncNothingToDo);
+        assert!(written < nothing, "{events:?}");
+    }
+
+    #[test]
+    fn an_outdated_lock_whose_destination_already_matches_is_still_rewritten() {
+        let project = project("outdated-nothing-to-do", &["beta"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        let before = project.lock_bytes().unwrap();
+        // alpha is installed already, as beta needs it: only the lock differs.
+        project.write_manifest(&["beta", "alpha"]);
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        assert_ne!(
+            project.lock_bytes().unwrap(),
+            before,
+            "the lock was not rewritten"
+        );
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        let nothing = position(&events, |e| e == &Event::SyncNothingToDo);
+        assert!(written < nothing, "{events:?}");
+    }
+
+    #[test]
+    fn a_cancel_after_the_lock_is_made_and_before_it_is_written_is_honoured() {
+        let project = project_with_an_unresolved_requirement("cancel-before-lock-write");
+        let token = crate::cancel::CancelToken::new();
+        let sink = CancelOn::new(&token, |e| matches!(e, Event::RequirementUnresolved { .. }));
+        let mut env = project.sync_env(&sink);
+        env.cancel = token;
+
+        let outcome = sync(&env, &SyncOptions::default());
+
+        assert_eq!(sink.answered(), Some(true), "the cancel was not accepted");
+        assert!(matches!(outcome, Err(SyncError::Cancelled)), "{outcome:?}");
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert!(project.installed().is_empty());
+    }
+
+    #[test]
+    fn a_cancel_once_the_lock_is_written_is_refused_and_the_sync_finishes() {
+        let project = project("cancel-after-lock-write", &["beta"]);
+        let token = crate::cancel::CancelToken::new();
+        let sink = CancelOn::new(&token, |e| matches!(e, Event::LockWritten { .. }));
+        let mut env = project.sync_env(&sink);
+        env.cancel = token;
+
+        sync(&env, &SyncOptions::default()).unwrap();
+
+        assert_eq!(sink.answered(), Some(false), "the cancel was accepted");
+        assert_eq!(
+            project.installed(),
+            pairs(&[("alpha", "2.0"), ("beta", "1.0")])
+        );
+    }
+
+    #[test]
+    fn a_first_sync_announces_the_plan_and_then_what_it_takes_out_before_it_writes_the_lock() {
+        let project = project("event-order", &["beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        std::fs::remove_file(project.lock_path()).unwrap();
+        project.write_manifest(&["beta"]);
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        let hashing = position(&events, |e| matches!(e, Event::LockHashing { .. }));
+        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
+        let migration = position(&events, |e| matches!(e, Event::SyncMigration { .. }));
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        assert!(
+            hashing < planned && planned < migration && migration < written,
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancel_before_the_lock_is_written_stops_a_sync_that_has_nothing_to_change() {
+        let project = project_with_an_unresolved_requirement("cancel-empty-plan");
+        project.sync(&SyncOptions::default()).0.unwrap();
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let installed = project.installed();
+        let token = crate::cancel::CancelToken::new();
+        let sink = CancelOn::new(&token, |e| matches!(e, Event::RequirementUnresolved { .. }));
+        let mut env = project.sync_env(&sink);
+        env.cancel = token;
+
+        let outcome = sync(&env, &SyncOptions::default());
+
+        assert_eq!(sink.answered(), Some(true), "the cancel was not accepted");
+        // The error leaves before the palette merge and `SyncNothingToDo`.
+        assert!(matches!(outcome, Err(SyncError::Cancelled)), "{outcome:?}");
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert_eq!(project.installed(), installed);
+    }
+
+    // ---- the question a sync puts before it removes ----
+
+    /// A front end that gives `answer`, and keeps what it was asked.
+    struct Question {
+        answer: Result<Answer, &'static str>,
+        asked: std::cell::RefCell<Vec<Vec<SyncStep>>>,
+    }
+
+    impl Question {
+        fn answering(answer: Answer) -> Self {
+            Question {
+                answer: Ok(answer),
+                asked: Default::default(),
+            }
+        }
+
+        fn failing(why: &'static str) -> Self {
+            Question {
+                answer: Err(why),
+                asked: Default::default(),
+            }
+        }
+
+        fn put(&self, removals: &[SyncStep]) -> anyhow::Result<Answer> {
+            self.asked.borrow_mut().push(removals.to_vec());
+            self.answer.map_err(|why| anyhow::anyhow!(why))
+        }
+
+        fn asked(&self) -> Vec<Vec<SyncStep>> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    impl Scratch {
+        fn sync_asked(
+            &self,
+            opts: &SyncOptions,
+            question: &Question,
+        ) -> (Result<(), SyncError>, Vec<Event>) {
+            let sink = Recorder::default();
+            let outcome = sync_asking(&self.sync_env(&sink), opts, &|removals| {
+                question.put(removals)
+            });
+            (outcome, sink.events())
+        }
+    }
+
+    /// beta and gamma are synced, and then the manifest asks for beta alone:
+    /// the lock is outdated, and the one it makes drops gamma, which is installed.
+    fn project_whose_new_lock_drops_gamma(tag: &str) -> Scratch {
+        let project = project(tag, &["beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["beta"]);
+        project
+    }
+
+    fn dry_run() -> SyncOptions {
+        SyncOptions {
+            install: InstallOptions {
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+            ..SyncOptions::default()
+        }
+    }
+
+    fn planned_count(events: &[Event]) -> usize {
+        let planned = |event: &&Event| matches!(event, Event::SyncPlanned { dry_run: false, .. });
+        events.iter().filter(planned).count()
+    }
+
+    const BETA_AND_ALPHA: &[(&str, &str)] = &[("alpha", "2.0"), ("beta", "1.0")];
+
+    #[test]
+    fn a_declined_sync_with_no_lock_writes_none_removes_nothing_and_says_so() {
+        let project = project_whose_new_lock_drops_gamma("declined-no-lock");
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let installed = project.installed();
+        let question = Question::answering(Answer::Asked(false));
+
+        let (outcome, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+        outcome.unwrap();
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert_eq!(project.installed(), installed);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::SyncDeclined { removing }
+                    if removing == &[PackageRef { name: "gamma".into(), version: "1.0".into() }]
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::SyncMigration { .. } | Event::PackageRemoved { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_declined_sync_leaves_an_outdated_lock_as_it_was() {
+        let project = project_whose_new_lock_drops_gamma("declined-outdated");
+        let (lock, installed) = (project.lock_bytes().unwrap(), project.installed());
+        let question = Question::answering(Answer::Asked(false));
+
+        project
+            .sync_asked(&SyncOptions::default(), &question)
+            .0
+            .unwrap();
+
+        assert_eq!(project.lock_bytes(), Some(lock));
+        assert_eq!(project.installed(), installed);
+    }
+
+    #[test]
+    fn an_accepted_sync_removes_the_package_and_writes_the_lock() {
+        let project = project_whose_new_lock_drops_gamma("accepted");
+        let question = Question::answering(Answer::Asked(true));
+
+        let (outcome, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+        outcome.unwrap();
+        assert_eq!(project.installed(), pairs(BETA_AND_ALPHA));
+        let locked = Lockfile::read(&project.lock_path()).unwrap();
+        let names: Vec<&str> = locked.packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "beta"], "the new lock was not written");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::SyncDeclined { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn the_question_is_put_once_with_exactly_the_packages_the_lock_does_not_list() {
+        let project = project("asked-two", &["alpha", "beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["alpha"]);
+        let question = Question::answering(Answer::Asked(false));
+
+        project
+            .sync_asked(&SyncOptions::default(), &question)
+            .0
+            .unwrap();
+
+        assert_eq!(
+            question.asked(),
+            [[
+                remove("beta", "1.0", RemoveReason::NotInLock),
+                remove("gamma", "1.0", RemoveReason::NotInLock)
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_failing_question_stops_the_sync_with_its_error_before_any_change() {
+        let project = project_whose_new_lock_drops_gamma("question-fails");
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let installed = project.installed();
+        let question = Question::failing("needs --yes");
+
+        let (outcome, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+        assert!(
+            matches!(&outcome, Err(SyncError::Other(why)) if why.to_string() == "needs --yes"),
+            "{outcome:?}"
+        );
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert_eq!(project.installed(), installed);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::LockWritten { .. }
+                    | Event::PackageStart { .. }
+                    | Event::PackageRemoved { .. }
+                    | Event::SyncMigration { .. }
+                    | Event::SyncDeclined { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn no_question_is_put_when_nothing_is_removed_or_what_is_removed_follows_from_the_flags() {
+        let no_dev = SyncOptions {
+            no_dev: true,
+            ..SyncOptions::default()
+        };
+        let dev_only = || {
+            let project = project("no-ask-dev-only", &["alpha"]);
+            std::fs::write(
+                project.root.join(crate::project::FILE_NAME),
+                format!("{MANIFEST_HEAD}[dependencies]\nalpha = \"*\"\n\n[dev-dependencies]\ngamma = \"*\"\n"),
+            )
+            .unwrap();
+            project.sync(&SyncOptions::default()).0.unwrap();
+            project
+        };
+        let replaced = || {
+            let project = project("no-ask-replace", &["alpha"]);
+            project.sync(&SyncOptions::default()).0.unwrap();
+            std::fs::write(
+                project.root.join(crate::project::FILE_NAME),
+                format!("{MANIFEST_HEAD}[dependencies]\nalpha = \"1.0\"\n"),
+            )
+            .unwrap();
+            project
+        };
+        let group_dropped = || {
+            let project = project_with_a_ci_group("no-ask-group");
+            project.sync(&selecting(&["ci"])).0.unwrap();
+            project
+        };
+        // The last of each case: what the flags remove is planned all the same,
+        // the guard of the cases that go ahead without a question for that reason.
+        let cases = [
+            (
+                "a package to install",
+                project("no-ask-install", &["beta"]),
+                SyncOptions::default(),
+                None,
+            ),
+            (
+                "a version to replace",
+                replaced(),
+                SyncOptions::default(),
+                None,
+            ),
+            (
+                "a dev-only package",
+                dev_only(),
+                no_dev,
+                Some(RemoveReason::DevOnly),
+            ),
+            (
+                "a group no longer selected",
+                group_dropped(),
+                SyncOptions::default(),
+                Some(RemoveReason::GroupsOnly),
+            ),
+            (
+                "a dry run that would remove",
+                project_whose_new_lock_drops_gamma("no-ask-dry-run"),
+                dry_run(),
+                None,
+            ),
+        ];
+        for (label, project, opts, planned_removal) in cases {
+            let question = Question::answering(Answer::Asked(false));
+
+            let (outcome, events) = project.sync_asked(&opts, &question);
+
+            outcome.unwrap_or_else(|why| panic!("{label}: {why}"));
+            if let Some(reason) = planned_removal {
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        Event::SyncPlanned { steps, dry_run: false }
+                            if steps.iter().any(|step| matches!(
+                                step, SyncStep::Remove { reason: why, .. } if *why == reason
+                            ))
+                    )),
+                    "{label}: no removal for {reason:?} was planned: {events:?}"
+                );
+            }
+            assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new(), "{label}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::SyncDeclined { .. })),
+                "{label}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_says_it_would_remove_the_package_and_asks_nothing_and_changes_nothing() {
+        let project = project_whose_new_lock_drops_gamma("dry-run-no-ask");
+        let (lock, installed) = (project.lock_bytes(), project.installed());
+        let question = Question::answering(Answer::Asked(false));
+
+        let (outcome, events) = project.sync_asked(&dry_run(), &question);
+
+        outcome.unwrap();
+        assert!(
+            events.contains(&Event::SyncPlanned {
+                steps: vec![remove("gamma", "1.0", RemoveReason::NotInLock)],
+                dry_run: true
+            }),
+            "{events:?}"
+        );
+        assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new());
+        assert_eq!(
+            (project.lock_bytes(), project.installed()),
+            (lock, installed)
+        );
+    }
+
+    #[test]
+    fn a_dry_run_is_not_refused_by_a_front_end_that_refuses_every_question() {
+        // The CLI's answer to `--global` without a terminal: an error.
+        let project = project_whose_new_lock_drops_gamma("dry-run-not-refused");
+        let question = Question::failing("needs --yes");
+
+        let (outcome, _) = project.sync_asked(&dry_run(), &question);
+
+        outcome.unwrap();
+        assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new());
+    }
+
+    #[test]
+    fn a_declined_first_sync_does_not_say_it_is_writing_a_lock() {
+        let project = project_whose_new_lock_drops_gamma("declined-no-lock-note");
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (outcome, events) = project.sync_asked(
+            &SyncOptions::default(),
+            &Question::answering(Answer::Asked(false)),
+        );
+
+        outcome.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::SyncDeclined { .. })),
+            "the sync was not declined: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::SyncLockMissing { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_first_sync_that_goes_ahead_says_it_is_writing_a_lock_just_before_it_does() {
+        let project = project_whose_new_lock_drops_gamma("lock-note-before-write");
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (outcome, events) = project.sync_asked(
+            &SyncOptions::default(),
+            &Question::answering(Answer::Asked(true)),
+        );
+
+        outcome.unwrap();
+        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
+        let said = position(&events, |e| matches!(e, Event::SyncLockMissing { .. }));
+        let changed = position(&events, |e| matches!(e, Event::LockChanged { .. }));
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        assert!(
+            planned < said && said < changed && changed < written,
+            "{events:?}"
+        );
+    }
+
+    /// Takes the cache away once the plan is said, and notes whether the cache
+    /// is back, as the fetch of the archives puts it, when the lock is written.
+    struct CacheBackWhenLockWritten {
+        cache: PathBuf,
+        back: Mutex<Option<bool>>,
+    }
+
+    impl EventSink for CacheBackWhenLockWritten {
+        fn emit(&self, event: Event) {
+            match event {
+                Event::SyncPlanned { .. } => {
+                    std::fs::remove_dir_all(&self.cache).unwrap();
+                }
+                Event::LockWritten { .. } => {
+                    *self.back.lock().unwrap() = Some(self.cache.exists());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn the_lock_is_written_after_the_archives_are_fetched_into_the_cache() {
+        let project = project("fetch-then-lock", &["beta"]);
+        let sink = CacheBackWhenLockWritten {
+            cache: project.root.join("cache"),
+            back: Mutex::new(None),
+        };
+
+        sync(&project.sync_env(&sink), &SyncOptions::default()).unwrap();
+
+        assert_eq!(
+            *sink.back.lock().unwrap(),
+            Some(true),
+            "the lock was written before the archives were fetched"
+        );
+    }
+
+    /// Takes the cache away once the plan is said: what is in it afterwards was
+    /// fetched after the plan.
+    struct CacheGoneOnceThePlanIsSaid {
+        cache: PathBuf,
+    }
+
+    impl EventSink for CacheGoneOnceThePlanIsSaid {
+        fn emit(&self, event: Event) {
+            if matches!(event, Event::SyncPlanned { .. }) {
+                std::fs::remove_dir_all(&self.cache).unwrap();
+            }
+        }
+    }
+
+    /// Syncs `tag`'s project, where gamma is installed and goes and alpha is
+    /// not and would be fetched, answering `answer`. Gives back whether the
+    /// cache holds anything fetched after the plan, whether the lock changed,
+    /// and the questions put.
+    fn cache_after_a_sync_that_would_fetch_alpha(
+        tag: &str,
+        answer: bool,
+    ) -> (bool, bool, Vec<Vec<SyncStep>>) {
+        let project = project(tag, &["gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["alpha"]);
+        let lock = project.lock_bytes();
+        let question = Question::answering(Answer::Asked(answer));
+        let sink = CacheGoneOnceThePlanIsSaid {
+            cache: project.root.join("cache"),
+        };
+
+        sync_asking(&project.sync_env(&sink), &SyncOptions::default(), &|r| {
+            question.put(r)
+        })
+        .unwrap();
+
+        (
+            project.root.join("cache").exists(),
+            project.lock_bytes() != lock,
+            question.asked(),
+        )
+    }
+
+    #[test]
+    fn a_declined_sync_has_fetched_nothing_even_with_a_package_to_install() {
+        let (cache, lock_changed, asked) =
+            cache_after_a_sync_that_would_fetch_alpha("declined-no-fetch", false);
+
+        assert_eq!(asked, [[remove("gamma", "1.0", RemoveReason::NotInLock)]]);
+        assert!(!cache, "the archives were fetched before the question");
+        assert!(!lock_changed, "the lock was changed by a decline");
+    }
+
+    #[test]
+    fn an_answered_sync_fetches_into_the_cache_after_the_plan() {
+        // The control of the test above: the same project, answered yes.
+        let (cache, ..) = cache_after_a_sync_that_would_fetch_alpha("answered-fetches", true);
+
+        assert!(cache, "alpha was not fetched after the plan");
+    }
+
+    #[test]
+    fn a_locked_or_frozen_sync_asks_once_about_a_stray_package_and_a_no_changes_nothing() {
+        for policy in [LockPolicy::Locked, LockPolicy::Frozen] {
+            let project = project("locked-stray", &["beta", "gamma"]);
+            project.sync(&SyncOptions::default()).0.unwrap();
+            // The lock follows the manifest, and gamma is left installed.
+            project.write_manifest(&["beta"]);
+            locking_lock(&project);
+            let (lock, installed) = (project.lock_bytes(), project.installed());
+            let question = Question::answering(Answer::Asked(false));
+
+            let (outcome, events) = project.sync_asked(&with(policy), &question);
+
+            outcome.unwrap();
+            assert_eq!(
+                question.asked(),
+                [[remove("gamma", "1.0", RemoveReason::NotInLock)]],
+                "{policy:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::SyncDeclined { .. })),
+                "{policy:?}: {events:?}"
+            );
+            assert_eq!(
+                (project.lock_bytes(), project.installed()),
+                (lock, installed),
+                "{policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fetch_that_fails_after_a_yes_leaves_the_lock_and_the_package_to_be_removed_as_they_were() {
+        for lock_there in [true, false] {
+            let project = project_with_an_unresolved_requirement("yes-then-fetch-fails");
+            project.write_manifest(&["alpha", "gamma"]);
+            project.sync(&SyncOptions::default()).0.unwrap();
+            // beta is new, gamma is dropped, and beta's archive is about to be lost.
+            project.write_manifest(&["beta"]);
+            if !lock_there {
+                std::fs::remove_file(project.lock_path()).unwrap();
+            }
+            let (lock, installed) = (project.lock_bytes(), project.installed());
+            let question = Question::answering(Answer::Asked(true));
+            let sink = LoseArchivesOnceLocked::of(&project);
+
+            let outcome = sync_asking(&project.sync_env(&sink), &SyncOptions::default(), &|r| {
+                question.put(r)
+            });
+
+            assert!(
+                matches!(outcome, Err(SyncError::Archives(_))),
+                "lock there {lock_there}: {outcome:?}"
+            );
+            assert_eq!(question.asked().len(), 1, "lock there {lock_there}");
+            assert_eq!(project.lock_bytes(), lock, "lock there {lock_there}");
+            assert_eq!(project.installed(), installed, "lock there {lock_there}");
+            assert_eq!(
+                installed,
+                pairs(&[("alpha", "2.0"), ("gamma", "1.0")]),
+                "gamma is still installed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_of_a_first_sync_still_says_what_it_would_take_out() {
+        let project = project_whose_new_lock_drops_gamma("dry-run-first-sync");
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (outcome, events) =
+            project.sync_asked(&dry_run(), &Question::answering(Answer::Asked(false)));
+
+        outcome.unwrap();
+        let migration = position(&events, |e| matches!(e, Event::SyncMigration { .. }));
+        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
+        assert!(migration < planned, "{events:?}");
+    }
+
+    #[test]
+    fn the_plan_is_announced_once_whichever_way_the_question_is_answered() {
+        let answers = [
+            ("yes", Question::answering(Answer::Asked(true))),
+            ("no", Question::answering(Answer::Asked(false))),
+            ("not asked", Question::answering(Answer::NotAsked)),
+            ("an error", Question::failing("needs --yes")),
+        ];
+        for (label, question) in answers {
+            let project = project_whose_new_lock_drops_gamma("planned-once");
+
+            let (_, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+            assert_eq!(planned_count(&events), 1, "{label}: {events:?}");
+        }
+    }
+
+    #[test]
+    fn the_question_comes_after_the_plan_and_before_any_write_and_a_note_follows_only_when_not_asked()
+     {
+        for (answer, says_what_it_takes_out) in
+            [(Answer::Asked(true), false), (Answer::NotAsked, true)]
+        {
+            let project = project_whose_new_lock_drops_gamma("question-order");
+            std::fs::remove_file(project.lock_path()).unwrap();
+            let sink = Recorder::default();
+            let put_after = std::cell::Cell::new(None);
+            let ask = |_: &[SyncStep]| {
+                put_after.set(Some(sink.events().len()));
+                Ok(answer)
+            };
+
+            sync_asking(&project.sync_env(&sink), &SyncOptions::default(), &ask).unwrap();
+
+            let (events, put_after) = (sink.events(), put_after.get().unwrap());
+            let before = &events[..put_after];
+            let after = &events[put_after..];
+            assert!(
+                before
+                    .iter()
+                    .any(|e| matches!(e, Event::SyncPlanned { dry_run: false, .. })),
+                "{answer:?}: {events:?}"
+            );
+            assert!(
+                !before.iter().any(|e| matches!(
+                    e,
+                    Event::LockWritten { .. }
+                        | Event::PackageRemoved { .. }
+                        | Event::SyncMigration { .. }
+                )),
+                "{answer:?}: {events:?}"
+            );
+            assert!(
+                after.iter().any(|e| matches!(e, Event::LockWritten { .. })),
+                "{answer:?}: {events:?}"
+            );
+            assert_eq!(
+                after
+                    .iter()
+                    .any(|e| matches!(e, Event::SyncMigration { .. })),
+                says_what_it_takes_out,
+                "{answer:?}: {events:?}"
+            );
+        }
     }
 
     // ---- a LabVIEW installation that is not there: --global and headless ----

@@ -444,7 +444,7 @@ pub enum EditError {
     /// itself, and the sync would uninstall `packages` (name and version) besides
     /// the one the edit takes away: other projects, or the user, may have put
     /// them there. Nothing was changed.
-    // Temporary until #55 asks before a sync removes.
+    // Named add and remove refuse this rather than ask.
     #[error(
         "the sync would uninstall packages from LabVIEW that you did not name: {}",
         names_and_versions(.packages)

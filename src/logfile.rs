@@ -38,7 +38,10 @@ impl LogSink {
     /// Write this run's log to `path` from now on, starting with its header.
     pub fn attach(&self, path: PathBuf) {
         *self.lock() = Some(path);
-        let args: Vec<String> = std::env::args().skip(1).map(|a| quote(&a)).collect();
+        let args: Vec<String> = std::env::args_os()
+            .skip(1)
+            .map(|a| quote(&a.to_string_lossy()))
+            .collect();
         let cwd = std::env::current_dir()
             .map(|d| d.display().to_string())
             .unwrap_or_default();

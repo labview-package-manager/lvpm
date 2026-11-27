@@ -39,7 +39,7 @@ Feature: lvpm sync makes the destination equal the lock
     Given no lvpm.lock exists and "gamma" 1.0 installed in dest
     When I run "lvpm sync --prefix dest"
     Then the output says no lvpm.lock was found and one is being written
-    And it says 1 installed package not in the lock will be removed, naming "gamma"
+    And it says 1 package not in lvpm.lock will be removed, naming "gamma"
     And it says to commit lvpm.lock
     And dest matches the new lvpm.lock
 
