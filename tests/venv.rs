@@ -815,9 +815,13 @@ lib = { version = \"*\", relink = true }
     lab.ok(&["venv", "create"]);
 
     // fork: the check is against lvpm.lock, not the manifest.
-    has(&lab.fails(&["launch"]), "no lvpm.lock beside the manifest");
+    let refused = lab.fails(&["launch"]);
+    has(&refused, "no lvpm.lock beside the manifest");
+    has(&refused, "run `lvpm sync`");
+    lacks(&refused, "Error: launching ");
     lab.ok(&["lock"]);
     let refused = lab.fails(&["launch"]);
+    lacks(&refused, "Error: launching ");
     has(&refused, "app: not installed (lock: 1.0.0.1)");
     has(&refused, "lib: not installed");
     has(&refused, "run `lvpm sync`");
@@ -867,8 +871,11 @@ lib = \"*\"
     let refused = lab.fails(&["launch"]);
     has(&refused, "no lvpm.lock beside the manifest");
     has(&refused, "run `lvpm sync`");
+    lacks(&refused, "Error: launching ");
     lab.ok(&["sync"]);
-    assert!(lock.is_file(), "lvpm sync did not write lvpm.lock");
+    let written = std::fs::read_to_string(&lock).expect("lvpm sync writes lvpm.lock");
+    has(&written, "2.0.0.1");
+    has(&written, "lib");
     let r = lab.run_in(&lab.project(), &["launch"]);
     has(&r.text, "Error: launching ");
     lacks(&r.text, "does not match");
