@@ -2735,8 +2735,16 @@ mod tests {
                     .chain(args.iter().copied()),
             )
         };
-        assert!(parse(&["pkg", "--with-deps", "--keep-deps"]).is_err());
-        assert!(parse(&["--all", "--with-deps"]).is_err());
+        assert_eq!(
+            parse(&["pkg", "--with-deps", "--keep-deps"])
+                .err()
+                .map(|e| e.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(
+            parse(&["--all", "--with-deps"]).err().map(|e| e.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
         assert!(parse(&["pkg", "--with-deps"]).is_ok());
     }
 
@@ -2757,8 +2765,8 @@ mod tests {
         let g = install_sync(&["--with", "a,b", "--with", "c", "--without", "b,d"]).unwrap();
         assert_eq!(g.with, ["a", "b", "c"]);
         assert_eq!(g.without, ["b", "d"]);
-        let g = install_sync(&["--only", "main,build"]).unwrap();
-        assert_eq!(g.only, ["main", "build"]);
+        let g = install_sync(&["--only", "test,build"]).unwrap();
+        assert_eq!(g.only, ["test", "build"]);
         assert!(g.with.is_empty() && g.without.is_empty());
     }
 
@@ -2771,11 +2779,36 @@ mod tests {
 
     #[test]
     fn group_flags_refuse_contradictory_combinations() {
-        assert!(install_sync(&["--only", "a", "--with", "b"]).is_err());
-        assert!(install_sync(&["--only", "a", "--without", "b"]).is_err());
-        assert!(install_sync(&["oglib_error", "--with", "a"]).is_err());
-        assert!(install_sync(&["oglib_error", "--without", "a"]).is_err());
-        assert!(install_sync(&["oglib_error", "--only", "a"]).is_err());
+        assert_eq!(
+            install_sync(&["--only", "a", "--with", "b"])
+                .err()
+                .map(|e| e.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(
+            install_sync(&["--only", "a", "--without", "b"])
+                .err()
+                .map(|e| e.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(
+            install_sync(&["oglib_error", "--with", "a"])
+                .err()
+                .map(|e| e.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(
+            install_sync(&["oglib_error", "--without", "a"])
+                .err()
+                .map(|e| e.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(
+            install_sync(&["oglib_error", "--only", "a"])
+                .err()
+                .map(|e| e.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
         assert!(install_sync(&["--manifest", "app.toml", "--with", "dev"]).is_ok());
         assert!(install_sync(&["--with", "a", "--without", "b"]).is_ok());
     }

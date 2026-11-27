@@ -2185,7 +2185,11 @@ Alpha = \"1.0\"
         std::fs::write(&manifest, before).unwrap();
         let sink = Recorded::default();
         let env = env_on(&sink, &root);
-        assert!(import(&env, Path::new("p.vipc"), false, None, false).is_err());
+        let err = format!(
+            "{:#}",
+            import(&env, Path::new("p.vipc"), false, None, false).unwrap_err()
+        );
+        assert!(err.contains("lvpm 0.3 form of a group"), "{err}");
         assert_eq!(std::fs::read_to_string(&manifest).unwrap(), before);
 
         // A manifest that does not exist yet is created by the write, not before.

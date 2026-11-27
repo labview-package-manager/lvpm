@@ -1124,10 +1124,13 @@ mod tests {
         let dir = Dir::new("upstream-malformed");
         let path = dir.0.join("p.vipc");
         std::fs::write(&path, "not a zip").unwrap();
-        assert!(read(&path, "p.vipc").is_err());
-        assert!(read_xml("upstream-unclosed", "<VI_Package_Configuration><Target>").is_err());
+        let err = format!("{:#}", read(&path, "p.vipc").unwrap_err());
+        assert!(err.contains("not a zip file"), "{err}");
+        let err = read_xml("upstream-unclosed", "<VI_Package_Configuration><Target>").unwrap_err();
+        assert!(err.contains("<Target> is not closed"), "{err}");
         let two = "<VI_Package_Configuration><Target></Target><Target></Target></VI_Package_Configuration>";
-        assert!(read_xml("upstream-two", two).is_err());
+        let err = read_xml("upstream-two", two).unwrap_err();
+        assert!(err.contains("more than one <Target>"), "{err}");
     }
 
     #[test]

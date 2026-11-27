@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn a_venv_uses_its_bound_manifest_and_has_none_when_it_is_missing() {
+    fn venv_uses_its_bound_manifest_and_reports_when_it_is_missing() {
         let dir = scratch_dir("bound-manifest");
         let bound = dir.join("app.toml");
         std::fs::write(&bound, "[dependencies]\npinned = \"1.0\"\n").unwrap();
