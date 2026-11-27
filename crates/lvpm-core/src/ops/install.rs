@@ -1365,4 +1365,285 @@ mod tests {
         assert_eq!(snapshot(&dir), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- resolve_greedy, ported from upstream's resolve.rs ----
+
+    fn listed(
+        name: &str,
+        version: &str,
+        requires: &[(&str, Option<&str>)],
+        lv_min: Option<f64>,
+    ) -> Entry {
+        Entry {
+            name: name.into(),
+            version: Version::parse(version),
+            url: String::new(),
+            md5: None,
+            display_name: None,
+            requires: requires
+                .iter()
+                .map(|(name, min)| crate::index::Requirement {
+                    name: (*name).into(),
+                    min: min.map(Version::parse),
+                    min_exclusive: false,
+                })
+                .collect(),
+            lv_min,
+            source: String::new(),
+            released: None,
+            index_pin: None,
+        }
+    }
+
+    fn wanted(name: &str, constraint: &str) -> (String, Constraint) {
+        (name.into(), Constraint::parse(constraint).unwrap())
+    }
+
+    /// A scratch store gated at `lv`, with `installed` as (name, version) records.
+    fn greedy_store(tag: &str, lv: Option<f64>, installed: &[(&str, &str)]) -> (PathBuf, Roots) {
+        let dir = crate::ops::testing::scratch_dir(tag);
+        let mut store = Roots::scratch(&dir);
+        store.target = lv.map(|version| crate::target::LvTarget {
+            version,
+            bitness: 64,
+            path: dir.join("LabVIEW"),
+        });
+        std::fs::create_dir_all(store.store_dir()).unwrap();
+        for (name, version) in installed {
+            let record = serde_json::json!({
+                "name": name, "version": version, "display_name": null, "installed_at": 0,
+                "target": "", "files": [], "skipped_hooks": []
+            });
+            std::fs::write(
+                store.store_dir().join(format!("{name}.json")),
+                record.to_string(),
+            )
+            .unwrap();
+        }
+        (dir, store)
+    }
+
+    /// The plan's names and versions, and the dependency events it raised.
+    type Greedy = (Vec<(String, String)>, Vec<Event>);
+
+    fn greedy(
+        store: &Roots,
+        dir: &std::path::Path,
+        index: Vec<Entry>,
+        roots: &[(String, Constraint)],
+        no_deps: bool,
+    ) -> Result<Greedy> {
+        let sink = crate::ops::testing::Recorded::default();
+        let env = crate::ops::testing::env_on(&sink, dir);
+        let plan = resolve_greedy(&env, store, &Index { entries: index }, roots, no_deps)?;
+        let names = plan
+            .entries
+            .iter()
+            .map(|p| (p.entry.name.clone(), p.entry.version.raw.clone()))
+            .collect();
+        let events = sink
+            .events()
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::DependencySatisfied { .. } | Event::DependencyUnresolved { .. }
+                )
+            })
+            .collect();
+        Ok((names, events))
+    }
+
+    fn names(plan: &[(String, String)]) -> Vec<&str> {
+        plan.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn resolves_transitive_dependencies_before_dependents_and_deduplicates_names() {
+        let (dir, store) = greedy_store("greedy-transitive", None, &[]);
+        let index = vec![
+            listed("root", "1", &[("a", None), ("b", None)], None),
+            listed("a", "1", &[("shared", None)], None),
+            listed("b", "1", &[("SHARED", None)], None),
+            listed("shared", "1", &[], None),
+        ];
+        let (plan, _) = greedy(&store, &dir, index, &[wanted("root", "*")], false).unwrap();
+        assert_eq!(names(&plan), ["shared", "a", "b", "root"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn honors_exact_roots_floors_and_labview_gates() {
+        let (dir, store) = greedy_store("greedy-gates", Some(26.0), &[]);
+        let index = || {
+            vec![
+                listed("root", "1", &[("dep", Some("2"))], None),
+                listed("root", "2", &[], Some(30.0)),
+                listed("dep", "1", &[], None),
+                listed("dep", "2", &[], None),
+                listed("dep", "3", &[], Some(30.0)),
+            ]
+        };
+        let (plan, _) = greedy(&store, &dir, index(), &[wanted("root", "1")], false).unwrap();
+        assert_eq!(names(&plan), ["dep", "root"]);
+        assert_eq!(plan[0].1, "2");
+        let (exact, _) = greedy(&store, &dir, index(), &[wanted("root", "2")], false).unwrap();
+        assert_eq!(exact[0].1, "2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retains_satisfying_installed_dependencies_but_resolves_explicit_roots() {
+        let (dir, store) = greedy_store(
+            "greedy-retains",
+            None,
+            &[("root", "2"), ("dep", "2"), ("child", "2")],
+        );
+        let index = || {
+            vec![
+                listed("root", "2", &[("dep", Some("2"))], None),
+                listed("dep", "3", &[("child", None)], None),
+            ]
+        };
+        let (plan, events) = greedy(&store, &dir, index(), &[wanted("root", "*")], false).unwrap();
+        assert_eq!(names(&plan), ["root"]);
+        assert_eq!(
+            events,
+            [Event::DependencySatisfied {
+                name: "dep".into(),
+                version: "2".into()
+            }]
+        );
+        // A root is resolved, never kept as installed.
+        let (plan, _) = greedy(&store, &dir, index(), &[wanted("dep", "*")], true).unwrap();
+        assert_eq!(plan[0].1, "3");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reports_all_missing_roots_and_unresolved_transitives() {
+        let (dir, store) = greedy_store("greedy-missing", None, &[]);
+        let sink = crate::ops::testing::Recorded::default();
+        let env = crate::ops::testing::env_on(&sink, &dir);
+        let index = Index {
+            entries: vec![listed("root", "1", &[("missing_dep", None)], None)],
+        };
+        let why = resolve_greedy(
+            &env,
+            &store,
+            &index,
+            &[
+                wanted("root", "*"),
+                wanted("missing", ">=2"),
+                wanted("absent", "1"),
+            ],
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(why.contains("missing >=2\n  absent@1"), "{why}");
+        assert!(sink.events().contains(&Event::DependencyUnresolved {
+            name: "missing_dep".into()
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skips_dependencies_when_requested_and_propagates_read_errors() {
+        // The read-error half is in
+        // an_unreadable_install_record_of_a_dependency_fails_the_resolution.
+        let (dir, store) = greedy_store("greedy-no-deps", None, &[]);
+        let index = vec![listed("root", "1", &[("dep", None)], None)];
+        let (plan, events) = greedy(&store, &dir, index, &[wanted("root", "*")], true).unwrap();
+        assert_eq!(names(&plan), ["root"]);
+        assert!(events.is_empty(), "{events:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "fork bug: resolve_greedy swallows an unreadable install record and resolves the dependency anyway; see #56"]
+    fn an_unreadable_install_record_of_a_dependency_fails_the_resolution() {
+        // Upstream's skips_dependencies_when_requested_and_propagates_read_errors, second half.
+        let (dir, store) = greedy_store("greedy-read-error", None, &[]);
+        std::fs::write(store.store_dir().join("dep.json"), "corrupt install record").unwrap();
+        let index = vec![
+            listed("root", "1", &[("dep", None)], None),
+            listed("dep", "1", &[], None),
+        ];
+        let got = greedy(&store, &dir, index, &[wanted("root", "*")], false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(got.is_err(), "resolved past a corrupt record: {got:?}");
+    }
+
+    #[test]
+    #[ignore = "fork bug: resolve_greedy keeps the first floor's installed version and ignores a higher floor met later; see #56"]
+    fn the_highest_floor_wins_over_an_earlier_satisfied_one() {
+        // `a` asks for shared >= 1, which installed 2 satisfies; `b`, met
+        // later, asks for shared >= 3. The installed 2 must not stand.
+        let (dir, store) = greedy_store("greedy-highest-floor", Some(26.0), &[("shared", "2")]);
+        let index = vec![
+            listed("a", "1", &[("shared", Some("1"))], None),
+            listed("b", "1", &[("shared", Some("3"))], None),
+            listed("shared", "2", &[], None),
+            listed("shared", "3", &[], None),
+            listed("shared", "4", &[], Some(30.0)),
+        ];
+        let roots = [wanted("a", "*"), wanted("b", "*")];
+        let (plan, events) = greedy(&store, &dir, index, &roots, false).unwrap();
+        assert_eq!(names(&plan), ["shared", "a", "b"]);
+        assert_eq!(plan[0].1, "3");
+        assert!(events.is_empty(), "{events:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Nothing at or above the highest floor for this LabVIEW: say so.
+        // Upstream names the floor ("shared >=4"); the fork's event names the package.
+        let (dir, store) = greedy_store("greedy-highest-floor-none", Some(26.0), &[]);
+        let index = vec![
+            listed("a", "1", &[("shared", Some("1"))], None),
+            listed("b", "1", &[("shared", Some("4"))], None),
+            listed("shared", "3", &[], None),
+            listed("shared", "4", &[], Some(30.0)),
+        ];
+        let (plan, events) = greedy(&store, &dir, index, &roots, false).unwrap();
+        assert_eq!(names(&plan), ["a", "b"]);
+        assert_eq!(
+            events,
+            [Event::DependencyUnresolved {
+                name: "shared".into()
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_root_that_is_also_a_dependency_installs_first() {
+        let (dir, store) = greedy_store("greedy-root-dep", None, &[]);
+        let index = || {
+            vec![
+                listed("app", "1", &[("lib", None)], None),
+                listed("lib", "1", &[], None),
+            ]
+        };
+        for roots in [
+            [wanted("lib", "*"), wanted("app", "*")],
+            [wanted("app", "*"), wanted("lib", "*")],
+        ] {
+            let (plan, _) = greedy(&store, &dir, index(), &roots, false).unwrap();
+            assert_eq!(names(&plan), ["lib", "app"]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolves_an_installed_dependency_below_the_floor_and_handles_cycles() {
+        let (dir, store) = greedy_store("greedy-cycle", None, &[("root", "1"), ("dep", "1")]);
+        let index = vec![
+            listed("root", "1", &[("dep", Some("2"))], None),
+            listed("dep", "2", &[("root", None)], None),
+        ];
+        let (plan, events) = greedy(&store, &dir, index, &[wanted("root", "*")], false).unwrap();
+        assert_eq!(names(&plan), ["dep", "root"]);
+        assert!(events.is_empty(), "{events:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

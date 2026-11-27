@@ -1354,6 +1354,38 @@ mod tests {
     }
 
     #[test]
+    fn a_root_pin_is_never_replaced_by_a_dependency_floor() {
+        // `app` is listed first and pulls in `lib >= 2` before the `lib` line
+        // is reached. Upstream installs the pin with a notice; the solver
+        // refuses it as a conflict instead.
+        let index = Index {
+            entries: vec![
+                entry("app", "1", &[("lib", "2")]),
+                entry("lib", "1", &[]),
+                entry("lib", "3", &[]),
+            ],
+        };
+        let Err(SolveError::Conflict(conflict)) =
+            run(&[("app", "*"), ("lib", "1")], &index, &[], None)
+        else {
+            panic!("expected a conflict");
+        };
+        assert!(conflict.facts.contains(&Fact::Manifest {
+            package: "lib".into(),
+            wanted: "= 1".into()
+        }));
+        assert!(conflict.facts.contains(&Fact::Requires {
+            package: "app".into(),
+            versions: "1".into(),
+            needs: "lib".into(),
+            wanted: ">= 2".into()
+        }));
+        // A floor root wins too.
+        let resolution = run(&[("app", "*"), ("lib", ">=1")], &index, &[], None).expect("solves");
+        assert_eq!(chosen(&resolution), [("app", "1"), ("lib", "3")]);
+    }
+
+    #[test]
     fn a_gate_that_rules_out_every_version_is_named() {
         let mut gated = entry("alpha", "2.0", &[]);
         gated.lv_min = Some(26.0);
