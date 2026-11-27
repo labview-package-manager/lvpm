@@ -144,6 +144,23 @@ jobs:
           docker run --rm --entrypoint bash -e GITHUB_STEP_SUMMARY=/out/summary.md \
             -v "$PWD/bin:/lvpm:ro" -v "$PWD/ci/e2e:/e2e:ro" -v "$PWD/out:/out" \
             "$IMAGE" /e2e/smoke.sh /lvpm/lvpm /e2e/fixture "$YEAR"
+      # The README's Linux install, inside the image, on a tarball laid out
+      # like the release's (dist-workspace.toml). A published release itself
+      # is only checked once there is one.
+      - name: Install the build with install.sh, as from a release tarball
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          want=$(bash ci/version-check.sh --print-version)
+          pkg=lvpm-x86_64-unknown-linux-gnu dl="$RUNNER_TEMP/dl"
+          mkdir -p "$dl/$pkg" && cp bin/lvpm bin/relink-package.vi bin/build-app.vi "$dl/$pkg/"
+          tar -czf "$dl/$pkg.tar.gz" -C "$dl" "$pkg"
+          sum=$(sha256sum "$dl/$pkg.tar.gz" | cut -d' ' -f1)
+          docker run --rm --entrypoint sh -v "$PWD/scripts:/scripts:ro" -v "$dl:/dl:ro" "$IMAGE" -c \
+            "sh /scripts/install.sh --archive /dl/$pkg.tar.gz --sha256 $sum --install-dir /tmp/lvpm-bin --no-path && /tmp/lvpm-bin/lvpm --version" \
+            | tee "$RUNNER_TEMP/install.log"
+          got=$(tail -n 1 "$RUNNER_TEMP/install.log")
+          [[ "$got" == *"$want"* ]] || { echo "::error::installed lvpm --version printed '$got', expected $want"; exit 1; }
       - name: Smoke flow
         if: matrix.os == 'windows'
         shell: pwsh
