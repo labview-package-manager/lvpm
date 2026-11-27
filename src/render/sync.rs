@@ -162,9 +162,12 @@ pub(super) fn step_line(step: &SyncStep) -> String {
             let why = match reason {
                 RemoveReason::NotInLock => "not in lvpm.lock".to_string(),
                 RemoveReason::DevOnly => {
-                    "only dev dependencies need it, and --no-dev is given".to_string()
+                    "only dev dependencies need it, and dev is not selected".to_string()
                 }
                 RemoveReason::GroupsOnly => groups_only(groups),
+                RemoveReason::DependenciesOnly => {
+                    "[dependencies] needs it, and --only leaves [dependencies] out".to_string()
+                }
             };
             format!("remove {name} {version} ({why})")
         }
@@ -426,10 +429,18 @@ mod tests {
     }
 
     #[test]
-    fn a_dev_only_removal_says_which_flag_asked_for_it() {
+    fn a_dev_only_removal_says_dev_is_not_selected() {
         assert_eq!(
             step_line(&remove("caraya", "1.0", RemoveReason::DevOnly)),
-            "remove caraya 1.0 (only dev dependencies need it, and --no-dev is given)"
+            "remove caraya 1.0 (only dev dependencies need it, and dev is not selected)"
+        );
+    }
+
+    #[test]
+    fn a_dependencies_only_removal_says_only_leaves_dependencies_out() {
+        assert_eq!(
+            step_line(&remove("alpha", "1.0", RemoveReason::DependenciesOnly)),
+            "remove alpha 1.0 ([dependencies] needs it, and --only leaves [dependencies] out)"
         );
     }
 

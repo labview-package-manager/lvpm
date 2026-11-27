@@ -206,16 +206,30 @@ struct SyncArgs {
     /// Also install this dependency group (repeatable); [dependencies] and dev are installed by default
     #[arg(long, value_name = "NAME")]
     group: Vec<String>,
+    /// Also install these dependency groups (comma-separated, repeatable); the same as --group without a package
+    #[arg(long, value_name = "GROUP", value_delimiter = ',')]
+    with: Vec<String>,
+    /// Leave these groups out, after include-groups are expanded (comma-separated, repeatable); --without dev is --no-dev
+    #[arg(
+        long,
+        value_name = "GROUP",
+        value_delimiter = ',',
+        conflicts_with = "only"
+    )]
+    without: Vec<String>,
+    /// Install only these groups and what they include (comma-separated, repeatable): not [dependencies], and not dev unless named
+    #[arg(long, value_name = "GROUP", value_delimiter = ',', conflicts_with_all = ["no_dev", "group", "with"])]
+    only: Vec<String>,
 }
 
 impl SyncArgs {
-    /// `--group dev` with `--no-dev`: dev is both asked for and left out.
+    /// `--group dev` or `--with dev` with `--no-dev` or `--without dev`: dev
+    /// is both asked for and left out.
     fn asks_for_and_against_dev(&self) -> bool {
-        self.no_dev
-            && self
-                .group
-                .iter()
-                .any(|g| lvpm_core::project::is_dev_group(g))
+        let names_dev =
+            |groups: &[String]| (groups.iter()).any(|g| lvpm_core::project::is_dev_group(g.trim()));
+        (names_dev(&self.group) || names_dev(&self.with))
+            && (self.no_dev || names_dev(&self.without))
     }
 
     fn options(&self, apply: &ApplyArgs, headless: bool) -> SyncOptions {
@@ -231,7 +245,9 @@ impl SyncArgs {
             lock: strictness.policy,
             headless_implied: strictness.implied_by_headless,
             no_dev: self.no_dev,
-            groups: self.group.clone(),
+            groups: [&self.group[..], &self.with].concat(),
+            without: self.without.clone(),
+            only: self.only.clone(),
             install: apply.options(false, false),
         }
     }
@@ -293,7 +309,7 @@ enum Cmd {
     )))]
     Install {
         /// Package to install. Omit it in a project to sync the project.
-        #[arg(conflicts_with_all = ["locked", "frozen", "no_locked", "no_dev"])]
+        #[arg(conflicts_with_all = ["locked", "frozen", "no_locked", "no_dev", "with", "without", "only"])]
         package: Option<String>,
         /// Not supported with a lock: lvpm.lock always holds the full set.
         #[arg(long, value_name = "FILE")]
@@ -910,7 +926,7 @@ fn main() -> std::process::ExitCode {
         Cli::command()
             .error(
                 clap::error::ErrorKind::ArgumentConflict,
-                "--group dev and --no-dev cannot be combined: --no-dev leaves out the dev group",
+                "--group dev or --with dev cannot be combined with --no-dev or --without dev: they leave out the dev group",
             )
             .exit();
     }

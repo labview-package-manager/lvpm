@@ -529,10 +529,15 @@ fn commit(
     {
         return Err(refusal);
     }
-    // The edited group is installed with the default selection. A package the
-    // lock lists stays where it is: only what the lock drops goes.
+    // The edited group and what it includes are installed with the default
+    // selection. A package the lock lists stays where it is: only what the
+    // lock drops goes.
+    let mut groups = edit
+        .project
+        .with_includes(&edit.group.iter().cloned().collect::<Vec<_>>())?;
+    groups.retain(|group| group != crate::project::DEV_GROUP);
     let selection = Selection {
-        groups: edit.group.iter().cloned().collect(),
+        groups,
         keep_listed: true,
         ..Selection::default()
     };

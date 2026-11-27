@@ -23,6 +23,7 @@
 //! jki_lib_unit_test = "*"
 //!
 //! [dependency-groups.ci]            # a named group, same syntax
+//! include-groups = ["test"]         # and every package of these groups too
 //! ci_tools = "*"
 //!
 //! [nipm.dependencies]               # NI Package Manager packages, reported only
@@ -217,6 +218,9 @@ pub struct Project {
     /// `[dependency-groups.<name>]`, in file order: the same syntax as
     /// `[dependencies]`. Never `dev`, which is `[dev-dependencies]`.
     pub groups: Vec<(String, Vec<(String, Constraint)>)>,
+    /// Each group's `include-groups`: the groups, `dev` among them, whose
+    /// packages it takes too. A group without the key is not listed.
+    pub group_includes: BTreeMap<String, Vec<String>>,
     /// The `github = "owner/repo"` of every dependency that has one, in any
     /// table, by the name the line is written under.
     pub github: BTreeMap<String, String>,
@@ -262,6 +266,7 @@ impl Default for Project {
             dependencies: Vec::new(),
             dev_dependencies: Vec::new(),
             groups: Vec::new(),
+            group_includes: BTreeMap::new(),
             github: BTreeMap::new(),
             source_pins: BTreeMap::new(),
             hooks_allowed: BTreeSet::new(),
@@ -536,7 +541,9 @@ pub(crate) fn parse(text: &str) -> Result<Project> {
     let mut stated = Stated::default();
     p.dependencies = parse_dependencies("dependencies", f.dependencies, &mut stated)?;
     p.dev_dependencies = parse_dependencies("dev-dependencies", f.dev_dependencies, &mut stated)?;
+    p.group_includes = take_includes(&mut f.dependency_groups)?;
     p.groups = parse_groups(f.dependency_groups, &mut stated)?;
+    check_includes(&p)?;
     check_source_pins(&p.sources, &stated.index)?;
     p.github = (stated.github.into_iter())
         .map(|(name, (repo, _))| (name, repo))
@@ -648,6 +655,14 @@ pub fn is_dev_group(name: &str) -> bool {
     name.eq_ignore_ascii_case(DEV_GROUP)
 }
 
+/// `name` as a selection holds it: `dev` in its one spelling.
+pub fn group_key(name: &str) -> String {
+    match is_dev_group(name) {
+        true => DEV_GROUP.to_string(),
+        false => name.to_string(),
+    }
+}
+
 /// Whether `name` can name a dependency group: letters, digits, `-` and `_`.
 pub fn valid_group_name(name: &str) -> Result<()> {
     if name.is_empty()
@@ -726,6 +741,117 @@ fn move_old_form_groups(f: &mut File) -> Result<Vec<String>> {
         }
     }
     Ok(old_form_names)
+}
+
+/// The key a group names the groups it takes in with.
+const INCLUDE_KEY: &str = "include-groups";
+
+/// Take each group's `include-groups` out of its table, before its lines are
+/// read as packages.
+fn take_includes(groups: &mut toml::Table) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut includes = BTreeMap::new();
+    for (name, value) in groups.iter_mut() {
+        let Some(list) = value.as_table_mut().and_then(|t| t.remove(INCLUDE_KEY)) else {
+            continue;
+        };
+        // Checked before the name is printed: it may hold control characters.
+        valid_group_name(name).context("[dependency-groups]")?;
+        let names = (list.as_array()).and_then(|items| {
+            items
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect()
+        });
+        let Some(names) = names else {
+            bail!(
+                "[dependency-groups.{name}] {INCLUDE_KEY}: must be a list of group names, \
+                 for example {INCLUDE_KEY} = [\"test\"]"
+            );
+        };
+        includes.insert(name.clone(), names);
+    }
+    Ok(includes)
+}
+
+/// Every `include-groups` names a group the manifest defines, or dev, and no
+/// group takes itself in, directly or through others.
+fn check_includes(p: &Project) -> Result<()> {
+    // One `done` for all: a group expanded once is not walked again.
+    let mut done = Vec::new();
+    for (name, included) in &p.group_includes {
+        for other in included {
+            ensure!(
+                p.defines_group(other),
+                "[dependency-groups.{name}] {INCLUDE_KEY}: there is no group {other:?}"
+            );
+        }
+        p.expand(name, &mut Vec::new(), &mut done)?;
+    }
+    // The shared walk can split a long chain; `done` lists includes first, so
+    // each group's height follows from those before it, without recursing.
+    let mut height: BTreeMap<&str, usize> = BTreeMap::new();
+    for name in &done {
+        let below = (p.group_includes.get(name).into_iter().flatten())
+            .map(|included| {
+                height
+                    .get(group_key(included).as_str())
+                    .copied()
+                    .unwrap_or(1)
+            })
+            .max()
+            .unwrap_or(0);
+        ensure!(
+            below < MAX_INCLUDE_DEPTH,
+            "{INCLUDE_KEY} nest more than {MAX_INCLUDE_DEPTH} groups deep at {name:?}"
+        );
+        height.insert(name, below + 1);
+    }
+    Ok(())
+}
+
+/// How deep `include-groups` may nest: a deeper chain is refused, not recursed.
+const MAX_INCLUDE_DEPTH: usize = 64;
+
+impl Project {
+    /// `name` is dev or a `[dependency-groups]` table of the manifest.
+    pub fn defines_group(&self, name: &str) -> bool {
+        is_dev_group(name) || self.groups.iter().any(|(group, _)| group == name)
+    }
+
+    /// `roots` and every group they take in through `include-groups`, each
+    /// once: a group's includes before the group, `dev` in its one spelling.
+    /// Fails on a chain nested too deep; cycles are refused when the manifest is read.
+    pub fn with_includes(&self, roots: &[String]) -> Result<Vec<String>> {
+        let mut order = Vec::new();
+        for root in roots {
+            self.expand(root, &mut Vec::new(), &mut order)?;
+        }
+        Ok(order)
+    }
+
+    /// Depth-first over `include-groups`; a group met again while still on
+    /// `stack` is a cycle.
+    fn expand(&self, name: &str, stack: &mut Vec<String>, order: &mut Vec<String>) -> Result<()> {
+        let name = group_key(name);
+        ensure!(
+            stack.len() < MAX_INCLUDE_DEPTH,
+            "{INCLUDE_KEY} nest more than {MAX_INCLUDE_DEPTH} groups deep at {name:?}"
+        );
+        if stack.contains(&name) {
+            stack.push(name);
+            bail!("{INCLUDE_KEY} forms a cycle: {}", stack.join(" -> "));
+        }
+        if order.contains(&name) {
+            return Ok(());
+        }
+        stack.push(name.clone());
+        for included in self.group_includes.get(&name).into_iter().flatten() {
+            self.expand(included, stack, order)?;
+        }
+        stack.pop();
+        order.push(name);
+        Ok(())
+    }
 }
 
 /// `[dependency-groups]`: each key a group name, each value that group's
@@ -1887,6 +2013,126 @@ e = \"*\"
             parse("[dependency-groups.devs]\n").is_ok(),
             "only dev itself"
         );
+    }
+
+    #[test]
+    fn include_groups_expand_depth_first_each_group_once() {
+        let p = parse(
+            r#"
+            [dependency-groups.ci]
+            include-groups = ["test", "Dev"]
+            ci_tools = "*"
+            [dependency-groups.test]
+            include-groups = ["dev"]
+            beta = "*"
+            [dependency-groups.docs]
+            include-groups = ["test"]
+            "#,
+        )
+        .unwrap();
+        let lines = |g: &str| p.groups.iter().find(|(n, _)| n == g).unwrap().1.len();
+        assert_eq!((lines("ci"), lines("test"), lines("docs")), (1, 1, 0));
+        let roots = |r: &[&str]| {
+            (p.with_includes(&r.iter().map(|g| g.to_string()).collect::<Vec<_>>())).unwrap()
+        };
+        assert_eq!(roots(&["ci"]), ["dev", "test", "ci"]);
+        assert_eq!(roots(&["docs", "ci"]), ["dev", "test", "docs", "ci"]);
+        assert_eq!(roots(&["beta_is_no_group"]), ["beta_is_no_group"]);
+    }
+
+    #[test]
+    fn a_wrong_include_groups_is_refused_when_read() {
+        for (manifest, says) in [
+            (
+                "[dependency-groups.ci]\ninclude-groups = [\"test\"]",
+                "there is no group \"test\"",
+            ),
+            (
+                "[dependency-groups.ci]\ninclude-groups = \"test\"",
+                "must be a list of group names",
+            ),
+            (
+                "[dependency-groups.ci]\ninclude-groups = [1]",
+                "must be a list of group names",
+            ),
+            (
+                "[dependency-groups.ci]\ninclude-groups = [\"ci\"]",
+                "a cycle: ci -> ci",
+            ),
+            (
+                "[dependency-groups.a]\ninclude-groups = [\"b\"]\n\
+                 [dependency-groups.b]\ninclude-groups = [\"a\"]",
+                "a cycle: a -> b -> a",
+            ),
+        ] {
+            let err = format!("{:#}", parse(manifest).unwrap_err());
+            assert!(err.contains(says), "{manifest}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_old_form_group_takes_include_groups_too() {
+        let old_form =
+            parse("[dependencies.ci]\ninclude-groups = [\"dev\"]\nci_tools = \"*\"").unwrap();
+        assert_eq!(old_form.group_includes["ci"], ["dev"]);
+    }
+
+    #[test]
+    fn include_groups_nested_too_deep_are_refused_and_control_characters_are_escaped() {
+        let chain: String = (0..=MAX_INCLUDE_DEPTH)
+            .map(|i| {
+                format!(
+                    "[dependency-groups.g{i}]\ninclude-groups = [\"g{}\"]\n",
+                    i + 1
+                )
+            })
+            .chain([format!("[dependency-groups.g{}]\n", MAX_INCLUDE_DEPTH + 1)])
+            .collect();
+        let err = format!("{:#}", parse(&chain).unwrap_err());
+        assert!(err.contains("nest more than 64 groups deep"), "{err}");
+        let at_the_limit: String = (0..MAX_INCLUDE_DEPTH - 1)
+            .map(|i| {
+                format!(
+                    "[dependency-groups.g{i}]\ninclude-groups = [\"g{}\"]\n",
+                    i + 1
+                )
+            })
+            .chain([format!("[dependency-groups.g{}]\n", MAX_INCLUDE_DEPTH - 1)])
+            .collect();
+        parse(&at_the_limit)
+            .unwrap()
+            .with_includes(&["g0".to_string()])
+            .unwrap();
+        // Walked from x00 first, the y chain stops at x00; its height still counts.
+        let split: String = (0..40)
+            .map(|i| {
+                format!(
+                    "[dependency-groups.x{i:02}]\ninclude-groups = [\"x{:02}\"]\n",
+                    i + 1
+                )
+            })
+            .chain((0..40).map(|i| {
+                let next = if i == 39 {
+                    "x00".to_string()
+                } else {
+                    format!("y{:02}", i + 1)
+                };
+                format!("[dependency-groups.y{i:02}]\ninclude-groups = [\"{next}\"]\n")
+            }))
+            .chain(["[dependency-groups.x40]\n".to_string()])
+            .collect();
+        let err = format!("{:#}", parse(&split).unwrap_err());
+        assert!(err.contains("nest more than 64 groups deep"), "{err}");
+
+        let err = format!(
+            "{:#}",
+            parse(
+                r#"[dependency-groups.ci]
+include-groups = ["\u001b[31m"]"#
+            )
+            .unwrap_err()
+        );
+        assert!(!err.contains('\u{1b}') && err.contains(r"\u{1b}"), "{err}");
     }
 
     #[test]
