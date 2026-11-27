@@ -2064,7 +2064,7 @@ mod tests {
     }
 
     #[test]
-    fn an_extra_package_is_announced_and_then_removed_without_a_question() {
+    fn an_extra_package_is_announced_and_then_removed_when_the_front_end_does_not_ask() {
         let project = project("extra", &["beta", "gamma"]);
         project.sync(&SyncOptions::default()).0.unwrap();
         project.write_manifest(&["beta"]);

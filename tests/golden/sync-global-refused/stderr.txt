@@ -1,0 +1,3 @@
+Error: sync would remove 1 package from LabVIEW 2026 (64-bit): extra 1.0
+no terminal to ask in
+next: lvpm sync --global --yes

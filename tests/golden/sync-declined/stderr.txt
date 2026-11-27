@@ -1,0 +1,5 @@
+manifest: <SANDBOX>/work/lvpm.toml (fixture) — 1 dependency
+      manifest says labview = ">=2026" (minimum)
+target: scratch tree at dest/LabVIEW
+hashing alpha 2.0 (1/1)
+remove 1 package (extra 1.0)? [y/N] 

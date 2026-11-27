@@ -478,10 +478,10 @@ graph TD
   - [x] Step 1.2: sync_asking, called only when a NotInLock removal is planned
 
 ### Wave 2
-- [ ] Slice 2: the CLI asks, goes ahead or refuses
+- [x] Slice 2: the CLI asks, goes ahead or refuses
   - [x] Step 2.1: the decision, as one pure function
   - [x] Step 2.2: wire cmd_sync, render the question and the cancel
-  - [ ] Step 2.3: goldens and the tests whose names now lie
+  - [x] Step 2.3: goldens and the tests whose names now lie
 
 ### Wave 3
 - [ ] Slice 3: docs

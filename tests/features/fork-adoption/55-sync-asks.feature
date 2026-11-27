@@ -24,6 +24,11 @@ Feature: sync asks before it removes packages
       |           |
       | yes please |
 
+  Scenario: the decline is recorded
+    Given dest has "alpha" 1.0 and "extra" 1.0 installed
+    When I run "lvpm sync --prefix dest" in a terminal and answer "n"
+    Then stdout, stderr and the exit code equal the recording "sync-declined"
+
   Scenario: a closed stdin is "no"
     Given dest has "alpha" 1.0 and "extra" 1.0 installed
     When I run "lvpm sync --prefix dest" in a terminal with stdin closed

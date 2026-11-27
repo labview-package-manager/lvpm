@@ -23,6 +23,13 @@ mod logfile;
 mod render;
 mod update_notice;
 
+// The acceptance harness's recordings, for the one output no acceptance scenario
+// can produce (the `--global` refusal needs a real LabVIEW).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/support/golden.rs"]
+mod golden;
+
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::builder::TypedValueParser as _;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -2580,5 +2587,34 @@ mod tests {
         assert!(!global(&["--labview-version", "2026"]));
         assert!(global(&["--global"]));
         assert!(global(&["--global", "--labview-version", "2026"]));
+    }
+
+    /// Recorded as `tests/golden/sync-global-refused`, in the harness's own
+    /// format: no acceptance scenario can make this refusal, since `--global`
+    /// needs a real LabVIEW and the scenario would run against it. This runs
+    /// the render path `cmd_sync` and `main` take, with `LVPM_RECORD=1` to
+    /// record.
+    #[test]
+    fn the_global_refusal_matches_its_recording() {
+        let global = at(false, Some(LABVIEW), "--global");
+        let decision = on_removal(false, false, false, true);
+        let (result, _) = put(decision, &global, "", &[removal("extra", "1.0")]);
+        // cmd_sync turns the error of core into text, and main prints that.
+        let error = lvpm_core::errors::SyncError::Other(result.unwrap_err());
+        let shown = anyhow!(render::sync::error(&error));
+        let printed = golden::Output {
+            stdout: String::new(),
+            stderr: format!("Error: {}\n", render::printable(format!("{shown:?}"))),
+            exit_code: 1,
+            tree: None,
+        };
+        let recordings = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden");
+        if let Err(why) = golden::Golden::new(recordings, golden::Mode::from_env())
+            .check("sync-global-refused", &printed)
+        {
+            panic!("{why}");
+        }
     }
 }
