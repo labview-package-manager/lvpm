@@ -766,7 +766,11 @@ $ lvpm launch MyProject.lvproj    # a LabVIEW that sees the venv
   package not yet relinked refuses the launch with one line per problem and
   a pointer to `lvpm sync`. `--no-check` starts anyway. The check does not
   hash files, so an edited file passes; dev and group packages are not
-  checked.
+  checked. A project with no `lvpm.lock`, such as one from lvpm 0.3.1, is
+  refused even with every package installed. Run `lvpm sync` once: it writes
+  the lock (commit it), and launch then passes the check. That sync also
+  removes installed packages `lvpm.toml` does not lead to; in a terminal it
+  asks first ([Syncing](#the-lock-file)).
 - `lvpm venv shortcut [<lvproj>]` writes a Windows shortcut,
   `<project> (LabVIEW <year> <bits>-bit).lnk`, that runs
   `lvpm --project <repo> launch [<lvproj>]` with the venv's icon. It goes in

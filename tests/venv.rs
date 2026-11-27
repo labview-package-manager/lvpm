@@ -801,21 +801,26 @@ fn relink_refuses_a_relink_vi_from_another_build_beside_lvpm() {
 }
 
 #[test]
-#[ignore = "#50"]
-fn launch_checks_the_venv_against_the_manifest_before_starting_anything() {
+fn launch_checks_the_venv_against_the_lock_before_starting_anything() {
     let lab = Lab::new("launch");
     lab.package("app", "1.0.0.1", "");
     lab.package("app", "2.0.0.1", "");
     lab.package("lib", "1.0.0.1", "");
     lab.write_manifest(
-        "[dependencies]\napp = \"1.0.0.1\"\nlib = { version = \"*\", relink = true }\n",
+        "[dependencies]
+app = \"1.0.0.1\"
+lib = { version = \"*\", relink = true }
+",
     );
     lab.ok(&["venv", "create"]);
 
+    // fork: the check is against lvpm.lock, not the manifest.
+    has(&lab.fails(&["launch"]), "no lvpm.lock beside the manifest");
+    lab.ok(&["lock"]);
     let refused = lab.fails(&["launch"]);
-    has(&refused, "app: not installed");
+    has(&refused, "app: not installed (lock: 1.0.0.1)");
     has(&refused, "lib: not installed");
-    has(&refused, "run `lvpm install`");
+    has(&refused, "run `lvpm sync`");
     has(&refused, "`lvpm launch --no-check` to start anyway");
 
     lab.ok(&["install", "--no-relink"]);
@@ -825,10 +830,16 @@ fn launch_checks_the_venv_against_the_manifest_before_starting_anything() {
         "lib: relink = true but the relink pass has not completed",
     );
 
-    lab.write_manifest("[dependencies]\napp = \"2.0.0.1\"\nlib = \"*\"\n");
+    lab.write_manifest(
+        "[dependencies]
+app = \"2.0.0.1\"
+lib = \"*\"
+",
+    );
+    lab.ok(&["lock"]);
     has(
         &lab.fails(&["launch"]),
-        "app: 1.0.0.1 installed, manifest asks for app",
+        "app: 1.0.0.1 installed, lock: 2.0.0.1",
     );
     lab.ok(&["install"]);
     std::fs::remove_file(lab.file("app", "app.txt")).unwrap();
@@ -846,7 +857,20 @@ lib = \"*\"
     );
     lab.ok(&["install"]);
     let r = lab.run_in(&lab.project(), &["launch"]);
-    has(&r.text, "checked 2 package(s)");
+    has(&r.text, "Error: launching ");
+    lacks(&r.text, "does not match");
+
+    // A project from 0.3.1: every package installed, but no lvpm.lock. The
+    // check is against the lock, so launch is refused until one sync writes it.
+    let lock = lab.project().join("lvpm.lock");
+    std::fs::remove_file(&lock).unwrap();
+    let refused = lab.fails(&["launch"]);
+    has(&refused, "no lvpm.lock beside the manifest");
+    has(&refused, "run `lvpm sync`");
+    lab.ok(&["sync"]);
+    assert!(lock.is_file(), "lvpm sync did not write lvpm.lock");
+    let r = lab.run_in(&lab.project(), &["launch"]);
+    has(&r.text, "Error: launching ");
     lacks(&r.text, "does not match");
 }
 
