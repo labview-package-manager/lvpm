@@ -536,6 +536,13 @@ mod tests {
             removing: vec![evil],
         });
         assert!(!out.text().contains('\u{1b}'), "{:?}", out.text());
+        assert!(
+            out.text()
+                .starts_with("sync cancelled: nothing was changed\n")
+                && out.text().contains("x?[31m"),
+            "{:?}",
+            out.text()
+        );
     }
 
     #[test]

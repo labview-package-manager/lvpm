@@ -3116,44 +3116,53 @@ beta = \"*\"
             project.sync(&selecting(&["ci"])).0.unwrap();
             project
         };
+        // The last of each case: what the flags remove is planned all the same,
+        // the guard of the cases that go ahead without a question for that reason.
         let cases = [
             (
                 "a package to install",
                 project("no-ask-install", &["beta"]),
                 SyncOptions::default(),
+                None,
             ),
-            ("a version to replace", replaced(), SyncOptions::default()),
-            ("a dev-only package", dev_only(), no_dev),
+            (
+                "a version to replace",
+                replaced(),
+                SyncOptions::default(),
+                None,
+            ),
+            (
+                "a dev-only package",
+                dev_only(),
+                no_dev,
+                Some(RemoveReason::DevOnly),
+            ),
             (
                 "a group no longer selected",
                 group_dropped(),
                 SyncOptions::default(),
+                Some(RemoveReason::GroupsOnly),
             ),
             (
                 "a dry run that would remove",
                 project_whose_new_lock_drops_gamma("no-ask-dry-run"),
                 dry_run(),
+                None,
             ),
         ];
-        // What the flags remove is planned all the same: the guard of the cases
-        // that go ahead without a question for that reason.
-        let guarded = [
-            ("a dev-only package", RemoveReason::DevOnly),
-            ("a group no longer selected", RemoveReason::GroupsOnly),
-        ];
-        for (label, project, opts) in cases {
+        for (label, project, opts, planned_removal) in cases {
             let question = Question::answering(Answer::Asked(false));
 
             let (outcome, events) = project.sync_asked(&opts, &question);
 
             outcome.unwrap_or_else(|why| panic!("{label}: {why}"));
-            if let Some((_, reason)) = guarded.iter().find(|(name, _)| *name == label) {
+            if let Some(reason) = planned_removal {
                 assert!(
                     events.iter().any(|event| matches!(
                         event,
                         Event::SyncPlanned { steps, dry_run: false }
                             if steps.iter().any(|step| matches!(
-                                step, SyncStep::Remove { reason: why, .. } if why == reason
+                                step, SyncStep::Remove { reason: why, .. } if *why == reason
                             ))
                     )),
                     "{label}: no removal for {reason:?} was planned: {events:?}"
@@ -3288,17 +3297,35 @@ beta = \"*\"
         );
     }
 
-    #[test]
-    fn a_declined_sync_has_fetched_nothing_even_with_a_package_to_install() {
-        // gamma is installed and goes; alpha is not and would be fetched.
-        let project = project("declined-no-fetch", &["gamma"]);
+    /// Takes the cache away once the plan is said: what is in it afterwards was
+    /// fetched after the plan.
+    struct CacheGoneOnceThePlanIsSaid {
+        cache: PathBuf,
+    }
+
+    impl EventSink for CacheGoneOnceThePlanIsSaid {
+        fn emit(&self, event: Event) {
+            if matches!(event, Event::SyncPlanned { .. }) {
+                std::fs::remove_dir_all(&self.cache).unwrap();
+            }
+        }
+    }
+
+    /// Syncs `tag`'s project, where gamma is installed and goes and alpha is
+    /// not and would be fetched, answering `answer`. Gives back whether the
+    /// cache holds anything fetched after the plan, whether the lock changed,
+    /// and the questions put.
+    fn cache_after_a_sync_that_would_fetch_alpha(
+        tag: &str,
+        answer: bool,
+    ) -> (bool, bool, Vec<Vec<SyncStep>>) {
+        let project = project(tag, &["gamma"]);
         project.sync(&SyncOptions::default()).0.unwrap();
         project.write_manifest(&["alpha"]);
-        let installed = project.installed();
-        let question = Question::answering(Answer::Asked(false));
-        let sink = CacheBackWhenLockWritten {
+        let lock = project.lock_bytes();
+        let question = Question::answering(Answer::Asked(answer));
+        let sink = CacheGoneOnceThePlanIsSaid {
             cache: project.root.join("cache"),
-            back: Mutex::new(None),
         };
 
         sync_asking(&project.sync_env(&sink), &SyncOptions::default(), &|r| {
@@ -3306,15 +3333,29 @@ beta = \"*\"
         })
         .unwrap();
 
-        assert_eq!(
+        (
+            project.root.join("cache").exists(),
+            project.lock_bytes() != lock,
             question.asked(),
-            [[remove("gamma", "1.0", RemoveReason::NotInLock)]]
-        );
-        assert!(
-            !project.root.join("cache").exists(),
-            "the archives were fetched before the question"
-        );
-        assert_eq!(project.installed(), installed);
+        )
+    }
+
+    #[test]
+    fn a_declined_sync_has_fetched_nothing_even_with_a_package_to_install() {
+        let (cache, lock_changed, asked) =
+            cache_after_a_sync_that_would_fetch_alpha("declined-no-fetch", false);
+
+        assert_eq!(asked, [[remove("gamma", "1.0", RemoveReason::NotInLock)]]);
+        assert!(!cache, "the archives were fetched before the question");
+        assert!(!lock_changed, "the lock was changed by a decline");
+    }
+
+    #[test]
+    fn an_answered_sync_fetches_into_the_cache_after_the_plan() {
+        // The control of the test above: the same project, answered yes.
+        let (cache, ..) = cache_after_a_sync_that_would_fetch_alpha("answered-fetches", true);
+
+        assert!(cache, "alpha was not fetched after the plan");
     }
 
     #[test]

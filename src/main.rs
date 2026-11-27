@@ -2518,6 +2518,11 @@ mod tests {
         put_from(decision, ask_context, || typed_answer.as_bytes(), removals)
     }
 
+    /// An input that fails the test when read: for decisions that ask nothing.
+    fn unread() -> &'static [u8] {
+        panic!("the terminal was read without a question")
+    }
+
     fn put_from<R: std::io::BufRead>(
         decision: OnRemoval,
         ask_context: &AskContext,
@@ -2572,12 +2577,13 @@ mod tests {
         let extra = [removal("extra", "1.0")];
         for json in [false, true] {
             let decision = on_removal(false, json, false, false);
-            let (result, written) = put(decision, &context(json, None, ""), "", &extra);
+            let (result, written) = put_from(decision, &context(json, None, ""), unread, &extra);
             assert_eq!(result.unwrap(), Answer::NotAsked, "json={json}");
             assert_eq!(written, "", "json={json}");
         }
         let global = context(false, Some(LABVIEW), "lvpm sync --global --yes");
-        let (result, written) = put(on_removal(true, false, true, true), &global, "", &extra);
+        let decision = on_removal(true, false, true, true);
+        let (result, written) = put_from(decision, &global, unread, &extra);
         assert_eq!((result.unwrap(), written.as_str()), (Answer::NotAsked, ""));
     }
 
@@ -2590,7 +2596,7 @@ mod tests {
         ] {
             let decision = on_removal(false, json, false, true);
             let global = context(json, Some(LABVIEW), "lvpm sync --global --yes");
-            let (result, written) = put(decision, &global, "y\n", &removals);
+            let (result, written) = put_from(decision, &global, unread, &removals);
             assert_eq!(
                 result.unwrap_err().to_string(),
                 format!(
@@ -2606,7 +2612,7 @@ mod tests {
             "lvpm install --labview-version 2025 --global --group docs --yes",
         );
         let two = [removal("extra", "1.0"), removal("zeta", "1.0")];
-        let (result, _) = put(OnRemoval::Refuse, &typed, "", &two);
+        let (result, _) = put_from(OnRemoval::Refuse, &typed, unread, &two);
         assert_eq!(
             result.unwrap_err().to_string(),
             "sync would remove 2 packages from LabVIEW 2026 (64-bit): extra 1.0, zeta 1.0\n\
@@ -2618,7 +2624,8 @@ mod tests {
     #[test]
     fn the_refusal_comes_back_through_the_sync_error_printers_whole() {
         let global = context(true, Some(LABVIEW), "lvpm sync --global --yes");
-        let (result, _) = put(OnRemoval::Refuse, &global, "", &[removal("extra", "1.0")]);
+        let removals = [removal("extra", "1.0")];
+        let (result, _) = put_from(OnRemoval::Refuse, &global, unread, &removals);
         let refusal = result.unwrap_err();
         let text = refusal.to_string();
         // What core hands back for an error of the callback.
@@ -2632,8 +2639,23 @@ mod tests {
     #[test]
     fn the_s10d_spec_says_sync_asks_and_not_that_it_has_no_prompt() {
         let spec = include_str!("../docs/specs/lvpm-unattended-s10d.md");
+        let spec = spec.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(spec.contains("sync asks before it removes a package the lock does not keep"));
         assert!(!spec.contains("`sync` has no prompt"));
+    }
+
+    #[test]
+    fn the_sync_help_says_it_asks_in_a_terminal_before_removing() {
+        let help = Cli::command()
+            .find_subcommand_mut("sync")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            help.contains("In a terminal it asks before removing a package the lock does not list"),
+            "{help}"
+        );
     }
 
     #[test]
@@ -2679,7 +2701,8 @@ mod tests {
         ] {
             let global = context(json, Some(LABVIEW), "lvpm sync --global --yes");
             let decision = on_removal(false, json, false, true);
-            let (result, _) = put(decision, &global, "", &[removal("extra", "1.0")]);
+            let removals = [removal("extra", "1.0")];
+            let (result, _) = put_from(decision, &global, unread, &removals);
             // What cmd_sync makes of the error of core, and what main prints of that.
             let error = lvpm_core::errors::SyncError::Other(result.unwrap_err());
             let shown = sync_failure(&error, false);
