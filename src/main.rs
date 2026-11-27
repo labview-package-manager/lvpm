@@ -2725,4 +2725,58 @@ mod tests {
             assert_eq!(error_line(&shown, json), line, "json={json}");
         }
     }
+
+    #[test]
+    fn uninstall_dependency_flags_conflict_with_each_other_and_all() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["lvpm", "uninstall"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+        };
+        assert!(parse(&["pkg", "--with-deps", "--keep-deps"]).is_err());
+        assert!(parse(&["--all", "--with-deps"]).is_err());
+        assert!(parse(&["pkg", "--with-deps"]).is_ok());
+    }
+
+    fn install_sync(args: &[&str]) -> Result<SyncArgs, clap::Error> {
+        let cli = Cli::try_parse_from(["lvpm", "install"].into_iter().chain(args.iter().copied()))?;
+        match cli.cmd {
+            Cmd::Install { sync, .. } => Ok(sync),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn group_flags_split_on_commas_and_accumulate() {
+        let g = install_sync(&["--with", "test,ci"]).unwrap();
+        assert_eq!(g.with, ["test", "ci"]);
+        let g = install_sync(&["--with", "test", "--with", "ci"]).unwrap();
+        assert_eq!(g.with, ["test", "ci"]);
+        let g = install_sync(&["--with", "a,b", "--with", "c", "--without", "b,d"]).unwrap();
+        assert_eq!(g.with, ["a", "b", "c"]);
+        assert_eq!(g.without, ["b", "d"]);
+        let g = install_sync(&["--only", "main,build"]).unwrap();
+        assert_eq!(g.only, ["main", "build"]);
+        assert!(g.with.is_empty() && g.without.is_empty());
+    }
+
+    #[test]
+    fn group_flags_keep_spaces_for_select_to_trim() {
+        let g = install_sync(&["--with", "test, ci", "--without", "x,"]).unwrap();
+        assert_eq!(g.with, ["test", " ci"]);
+        assert_eq!(g.without, ["x", ""]);
+    }
+
+    #[test]
+    fn group_flags_refuse_contradictory_combinations() {
+        assert!(install_sync(&["--only", "a", "--with", "b"]).is_err());
+        assert!(install_sync(&["--only", "a", "--without", "b"]).is_err());
+        assert!(install_sync(&["oglib_error", "--with", "a"]).is_err());
+        assert!(install_sync(&["oglib_error", "--without", "a"]).is_err());
+        assert!(install_sync(&["oglib_error", "--only", "a"]).is_err());
+        assert!(install_sync(&["--manifest", "app.toml", "--with", "dev"]).is_ok());
+        assert!(install_sync(&["--with", "a", "--without", "b"]).is_ok());
+    }
 }

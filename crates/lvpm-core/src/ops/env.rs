@@ -1062,4 +1062,32 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn a_venv_uses_its_bound_manifest_and_has_none_when_it_is_missing() {
+        let dir = scratch_dir("bound-manifest");
+        let bound = dir.join("app.toml");
+        std::fs::write(&bound, "[dependencies]\npinned = \"1.0\"\n").unwrap();
+        std::fs::write(dir.join("lvpm.toml"), "[dependencies]\nother = \"*\"\n").unwrap();
+        let env = OpEnv::new(&NullSink, config(), Vec::new(), dir.clone());
+        let names = |project: &Project| {
+            let deps = project.dependencies.iter();
+            deps.map(|(name, _)| name.clone()).collect::<Vec<_>>()
+        };
+
+        let (path, project) = env.manifest_for(None, Some(&bound)).unwrap().unwrap();
+        assert_eq!(path, bound);
+        assert_eq!(names(&project), ["pinned"]);
+        let explicit = Path::new("lvpm.toml");
+        let (_, overridden) = env
+            .manifest_for(Some(explicit), Some(&bound))
+            .unwrap()
+            .unwrap();
+        assert_eq!(names(&overridden), ["other"]);
+
+        // A missing bound manifest is no manifest, not the lvpm.toml beside it.
+        std::fs::remove_file(&bound).unwrap();
+        assert!(env.manifest_for(None, Some(&bound)).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
