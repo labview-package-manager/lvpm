@@ -272,33 +272,12 @@ pub fn resolve_greedy(
     wanted: &[(String, Constraint)],
     no_deps: bool,
 ) -> Result<InstallPlan> {
-    // Floors only rise and the index is finite, so this ends; the bound is a
-    // guard, not a limit expected to be reached.
-    let mut floors: HashMap<String, Floor> = HashMap::new();
-    let mut pass = None;
-    for _ in 0..32 {
-        let this = greedy_pass(store, idx, wanted, no_deps, &floors)?;
-        let mut raised = false;
-        for (key, floor) in &this.seen {
-            if floors.get(key).is_none_or(|have| above(floor, have)) {
-                floors.insert(key.clone(), floor.clone());
-                raised = true;
-            }
-        }
-        if !raised {
-            pass = Some(this);
-            break;
-        }
-    }
-    let Some(GreedyPass {
+    let GreedyPass {
         entries,
         unresolved,
         events,
         ..
-    }) = pass
-    else {
-        bail!("dependency floors did not settle after 32 passes");
-    };
+    } = settle_floors(store, idx, wanted, no_deps)?;
     // Only the last pass's events: an earlier one may have kept a version
     // a higher floor then replaced.
     for e in events {
@@ -341,18 +320,52 @@ pub fn resolve_greedy(
     Ok(InstallPlan { entries })
 }
 
+/// Passes [`settle_floors`] makes before it gives up. Floors only rise and the
+/// index is finite, so the walk settles; this is a guard, not a limit
+/// expected to be reached.
+const MAX_GREEDY_PASSES: usize = 32;
+
+/// Walk until no pass asks any name for a higher floor than the last one did.
+///
+/// shortcut: floors only rise, so a floor asked by a package a later pass
+/// drops (it went unresolved) still holds; upstream does the same. Rebuild
+/// the floors from the last pass alone if that ever matters.
+fn settle_floors(
+    store: &Roots,
+    idx: &Index,
+    wanted: &[(String, Constraint)],
+    no_deps: bool,
+) -> Result<GreedyPass> {
+    let mut floors: HashMap<String, Floor> = HashMap::new();
+    for _ in 0..MAX_GREEDY_PASSES {
+        let pass = greedy_pass(store, idx, wanted, no_deps, &floors)?;
+        let mut any_raised = false;
+        for (key, floor) in &pass.asked {
+            any_raised |= raise(&mut floors, key, floor);
+        }
+        if !any_raised {
+            return Ok(pass);
+        }
+    }
+    bail!("dependency floors did not settle after {MAX_GREEDY_PASSES} passes")
+}
+
 /// What one walk of [`resolve_greedy`] planned and said, and the highest
 /// floor it saw asked of each name.
 struct GreedyPass {
     entries: Vec<PlannedPackage>,
     unresolved: Vec<String>,
     events: Vec<Event>,
-    seen: HashMap<String, Floor>,
+    asked: HashMap<String, Floor>,
 }
 
-/// Whether `a` asks for more than `b`.
-fn above(a: &Floor, b: &Floor) -> bool {
-    a.version > b.version || (a.version == b.version && a.exclusive && !b.exclusive)
+/// Keep `floor` for `key` if it asks for more than the one held; say whether it did.
+fn raise(floors: &mut HashMap<String, Floor>, key: &str, floor: &Floor) -> bool {
+    if floors.get(key).is_some_and(|held| !floor.exceeds(held)) {
+        return false;
+    }
+    floors.insert(key.to_string(), floor.clone());
+    true
 }
 
 /// One walk, with every dependency's floor raised to `floors`'s entry for its name.
@@ -374,15 +387,15 @@ fn greedy_pass(
         entries: Vec::new(),
         unresolved: Vec::new(),
         events: Vec::new(),
-        seen: HashMap::new(),
+        asked: HashMap::new(),
     };
 
     while let Some((n, mut req, is_root)) = queue.pop() {
         let key = project::name_key(&n);
-        if let Req::Floor(Some(f)) = &req
-            && pass.seen.get(&key).is_none_or(|have| above(f, have))
-        {
-            pass.seen.insert(key.clone(), f.clone());
+        // Before the `done` check: a later, higher request for a name already
+        // planned is what the next pass must see.
+        if let Req::Floor(Some(f)) = &req {
+            raise(&mut pass.asked, &key, f);
         }
         if !done.insert(key.clone()) {
             continue;
@@ -390,10 +403,10 @@ fn greedy_pass(
         // A root keeps its own constraint; only a dependency is raised.
         if !is_root
             && let Req::Floor(floor) = &mut req
-            && let Some(high) = floors.get(&key)
-            && floor.as_ref().is_none_or(|f| above(high, f))
+            && let Some(highest) = floors.get(&key)
+            && floor.as_ref().is_none_or(|f| highest.exceeds(f))
         {
-            *floor = Some(high.clone());
+            *floor = Some(highest.clone());
         }
         // A dependency the installed version already satisfies stays as it
         // is: `install foo` upgrades foo, not everything foo happens to need.
@@ -402,19 +415,16 @@ fn greedy_pass(
         // that is a no-op, an upgrade, or a refused downgrade.
         if !is_root
             && let Req::Floor(floor) = &req
-            && install::is_installed(store, &n)
-        {
-            let have = install::read_manifest(store, &n)?;
-            if floor
+            && let Some(have) = install::read_manifest_if_present(store, &n)?
+            && floor
                 .as_ref()
                 .is_none_or(|f| f.admits(&Version::parse(&have.version)))
-            {
-                pass.events.push(Event::DependencySatisfied {
-                    name: have.name,
-                    version: have.version,
-                });
-                continue;
-            }
+        {
+            pass.events.push(Event::DependencySatisfied {
+                name: have.name,
+                version: have.version,
+            });
+            continue;
         }
         let entry = match &req {
             Req::Exact(v) => idx
@@ -1653,7 +1663,51 @@ mod tests {
         ];
         let got = greedy(&store, &dir, index, &[wanted("root", "*")], false);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(got.is_err(), "resolved past a corrupt record: {got:?}");
+        let why = format!("{:#}", got.expect_err("resolved past a corrupt record"));
+        assert!(
+            why.contains("dep.json") && why.contains("not a valid install record"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_raised_floor_that_raises_another_settles_over_more_passes() {
+        // b's x >= 2 replaces the installed x 1; x 2 then asks y >= 5, which
+        // the installed y 1 does not meet. That takes a third pass.
+        let (dir, store) = greedy_store("greedy-cascade", None, &[("x", "1"), ("y", "1")]);
+        let index = vec![
+            listed("a", "1", &[("x", Some("1"))], None),
+            listed("b", "1", &[("x", Some("2"))], None),
+            listed("x", "1", &[("y", Some("1"))], None),
+            listed("x", "2", &[("y", Some("5"))], None),
+            listed("y", "1", &[], None),
+            listed("y", "5", &[], None),
+        ];
+        let roots = [wanted("a", "*"), wanted("b", "*")];
+        let (plan, events) = greedy(&store, &dir, index, &roots, false).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            plan,
+            [("y", "5"), ("x", "2"), ("a", "1"), ("b", "1")].map(|(n, v)| (n.into(), v.into()))
+        );
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_root_keeps_its_own_floor_over_a_dependency_s_higher_one() {
+        // a asks shared >= 4, which this LabVIEW cannot take; the root asked
+        // for shared >= 1 and still gets the newest it can.
+        let (dir, store) = greedy_store("greedy-root-floor", Some(26.0), &[]);
+        let index = vec![
+            listed("a", "1", &[("shared", Some("4"))], None),
+            listed("shared", "3", &[], None),
+            listed("shared", "4", &[], Some(30.0)),
+        ];
+        let roots = [wanted("shared", ">=1"), wanted("a", "*")];
+        let (plan, _) = greedy(&store, &dir, index, &roots, false).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(names(&plan), ["shared", "a"]);
+        assert_eq!(plan[0].1, "3");
     }
 
     #[test]

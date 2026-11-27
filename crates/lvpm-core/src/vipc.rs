@@ -132,6 +132,7 @@ fn package(block: &str) -> Result<Package, String> {
     // Failing that, the last '-', so the error names what is not a version.
     let (name, version) = split_id(full)
         .map(|(n, v)| (n, v.raw))
+        .filter(|(_, v)| is_version(v))
         .or_else(|| full.rsplit_once('-').map(|(n, v)| (n.into(), v.into())))
         .ok_or_else(|| format!("package {full}: no version (expected name-version)"))?;
     let (name, version) = (name.as_str(), version.as_str());
