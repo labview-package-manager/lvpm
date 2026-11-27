@@ -842,6 +842,50 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_prunes_package_but_preserves_packages_directory_and_state() {
+        let dir =
+            std::env::temp_dir().join(format!("lvpm-uninstall-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = LvTarget {
+            version: 26.3,
+            bitness: 64,
+            path: dir.join("LabVIEW"),
+        };
+        let package = Roots::project(&dir, &target, "example");
+        let store = Roots::project_store(&dir, &target);
+        let payload = package.application.join("vi.lib").join("test.vi");
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"test").unwrap();
+        let mut manifest = record(&[&payload.to_string_lossy()], None);
+        manifest.name = "example".into();
+        write_manifest(&package, &manifest).unwrap();
+        assert_eq!(uninstall(&store, "example").unwrap().0, 1);
+        assert!(!dir.join("packages").join("example").exists());
+        assert!(dir.join("packages").is_dir());
+        assert!(dir.join("installed").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_palette_record_from_before_addons_merging_reads_as_menus() {
+        let file: PaletteFile = serde_json::from_str(r#"{"relative":"Categories/a.mnu"}"#).unwrap();
+        assert_eq!(file.tree, PaletteTree::Menus);
+        assert_eq!(
+            serde_json::to_string(&file).unwrap(),
+            r#"{"relative":"Categories/a.mnu"}"#
+        );
+        let addons = PaletteFile {
+            relative: "HSE/a.mnu".into(),
+            tree: PaletteTree::Addons,
+        };
+        assert_eq!(
+            serde_json::to_string(&addons).unwrap(),
+            r#"{"relative":"HSE/a.mnu","tree":"vi.lib/addons"}"#
+        );
+    }
+
+    #[test]
     fn a_record_says_which_hook_it_lists_as_skipped_by_the_hooks_name_alone() {
         use crate::events::HookKind::{PostInstall, PreInstall};
         let mut m = record(&[], None);

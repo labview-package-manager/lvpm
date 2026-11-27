@@ -208,6 +208,16 @@ mod tests {
     }
 
     #[test]
+    fn is_version_takes_real_versions_only() {
+        for good in ["1.0.1-1", "2018.0.7.45", "7.1.2.1547", "1.0.0b3", "6"] {
+            assert!(is_version(good), "{good}");
+        }
+        for bad in ["latest", "v1.0", "skip", "run", "", "*", ">=1", "1_0"] {
+            assert!(!is_version(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_number_inside_the_name_is_not_the_version() {
         // The only id in 4815 that the first-`-digit` rule got wrong.
         let (n, v) =

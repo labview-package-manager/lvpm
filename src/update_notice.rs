@@ -315,6 +315,126 @@ mod tests {
     }
 
     #[test]
+    fn only_stable_releases_count_and_versions_compare_as_semver() {
+        // A tag without the `v` prefix counts as well.
+        let releases = serde_json::from_str(
+            r#"[
+            {"tag_name":"v0.9.0","draft":false},
+            {"tag_name":"0.10.0","draft":false}
+        ]"#,
+        )
+        .unwrap();
+        assert_eq!(latest_release(releases).as_deref(), Some("0.10.0"));
+        let releases = serde_json::from_str(
+            r#"[{"tag_name":"v0.10.0-rc.1","draft":false,"prerelease":true}]"#,
+        )
+        .unwrap();
+        assert!(latest_release(releases).is_none());
+    }
+
+    #[test]
+    fn failed_checks_are_cached_without_losing_the_previous_notice() {
+        let (_dir, path) = cache();
+        let mut now = INTERVAL * 10;
+        write_cache(
+            &path,
+            &Cached {
+                checked_at: 0,
+                latest: Some("0.4.0".into()),
+            },
+        )
+        .unwrap();
+        for (status, body) in [
+            ("403 Forbidden", "rate limited"),
+            ("200 OK", "invalid json"),
+        ] {
+            let (url, server) = server(status, body);
+            let result = refresh(&path, &url, now, TIMEOUT).unwrap().unwrap();
+            server.join().unwrap();
+            assert_eq!(result.latest.as_deref(), Some("0.4.0"));
+            let persisted = read_cache(&path).unwrap();
+            assert_eq!(persisted.checked_at, now);
+            assert!(persisted.fresh(now + 1));
+            now += INTERVAL;
+        }
+        let (url, server) = server("200 OK", "[]");
+        assert!(
+            refresh(&path, &url, now, TIMEOUT)
+                .unwrap()
+                .unwrap()
+                .latest
+                .is_none()
+        );
+        server.join().unwrap();
+        assert!(read_cache(&path).unwrap().latest.is_none());
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn corrupt_cache_is_repaired_and_concurrent_checks_are_skipped() {
+        let (_dir, path) = cache();
+        std::fs::write(&path, b"partial json").unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        assert!(
+            refresh(&path, "invalid URL", INTERVAL * 10, TIMEOUT)
+                .unwrap()
+                .is_none()
+        );
+        drop(lock);
+
+        let (url, server) = server("200 OK", r#"[{"tag_name":"v0.4.0","draft":false}]"#);
+        refresh(&path, &url, INTERVAL * 10, TIMEOUT).unwrap();
+        server.join().unwrap();
+        assert_eq!(read_cache(&path).unwrap().latest.as_deref(), Some("0.4.0"));
+    }
+
+    #[test]
+    fn slow_requests_time_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/releases", listener.local_addr().unwrap());
+        let (release, wait) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        });
+        let started = Instant::now();
+        let error = fetch_latest(&url, Duration::from_millis(100)).unwrap_err();
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        server.join().unwrap();
+        assert!(
+            error.downcast_ref::<reqwest::Error>().unwrap().is_timeout(),
+            "{error:#}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_check_completing_within_the_grace_period_replaces_or_clears_the_cached_notice() {
+        for latest in [Some("0.5.0"), None] {
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                Some(Cached {
+                    checked_at: 0,
+                    latest: latest.map(String::from),
+                })
+            });
+            assert_eq!(
+                notice("0.3.0", Some("0.4.0"), Some(worker))
+                    .available(Duration::from_secs(5))
+                    .as_deref(),
+                latest
+            );
+        }
+    }
+
+    #[test]
     fn only_interactive_runs_without_an_opt_out_are_enabled() {
         assert!(enabled(true, true, |_| false));
         assert!(!enabled(false, true, |_| false));
