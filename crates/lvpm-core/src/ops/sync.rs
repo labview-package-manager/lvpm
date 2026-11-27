@@ -1588,6 +1588,117 @@ mod tests {
         );
     }
 
+    const GROUPS: &str = r#"
+[dependencies]
+delacor_lib_qmh = "7.1.2.1547"
+
+[dependency-groups.test]
+jki_lib_caraya = "*"
+oglib_error = ">=6.0"
+
+[dependency-groups.ci]
+include-groups = ["test"]
+ni_vi_analyzer_tests = "1.2.0.3"
+
+[dependency-groups.build]
+vipm_package_builder = "*"
+"#;
+
+    fn strings(groups: &[&str]) -> Vec<String> {
+        groups.iter().map(|g| g.to_string()).collect()
+    }
+
+    /// What `--with`, `--without` and `--only` select from [`GROUPS`].
+    fn select_groups(with: &[&str], without: &[&str], only: &[&str]) -> Result<Selection, String> {
+        let project = crate::project::parse(GROUPS).unwrap();
+        let options = SyncOptions {
+            groups: strings(with),
+            without: strings(without),
+            only: strings(only),
+            ..SyncOptions::default()
+        };
+        options.selection(&project).map_err(|e| e.to_string())
+    }
+
+    fn picked(groups: &[&str], no_dev: bool, no_main: bool) -> Selection {
+        Selection {
+            groups: strings(groups),
+            no_dev,
+            no_main,
+            keep_listed: false,
+        }
+    }
+
+    // Upstream also lists each selection's packages; gone: a selection names groups, the lock their packages.
+    #[test]
+    fn selection_defaults_to_main_and_follows_with_without_only() {
+        assert_eq!(select_groups(&[], &[], &[]), Ok(picked(&[], false, false)));
+        assert_eq!(
+            select_groups(&["ci"], &[], &[]),
+            Ok(picked(&["test", "ci"], false, false))
+        );
+        assert_eq!(
+            select_groups(&["ci"], &["test"], &[]),
+            Ok(picked(&["ci"], false, false))
+        );
+        assert_eq!(
+            select_groups(&[], &[], &["build"]),
+            Ok(picked(&["build"], true, true))
+        );
+        // Upstream also takes --without main; gone: main is no group, so it is refused as unknown.
+    }
+
+    #[test]
+    fn several_groups_per_flag_and_duplicates() {
+        assert_eq!(
+            select_groups(&["test", "build"], &[], &[]),
+            Ok(picked(&["test", "build"], false, false))
+        );
+        assert_eq!(
+            select_groups(&["test", "test"], &[], &[]),
+            Ok(picked(&["test"], false, false))
+        );
+        assert_eq!(
+            select_groups(&["ci", "test"], &[], &[]),
+            Ok(picked(&["test", "ci"], false, false)),
+            "test once, before the group including it"
+        );
+        assert_eq!(
+            select_groups(&["ci", "build"], &["test", "build"], &[]),
+            Ok(picked(&["ci"], false, false))
+        );
+    }
+
+    #[test]
+    fn without_a_group_that_was_not_selected_changes_nothing() {
+        assert_eq!(
+            select_groups(&[], &["build"], &[]),
+            Ok(picked(&[], false, false))
+        );
+    }
+
+    #[test]
+    fn names_are_trimmed_empty_entries_dropped_and_case_kept() {
+        assert_eq!(
+            select_groups(&[" test", "build ", ""], &[], &[]),
+            Ok(picked(&["test", "build"], false, false))
+        );
+        assert_eq!(
+            select_groups(&["ci"], &[" test "], &[]),
+            Ok(picked(&["ci"], false, false))
+        );
+        // Upstream falls back to the default for an all-empty --only; the fork refuses it (#80).
+        assert_eq!(
+            select_groups(&[], &["  "], &["", " "]),
+            Err("--only names no group".to_string())
+        );
+        let err = select_groups(&["Test"], &[], &[]).unwrap_err();
+        assert!(
+            err.contains("'Test'"),
+            "group names are case-sensitive: {err}"
+        );
+    }
+
     #[test]
     fn leaving_dev_out_wins_over_a_group_that_includes_it() {
         let project =

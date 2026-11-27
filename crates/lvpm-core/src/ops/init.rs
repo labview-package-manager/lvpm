@@ -2169,4 +2169,144 @@ Alpha = \"1.0\"
         assert!(!root.join("lvpm.toml").exists());
         let _ = std::fs::remove_dir_all(&scratch);
     }
+
+    #[test]
+    fn edits_stay_in_memory_until_written_and_a_new_manifest_starts_from_text() {
+        let (scratch, root) = folder("import-in-memory", "App");
+        // alpha is saved before tools is refused: the file has neither.
+        vipc_in(
+            &root,
+            "p.vipc",
+            "23.0",
+            &[("alpha-2.0", true, false), ("tools-1.0", true, false)],
+        );
+        let manifest = root.join("lvpm.toml");
+        let before = "[project]\nname = \"App\"\n\n[dependencies.tools]\nbeta = \"*\"\n";
+        std::fs::write(&manifest, before).unwrap();
+        let sink = Recorded::default();
+        let env = env_on(&sink, &root);
+        assert!(import(&env, Path::new("p.vipc"), false, None, false).is_err());
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), before);
+
+        // A manifest that does not exist yet is created by the write, not before.
+        std::fs::remove_file(&manifest).unwrap();
+        vipc_in(&root, "p.vipc", "23.0", &[("alpha-2.0", true, false)]);
+        let dry = import(&env, Path::new("p.vipc"), false, None, true).unwrap();
+        assert!(dry.created && !manifest.exists());
+        import(&env, Path::new("p.vipc"), false, None, false).unwrap();
+        let after = project::read(&manifest).unwrap();
+        assert_eq!(after.name.as_deref(), Some("App"));
+        assert_eq!(after.dependencies.len(), 1);
+        // Upstream also sets [project] labview through the edit; gone: import keeps [project] as written (#132).
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_default_group_gives_way_to_the_group_already_declaring_the_package() {
+        let (scratch, root) = folder("import-declaring-group", "App");
+        let manifest = root.join("lvpm.toml");
+        std::fs::write(
+            &manifest,
+            "[project]\nname = \"App\"\n\n[dependencies]\n\n[dependency-groups.test]\ncaraya = \"1.0\"\n",
+        )
+        .unwrap();
+        vipc_in(
+            &root,
+            "p.vipc",
+            "23.0",
+            &[("Caraya-1.4.5.165", true, false), ("lint-2.0", true, false)],
+        );
+        let sink = Recorded::default();
+        let env = env_on(&sink, &root);
+
+        // Declared in `test`: updated there, not duplicated into the default table.
+        let done = import(&env, Path::new("p.vipc"), false, None, false).unwrap();
+        let saved: Vec<_> = (done.saved.iter())
+            .map(|e| (e.table.as_str(), e.name.as_str(), e.was.as_deref()))
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                ("dependency-groups.test", "caraya", Some("1.0")),
+                ("dependencies", "lint", None)
+            ]
+        );
+        // An explicit group wins over both.
+        let done = import(&env, Path::new("p.vipc"), false, Some("ci"), false).unwrap();
+        assert!(
+            (done.saved.iter()).all(|e| e.table == "dependency-groups.ci"),
+            "{:?}",
+            done.saved
+        );
+        let p = project::read(&manifest).unwrap();
+        let group = |name: &str| {
+            (p.groups.iter())
+                .find(|(n, _)| n == name)
+                .map(|(_, g)| g.len())
+        };
+        assert_eq!(
+            (p.dependencies.len(), group("test"), group("ci")),
+            (1, Some(1), Some(2))
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn nipm_entries_are_copied_as_written() {
+        let (scratch, root) = folder("import-nipm", "App");
+        let manifest = root.join("lvpm.toml");
+        std::fs::write(&manifest, "[project]\nname = \"x\"\n").unwrap();
+        let nipm = "ni-visa = '24.0'\nni-daqmx = { version = \"24.5.0\", feed = \"ni-daq\" }\n";
+        let vipm = root.join("vipm.toml");
+        std::fs::write(&vipm, format!("[nipm.dependencies]\n{nipm}")).unwrap();
+        let sink = Recorded::default();
+        let env = env_on(&sink, &root);
+
+        let done = import(&env, Path::new("vipm.toml"), false, None, false).unwrap();
+        assert_eq!(done.nipm_added, 2);
+        let after = std::fs::read_to_string(&manifest).unwrap();
+        assert!(
+            after.ends_with(&format!("[nipm.dependencies]\n{nipm}")),
+            "{after}"
+        );
+        assert!(
+            !after.contains("[nipm]\n"),
+            "no empty [nipm] header: {after}"
+        );
+        assert_eq!(
+            project::read(&manifest).unwrap().nipm,
+            ["ni-visa", "ni-daqmx"]
+        );
+
+        // One already there is kept, whatever the file says for it.
+        std::fs::write(&vipm, "[nipm.dependencies]\nni-visa = '25.0'\n").unwrap();
+        let done = import(&env, Path::new("vipm.toml"), false, None, false).unwrap();
+        assert_eq!(done.nipm_added, 0);
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), after);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn an_import_that_fails_part_way_leaves_the_manifest_as_it_was() {
+        let (scratch, root) = folder("import-part-way", "App");
+        let manifest = root.join("lvpm.toml");
+        let before = "[project]\nname = \"App\"\n\n[dependencies.tools]\nbeta = \"*\"\n";
+        std::fs::write(&manifest, before).unwrap();
+        std::fs::write(
+            root.join("vipm.toml"),
+            "[dependencies]\na = \"1.0\"\nb = \"2.0\"\ntools = \"1.0\"\n",
+        )
+        .unwrap();
+        let sink = Recorded::default();
+        let env = env_on(&sink, &root);
+
+        let error = import(&env, Path::new("vipm.toml"), false, None, false).unwrap_err();
+        assert!(
+            error.to_string().contains("lvpm 0.3 form of a group"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), before);
+        // Upstream also fails an import with no manifest and finds no skeleton; gone: a new skeleton has no old-form group to refuse.
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 }
