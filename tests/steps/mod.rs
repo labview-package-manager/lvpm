@@ -34,5 +34,6 @@ pub mod solver;
 pub mod sources;
 pub mod staleness;
 pub mod sync;
+pub mod sync_asks;
 pub mod upgrade;
 pub mod venv;

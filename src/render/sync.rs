@@ -8,6 +8,7 @@ use lvpm_core::errors::{
     SyncError,
 };
 use lvpm_core::events::{Event, PackageRef, RemoveReason, SyncStep};
+use lvpm_core::ops::env::shell_word;
 
 pub(super) fn render(r: &mut Renderer, event: &Event) {
     match event {
@@ -36,8 +37,10 @@ pub(super) fn render(r: &mut Renderer, event: &Event) {
                 r.line(Stream::Out, "dry run: nothing changed");
             }
         }
-        // shortcut: placeholder wording with no `next:` hint, Step 2.2 words the decline.
-        Event::SyncDeclined { .. } => r.line(Stream::Out, "sync cancelled: nothing was changed"),
+        Event::SyncDeclined {
+            removing,
+            destination,
+        } => r.line(Stream::Out, &declined(removing, destination.as_deref())),
         Event::SyncNothingToDo => r.line(
             Stream::Out,
             "nothing to do: the destination already matches lvpm.lock",
@@ -50,18 +53,46 @@ fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
-/// The first sync of a project: what the new lock does not list goes.
+/// `extra 1.0, zeta 1.0`: the first five of `packages`, then `and N more`. The
+/// question sync asks and the note of a first sync name packages this way.
+pub fn package_list(packages: &[String]) -> String {
+    let (shown, rest) = packages.split_at(packages.len().min(5));
+    match rest.len() {
+        0 => shown.join(", "),
+        more => format!("{} and {more} more", shown.join(", ")),
+    }
+}
+
+/// The first sync of a project: what the new lock does not list goes. It reads
+/// as the question sync asks, `remove 1 package (gamma 1.0)?`, would.
 fn migration(removing: &[PackageRef]) -> String {
     let names: Vec<String> = removing
         .iter()
         .map(|package| format!("{} {}", package.name, package.version))
         .collect();
     format!(
-        "note: {} installed package{} not in lvpm.lock will be removed: {}",
+        "note: {} package{} not in lvpm.lock will be removed ({})",
         removing.len(),
         plural(removing.len()),
-        names.join(", ")
+        package_list(&names)
     )
+}
+
+/// What the user said no to, and the two ways on: the manifest, or `--yes` with
+/// the destination flags they typed.
+fn declined(removing: &[PackageRef], destination: Option<&str>) -> String {
+    let sync = match destination {
+        Some(flags) => format!("lvpm sync {flags} --yes"),
+        None => "lvpm sync --yes".to_string(),
+    };
+    let add = match removing {
+        [only] => format!(
+            "add it to lvpm.toml with lvpm add {}",
+            shell_word(&only.name)
+        ),
+        _ => "add them to lvpm.toml".to_string(),
+    };
+    format!("sync cancelled: nothing was changed\nnext: {add}, or run {sync}")
 }
 
 /// `sync: 2 to install, 1 to remove`: what is going to happen, in counts.
@@ -417,7 +448,54 @@ mod tests {
         assert_eq!(
             out.text(),
             "no lvpm.lock found: writing one from lvpm.toml (commit lvpm.lock with the project)\n\
-             note: 1 installed package not in lvpm.lock will be removed: gamma 1.0\n"
+             note: 1 package not in lvpm.lock will be removed (gamma 1.0)\n"
+        );
+    }
+
+    fn gone(name: &str) -> PackageRef {
+        PackageRef {
+            name: name.into(),
+            version: "1.0".into(),
+        }
+    }
+
+    #[test]
+    fn a_decline_says_nothing_changed_and_the_two_ways_on_as_typed() {
+        let (mut renderer, out, _) = renderer();
+        renderer.render(&Event::SyncDeclined {
+            removing: vec![gone("extra")],
+            destination: Some("--prefix dest".into()),
+        });
+        renderer.render(&Event::SyncDeclined {
+            removing: vec![gone("extra"), gone("zeta")],
+            destination: Some("--prefix 'my dest'".into()),
+        });
+        renderer.render(&Event::SyncDeclined {
+            removing: vec![gone("extra")],
+            destination: None,
+        });
+        assert_eq!(
+            out.text(),
+            "sync cancelled: nothing was changed\n\
+             next: add it to lvpm.toml with lvpm add extra, or run lvpm sync --prefix dest --yes\n\
+             sync cancelled: nothing was changed\n\
+             next: add them to lvpm.toml, or run lvpm sync --prefix 'my dest' --yes\n\
+             sync cancelled: nothing was changed\n\
+             next: add it to lvpm.toml with lvpm add extra, or run lvpm sync --yes\n"
+        );
+    }
+
+    #[test]
+    fn a_list_of_packages_names_five_and_counts_the_rest() {
+        let names =
+            |count: usize| -> Vec<String> { (1..=count).map(|n| format!("p{n} 1.0")).collect() };
+        assert_eq!(
+            package_list(&names(5)),
+            "p1 1.0, p2 1.0, p3 1.0, p4 1.0, p5 1.0"
+        );
+        assert_eq!(
+            package_list(&names(8)),
+            "p1 1.0, p2 1.0, p3 1.0, p4 1.0, p5 1.0 and 3 more"
         );
     }
 

@@ -54,7 +54,7 @@ How Python's uv does it, for comparison: `uv sync` never asks. It removes extran
 ## Stances I took (not the user's decisions; open at the gate)
 
 - **Which removals ask: `NotInLock` only.** `DevOnly` (`--no-dev`) and `GroupsOnly` (group selection) follow from flags the user just typed, so they do not ask. A scenario pins that `--no-dev` removes without asking.
-- **"n" exits 0.** It prints `sync cancelled: nothing was changed` and a `next:` hint (`add it to lvpm.toml with 'lvpm add extra', or run 'lvpm sync --prefix dest --yes'`). The hint repeats the flags the user typed. With more than one package it drops the `add` half and says `add them to lvpm.toml`. The `--global` refusal names the same two ways out. This matches `venv remove`. A script never sees the question, because without a terminal there is none, so `lvpm sync && build` is not at risk.
+- **"n" exits 0.** It prints `sync cancelled: nothing was changed` and a `next:` hint (`add it to lvpm.toml with lvpm add extra, or run lvpm sync --prefix dest --yes`; unquoted, so a quoted path does not nest quotes). The hint repeats the flags the user typed. With more than one package it drops the `add` half and says `add them to lvpm.toml`. The `--global` refusal names the same two ways out. This matches `venv remove`. A script never sees the question, because without a terminal there is none, so `lvpm sync && build` is not at risk.
 - **The question** is `remove 2 packages (extra 1.0, zeta 0.3)? [y/N] ` on stderr. It names at most 5 packages and then `and N more`. For `--global` it names the LabVIEW target: `remove 1 package from LabVIEW 2026 (64-bit) (extra 1.0)? [y/N] `. The full plan (including any `--no-dev` removals and replacements, which "y" also runs) ends on the line just above the question, and "n" cancels all of it.
 - **The plan is printed once,** before the question, and not again after "y". On a sync that will ask, the `SyncMigration` note ("removing ...") is skipped, since the question says it. Where nothing asks (add/remove's commit, `--yes`, no terminal), the note stays.
 - **Core takes no input.** `ops::sync::sync_asking(env, opts, ask)` takes a front-end callback, as `uninstall`'s `Dependencies::Ask` does. `sync(env, opts)` stays and passes "always yes", so its callers do not change.
@@ -314,7 +314,7 @@ Feature: sync asks before it removes packages
     Examples:
       | command                                  | outcome                                                   |
       | lvpm install zeta --prefix dest          | dest's lvpm-installed packages are exactly "alpha" 2.0 and "zeta" 1.0 |
-      | lvpm uninstall alpha --prefix dest       | dest's lvpm-installed packages are exactly "extra" 1.0     |
+      | lvpm uninstall alpha --prefix dest       | dest has no lvpm-installed packages                       |
       | lvpm add zeta --prefix dest              | the manifest depends on "zeta"                             |
       | lvpm remove alpha --prefix dest          | the manifest no longer depends on "alpha"                  |
 
@@ -333,10 +333,21 @@ Feature: sync asks before it removes packages
     And dest's lvpm-installed packages are exactly "alpha" 2.0
 ```
 
-The named-command outcomes are what each command does today with an unlocked
-`extra` in dest. Before Slice 2, /build runs the four commands on today's build
-and pastes the observed outcomes into the table. The point of each row is "no question", not a new
-behaviour.
+Observed on today's build (2026-11-27), before `cmd_sync` was wired, with an
+unlocked `extra` in dest. None of the four asks; the point of each row is "no
+question".
+
+| Command | Today's outcome |
+|---|---|
+| `lvpm install zeta --prefix dest` | no question; dest holds "alpha" 2.0 and "zeta" 1.0: the named install is an add, whose sync removed `extra` unasked |
+| `lvpm uninstall alpha --prefix dest` | no question; dest holds nothing: alpha leaves the manifest, and the sync that follows removed `extra` unasked too (the plan said `extra` stays) |
+| `lvpm add zeta --prefix dest` | no question; lvpm.toml depends on "zeta" |
+| `lvpm remove alpha --prefix dest` | no question; lvpm.toml no longer depends on "alpha" |
+
+The uninstall row's outcome column was wrong and is corrected; the other three
+are as first written. The `add` and `remove` rows assert the manifest only. The
+unasked removal of a stray package by a named command outside `--global` is
+decision 3, as before.
 
 The `--global` refusal has no acceptance scenario: the harness cannot point a
 LabVIEW target at a throwaway directory (the same limit #54 hit). It is covered
@@ -469,7 +480,7 @@ graph TD
 ### Wave 2
 - [ ] Slice 2: the CLI asks, goes ahead or refuses
   - [x] Step 2.1: the decision, as one pure function
-  - [ ] Step 2.2: wire cmd_sync, render the question and the cancel
+  - [x] Step 2.2: wire cmd_sync, render the question and the cancel
   - [ ] Step 2.3: goldens and the tests whose names now lie
 
 ### Wave 3

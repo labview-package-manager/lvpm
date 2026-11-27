@@ -287,6 +287,7 @@ fn goes_ahead(
         Answer::Asked(false) => {
             env.sink.emit(Event::SyncDeclined {
                 removing: package_refs(removals),
+                destination: env.destination_flags_as_typed(),
             });
             Ok(false)
         }
@@ -2977,13 +2978,14 @@ beta = \"*\"
         outcome.unwrap();
         assert_eq!(project.lock_bytes(), None, "a lock was written");
         assert_eq!(project.installed(), installed);
+        // The destination is the flags the test's env was given, as typed.
         assert!(
-            events.contains(&Event::SyncDeclined {
-                removing: vec![PackageRef {
-                    name: "gamma".into(),
-                    version: "1.0".into()
-                }]
-            }),
+            events.iter().any(|event| matches!(
+                event,
+                Event::SyncDeclined { removing, destination }
+                    if removing == &[PackageRef { name: "gamma".into(), version: "1.0".into() }]
+                        && destination.as_deref().is_some_and(|flags| flags.starts_with("--prefix "))
+            )),
             "{events:?}"
         );
         assert!(
@@ -3179,6 +3181,25 @@ beta = \"*\"
             (project.lock_bytes(), project.installed()),
             (lock, installed)
         );
+    }
+
+    #[test]
+    fn a_dry_run_is_not_refused_by_a_front_end_that_refuses_every_question() {
+        // The CLI's answer to `--global` without a terminal: an error.
+        let project = project_whose_new_lock_drops_gamma("dry-run-not-refused");
+        let question = Question::failing("needs --yes");
+        let opts = SyncOptions {
+            install: InstallOptions {
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+            ..SyncOptions::default()
+        };
+
+        let (outcome, _) = project.sync_asked(&opts, &question);
+
+        outcome.unwrap();
+        assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new());
     }
 
     #[test]

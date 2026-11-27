@@ -553,7 +553,12 @@ pub enum Event {
     /// What the sync does, before it does it; on a dry run, instead.
     SyncPlanned { steps: Vec<SyncStep>, dry_run: bool },
     /// The user said no to the removals of `removing`, and nothing was changed.
-    SyncDeclined { removing: Vec<PackageRef> },
+    /// `destination` is the destination flags as typed, for the command the
+    /// next step suggests.
+    SyncDeclined {
+        removing: Vec<PackageRef>,
+        destination: Option<String>,
+    },
     /// The destination already holds exactly what the lock lists.
     SyncNothingToDo,
 

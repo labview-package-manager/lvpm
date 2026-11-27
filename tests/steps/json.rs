@@ -376,16 +376,16 @@ async fn skipped_for_scratch(world: &mut CliWorld) {
     }
 }
 
-#[then(regex = r#"^it asked "\[y/N\]"$"#)]
-async fn it_asked(world: &mut CliWorld) {
+#[then(regex = r#"^it asked "(.+)"$"#)]
+async fn it_asked(world: &mut CliWorld, question: String) {
     let stderr = &output(world).stderr;
-    assert!(stderr.contains("[y/N]"), "{stderr}");
+    assert!(stderr.contains(&question), "{stderr}");
 }
 
-#[then(regex = r#"^it did not ask "\[y/N\]"$"#)]
-async fn it_did_not_ask(world: &mut CliWorld) {
+#[then(regex = r#"^it did not ask "(.+)"$"#)]
+async fn it_did_not_ask(world: &mut CliWorld, question: String) {
     let stderr = &output(world).stderr;
-    assert!(!stderr.contains("[y/N]"), "{stderr}");
+    assert!(!stderr.contains(&question), "{stderr}");
 }
 
 // ---- Without --json ----
