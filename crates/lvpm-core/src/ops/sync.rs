@@ -152,7 +152,8 @@ impl Selection {
 /// and asking nothing.
 ///
 /// Every archive is in hand before the first change, so a missing or altered
-/// archive fails the sync with the destination as it was. A dry run reports
+/// archive fails the sync with the destination, and `lvpm.lock`, as they were:
+/// a lock made here is written once the archives are in hand. A dry run reports
 /// the plan, and changes nothing.
 pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
     if opts.headless_implied {
@@ -178,7 +179,7 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
     announce_target(env, &store);
 
     let lock_path = manifest_path.with_file_name(lockfile::FILE_NAME);
-    let (lock, first_sync) = settle_lock(env, &found, &lock_path, opts)?;
+    let mut settled = settle_lock(env, &found, &lock_path, opts)?;
     if !project.nipm.is_empty() {
         env.sink.emit(Event::NipmNotInstalled {
             count: project.nipm.len(),
@@ -186,11 +187,12 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
     }
 
     let selection = opts.selection();
-    let plan = plan_sync(&lock, &install::list_installed(&store)?, &selection);
-    if first_sync {
+    let plan = plan_sync(&settled.lock, &install::list_installed(&store)?, &selection);
+    if settled.first_sync {
         announce_migration(env, &plan);
     }
     if plan.is_empty() {
+        settled.write_lock(env)?;
         // In line with the lock, but the merged palette addon may still be
         // owed: the fix `lvpm launch` points at for a stale one.
         if let crate::ops::Destination::Venv(v) = &dest
@@ -210,6 +212,11 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
     }
 
     let planned = fetch_locked(env, project, &plan.wanted)?;
+    settled.write_lock(env)?;
+    // The first change is a removal or an install, and every archive is in
+    // hand: this is where cancelling stops being possible. The lock write has
+    // said so already when there was a lock to write.
+    env.cancel.begin_unpack()?;
     // The project's own lines allow hooks; a dependency's manifest never does.
     let opts = &SyncOptions {
         install: InstallOptions {
@@ -220,7 +227,15 @@ pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
         ..opts.clone()
     };
     let mut session = InstallSession::new(dest);
-    let applied = apply_sync(env, &mut session, &lock, &plan, &selection, planned, opts)?;
+    let applied = apply_sync(
+        env,
+        &mut session,
+        &settled.lock,
+        &plan,
+        &selection,
+        planned,
+        opts,
+    )?;
     finish(env, &mut session, &applied, &opts.install)?;
     Ok(())
 }
@@ -247,8 +262,39 @@ pub(super) fn refuse_unknown_groups(project: &Project, groups: &[String]) -> Res
     }
 }
 
+/// The lock a sync goes by, and what is left to do about it.
+struct Settled {
+    lock: Lockfile,
+    /// The project's first sync: the lock was made because there was none.
+    first_sync: bool,
+    /// A lock made here and not yet written: see [`Settled::write_lock`].
+    pending: Option<locking::PendingLock>,
+}
+
+impl Settled {
+    /// A lock that is there already and is used as it is.
+    fn kept(lock: Lockfile) -> Settled {
+        Settled {
+            lock,
+            first_sync: false,
+            pending: None,
+        }
+    }
+
+    /// Write the lock this sync made, if it made one: the one place it is
+    /// written, once the archives are in hand, so that a sync that fails
+    /// before it changes anything leaves `lvpm.lock` as it was.
+    fn write_lock(&mut self, env: &OpEnv) -> Result<(), SyncError> {
+        match self.pending.take() {
+            Some(pending) => Ok(pending.write(env)?),
+            None => Ok(()),
+        }
+    }
+}
+
 /// The lock this sync goes by, and whether it is the project's first: made
-/// here because there was none. A dry run makes it without writing it.
+/// here because there was none. It is made, not written: [`Settled::write_lock`]
+/// writes it. A dry run makes it and never writes it.
 ///
 /// A lock that was there is warned about for the requirements it records as
 /// unresolved; one made here has said so already, as it was made.
@@ -257,7 +303,7 @@ fn settle_lock(
     found: &(PathBuf, Project),
     lock_path: &Path,
     opts: &SyncOptions,
-) -> Result<(Lockfile, bool), SyncError> {
+) -> Result<Settled, SyncError> {
     let project = &found.1;
     match opts.lock {
         LockPolicy::Frozen => {
@@ -266,18 +312,18 @@ fn settle_lock(
             if let Some(reason) = lock.format_is_outdated() {
                 return Err(LockError::Stale(reason).into());
             }
-            Ok((warn_unresolved(env, lock), false))
+            Ok(Settled::kept(warn_unresolved(env, lock)))
         }
         LockPolicy::Locked => {
             let lock = locking::read_lock(lock_path)?;
             match lock.staleness(project) {
                 Some(reason) => Err(LockError::Stale(reason).into()),
-                None => Ok((warn_unresolved(env, lock), false)),
+                None => Ok(Settled::kept(warn_unresolved(env, lock))),
             }
         }
         LockPolicy::Update => match locking::read_lock(lock_path) {
             Ok(lock) if lock.staleness(project).is_none() => {
-                Ok((warn_unresolved(env, lock), false))
+                Ok(Settled::kept(warn_unresolved(env, lock)))
             }
             read => {
                 let missing = matches!(read, Err(LockError::NoLock { .. }));
@@ -287,8 +333,12 @@ fn settle_lock(
                         dry_run: opts.install.dry_run,
                     });
                 }
-                let lock = new_lock(env, found, lock_path, opts.install.dry_run)?;
-                Ok((lock, missing))
+                let (lock, pending) = new_lock(env, found, lock_path, opts.install.dry_run)?;
+                Ok(Settled {
+                    lock,
+                    first_sync: missing,
+                    pending,
+                })
             }
         },
     }
@@ -305,27 +355,26 @@ fn warn_unresolved(env: &OpEnv, lock: Lockfile) -> Lockfile {
     lock
 }
 
-/// The lock the manifest resolves to now: written beside it, or on a dry run
-/// only said how it would differ from the one there.
+/// The lock the manifest resolves to now, and the write of it that is owed:
+/// none on a dry run, which only says how the lock would differ from the one
+/// there.
 fn new_lock(
     env: &OpEnv,
     found: &(PathBuf, Project),
     lock_path: &Path,
     dry_run: bool,
-) -> Result<Lockfile, LockError> {
-    if !dry_run {
-        // shortcut: the lock is written, and cancel refused, before the
-        // archives are fetched, so a fetch that fails leaves the new lock with
-        // nothing synced. Lock in memory and write it with the sync if that bites.
-        return locking::lock(env);
-    }
+) -> Result<(Lockfile, Option<locking::PendingLock>), LockError> {
     let previous = Lockfile::read(lock_path).ok();
     let (lock, changes, after) = locking::relock(env, found, previous.as_ref())?;
-    if !changes.is_empty() {
-        env.sink.emit(Event::LockWouldChange { changes });
+    if dry_run {
+        if !changes.is_empty() {
+            env.sink.emit(Event::LockWouldChange { changes });
+        }
+        after.into_iter().for_each(|event| env.sink.emit(event));
+        return Ok((lock, None));
     }
-    after.into_iter().for_each(|event| env.sink.emit(event));
-    Ok(lock)
+    let pending = locking::PendingLock::new(lock_path.to_path_buf(), &lock, changes, after)?;
+    Ok((lock, Some(pending)))
 }
 
 /// The first sync of a project removes what the lock it just made does not
@@ -358,6 +407,9 @@ pub(super) fn announce_migration(env: &OpEnv, plan: &SyncPlan) {
 /// refresh are left to [`finish`], which spends what this leaves in the
 /// session.
 ///
+/// The caller has called `begin_unpack` before its first write, which may be the
+/// lock's: this changes the destination and takes no cancel.
+///
 /// A change that fails stops the rest. The error says which packages are done
 /// and which are not, so that running the sync again can finish it.
 pub fn apply_sync(
@@ -369,9 +421,6 @@ pub fn apply_sync(
     planned: Vec<PlannedPackage>,
     opts: &SyncOptions,
 ) -> Result<Applied, SyncError> {
-    // The first change is a removal or an install, and every archive is in
-    // hand: this is where cancelling stops being possible.
-    env.cancel.begin_unpack()?;
     env.sink.emit(Event::SyncPlanned {
         steps: plan.steps.clone(),
         dry_run: false,
@@ -1662,7 +1711,6 @@ mod tests {
 
     #[test]
     fn a_cancel_during_the_last_sources_load_is_a_cancel_and_not_a_missing_archive() {
-        use super::super::testing::CancelOn;
         let scratch = Scratch::new("cancelled-last-load");
         let project = manifest(
             "dead = \"http://127.0.0.1:1/feed\"
@@ -1813,6 +1861,7 @@ mod tests {
 
     // ---- the whole operation, on real files ----
 
+    use super::super::testing::CancelOn;
     use crate::events::EventSink;
     use crate::target::Roots;
     use std::sync::Mutex;
@@ -2591,6 +2640,185 @@ beta = \"*\"
                 required_by: "beta".into()
             }]
         );
+    }
+
+    // ---- the lock is written once the archives are in hand ----
+
+    /// Takes the folder and the cache away when the lock has been made, which
+    /// `project_with_an_unresolved_requirement` says by `RequirementUnresolved`
+    /// as its last word: the one event between making the lock and fetching
+    /// the archives the sync installs.
+    struct LoseArchivesOnceLocked {
+        folder: PathBuf,
+        cache: PathBuf,
+    }
+
+    impl LoseArchivesOnceLocked {
+        fn of(project: &Scratch) -> Self {
+            LoseArchivesOnceLocked {
+                folder: project.folder(),
+                cache: project.root.join("cache"),
+            }
+        }
+    }
+
+    impl EventSink for LoseArchivesOnceLocked {
+        fn emit(&self, event: Event) {
+            if matches!(event, Event::RequirementUnresolved { .. }) {
+                std::fs::remove_dir_all(&self.folder).ok();
+                std::fs::remove_dir_all(&self.cache).ok();
+            }
+        }
+    }
+
+    fn position(events: &[Event], wanted: impl Fn(&Event) -> bool) -> usize {
+        events
+            .iter()
+            .position(wanted)
+            .unwrap_or_else(|| panic!("event missing in {events:?}"))
+    }
+
+    #[test]
+    fn a_fetch_that_fails_after_the_lock_is_made_leaves_a_missing_lock_missing() {
+        let project = project_with_an_unresolved_requirement("fetch-fails-no-lock");
+        let sink = LoseArchivesOnceLocked::of(&project);
+
+        let outcome = sync(&project.sync_env(&sink), &SyncOptions::default());
+
+        assert!(
+            matches!(outcome, Err(SyncError::Archives(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert!(project.installed().is_empty());
+    }
+
+    #[test]
+    fn a_fetch_that_fails_after_the_lock_is_made_leaves_an_outdated_lock_as_it_was() {
+        let project = project_with_an_unresolved_requirement("fetch-fails-outdated");
+        project.sync(&SyncOptions::default()).0.unwrap();
+        let (lock, installed) = (project.lock_bytes().unwrap(), project.installed());
+        // gamma is new: the lock is outdated, and the sync has an archive to fetch.
+        project.write_manifest(&["beta", "gamma"]);
+        let sink = LoseArchivesOnceLocked::of(&project);
+
+        let outcome = sync(&project.sync_env(&sink), &SyncOptions::default());
+
+        assert!(
+            matches!(outcome, Err(SyncError::Archives(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(project.lock_bytes(), Some(lock));
+        assert_eq!(project.installed(), installed);
+    }
+
+    #[test]
+    fn a_first_sync_whose_destination_already_matches_still_writes_the_lock() {
+        let project = project("first-nothing-to-do", &["beta"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        assert!(project.lock_path().is_file(), "no lock was written");
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        let nothing = position(&events, |e| e == &Event::SyncNothingToDo);
+        assert!(written < nothing, "{events:?}");
+    }
+
+    #[test]
+    fn an_outdated_lock_whose_destination_already_matches_is_still_rewritten() {
+        let project = project("outdated-nothing-to-do", &["beta"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        let before = project.lock_bytes().unwrap();
+        // alpha is installed already, as beta needs it: only the lock differs.
+        project.write_manifest(&["beta", "alpha"]);
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        assert_ne!(
+            project.lock_bytes().unwrap(),
+            before,
+            "the lock is as it was"
+        );
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        let nothing = position(&events, |e| e == &Event::SyncNothingToDo);
+        assert!(written < nothing, "{events:?}");
+    }
+
+    #[test]
+    fn a_cancel_after_the_lock_is_made_and_before_it_is_written_is_honoured() {
+        let project = project_with_an_unresolved_requirement("cancel-before-lock-write");
+        let token = crate::cancel::CancelToken::new();
+        let sink = CancelOn::new(&token, |e| matches!(e, Event::RequirementUnresolved { .. }));
+        let mut env = project.sync_env(&sink);
+        env.cancel = token;
+
+        let outcome = sync(&env, &SyncOptions::default());
+
+        assert_eq!(sink.answered(), Some(true), "the cancel was not accepted");
+        assert!(matches!(outcome, Err(SyncError::Cancelled)), "{outcome:?}");
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert!(project.installed().is_empty());
+    }
+
+    #[test]
+    fn a_cancel_once_the_lock_is_written_is_refused_and_the_sync_finishes() {
+        let project = project("cancel-after-lock-write", &["beta"]);
+        let token = crate::cancel::CancelToken::new();
+        let sink = CancelOn::new(&token, |e| matches!(e, Event::LockWritten { .. }));
+        let mut env = project.sync_env(&sink);
+        env.cancel = token;
+
+        sync(&env, &SyncOptions::default()).unwrap();
+
+        assert_eq!(sink.answered(), Some(false), "the cancel was accepted");
+        assert_eq!(
+            project.installed(),
+            pairs(&[("alpha", "2.0"), ("beta", "1.0")])
+        );
+    }
+
+    #[test]
+    fn a_first_sync_says_what_it_takes_out_before_it_writes_the_lock_and_then_announces_the_plan() {
+        let project = project("event-order", &["beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        std::fs::remove_file(project.lock_path()).unwrap();
+        project.write_manifest(&["beta"]);
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        let hashing = position(&events, |e| matches!(e, Event::LockHashing { .. }));
+        let migration = position(&events, |e| matches!(e, Event::SyncMigration { .. }));
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
+        assert!(
+            hashing < migration && migration < written && written < planned,
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancel_before_the_lock_is_written_stops_a_sync_that_has_nothing_to_change() {
+        let project = project_with_an_unresolved_requirement("cancel-empty-plan");
+        project.sync(&SyncOptions::default()).0.unwrap();
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let installed = project.installed();
+        let token = crate::cancel::CancelToken::new();
+        let sink = CancelOn::new(&token, |e| matches!(e, Event::RequirementUnresolved { .. }));
+        let mut env = project.sync_env(&sink);
+        env.cancel = token;
+
+        let outcome = sync(&env, &SyncOptions::default());
+
+        assert_eq!(sink.answered(), Some(true), "the cancel was not accepted");
+        // The error leaves before the palette merge and `SyncNothingToDo`.
+        assert!(matches!(outcome, Err(SyncError::Cancelled)), "{outcome:?}");
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert_eq!(project.installed(), installed);
     }
 
     // ---- a LabVIEW installation that is not there: --global and headless ----

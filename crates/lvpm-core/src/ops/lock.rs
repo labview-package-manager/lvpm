@@ -52,12 +52,50 @@ pub fn lock(env: &OpEnv) -> Result<Lockfile, LockError> {
     }
 
     let (lock, changes, after) = relock(env, &found, previous.as_ref())?;
-    let text = lock.to_toml()?;
-    // From here a cancel is refused: the first file is written.
-    env.cancel.begin_unpack()?;
-    write_atomically(&lock_path, &text)?;
-    announce_written(env, lock_path, &lock, changes, after);
+    PendingLock::new(lock_path, &lock, changes, after)?.write(env)?;
     Ok(lock)
+}
+
+/// A lock that is made and serialised and not yet on disk, so that a caller
+/// with more to do first can write it at the moment it chooses.
+///
+/// It writes the lock alone: no manifest, and no rollback. An operation that
+/// also writes the manifest, as `commit` and [`upgrade`] do, keeps
+/// [`write_manifest_and_lock`] and puts both back when it fails.
+pub(super) struct PendingLock {
+    path: PathBuf,
+    lock: Lockfile,
+    /// The lock as it is written, made up front so that a lock that cannot be
+    /// serialised fails before anything else is asked or done.
+    text: String,
+    changes: Vec<LockChange>,
+    after: Vec<Event>,
+}
+
+impl PendingLock {
+    pub(super) fn new(
+        path: PathBuf,
+        lock: &Lockfile,
+        changes: Vec<LockChange>,
+        after: Vec<Event>,
+    ) -> anyhow::Result<PendingLock> {
+        Ok(PendingLock {
+            text: lock.to_toml()?,
+            lock: lock.clone(),
+            path,
+            changes,
+            after,
+        })
+    }
+
+    /// Write the lock, and say so. A cancel is refused from here: the first
+    /// file is written.
+    pub(super) fn write(self, env: &OpEnv) -> Result<(), LockError> {
+        env.cancel.begin_unpack()?;
+        write_atomically(&self.path, &self.text)?;
+        announce_written(env, self.path, &self.lock, self.changes, self.after);
+        Ok(())
+    }
 }
 
 /// A package an upgrade moves, and the version to move it to when the caller
