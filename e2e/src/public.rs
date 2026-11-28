@@ -21,13 +21,12 @@ use crate::checks::*;
 /// the Call Library links VI Package Builder breaks.
 pub const PACKAGES: [&str; 2] = ["astemes_lib_lunit", "dataflow_g_lib_g_image"];
 
-/// Packages whose install hooks the projects turn off (`hooks = "skip"`);
-/// every other package's run (`hooks = "run"`). G-Image's PostInstall
-/// unzips clean copies of its VIs over the installed ones, to undo VI
-/// Package Builder replacing their Call Library wildcard with
-/// `g_image_32.dll`. linkfix's `clfn-wildcard` makes that repair, and the
-/// unzipped copies would replace the linkfixed files with unprepared ones.
-pub const SKIP_HOOKS: [&str; 1] = ["dataflow_g_lib_g_image"];
+/// G-Image's PostInstall unzips clean copies of its VIs over the installed
+/// ones, to undo VI Package Builder replacing their Call Library wildcard
+/// with `g_image_32.dll`. linkfix's `clfn-wildcard` makes that repair, and
+/// the unzipped copies would replace the linkfixed files with unprepared
+/// ones. The installs pass no --hooks, so headless skips it (#76).
+const G_IMAGE: &str = "dataflow_g_lib_g_image";
 
 /// Every name under the LabVIEW folder, with a file's modification time; a
 /// folder has none.
@@ -45,8 +44,8 @@ pub fn trials() -> Vec<Trial> {
         ),
         ("lvpm list shows every package asked for", list_complete),
         (
-            "hooks ran as the manifest says: G-Image's skipped",
-            hooks_ran,
+            "headless without --hooks skips G-Image's PostInstall",
+            hooks_skipped,
         ),
         (
             "every file in the install records is on disk",
@@ -91,8 +90,8 @@ fn global_install() -> Check {
     )?;
     close_labview();
     *GLOBAL_TREE.lock().unwrap() = Some(tree()?);
-    // No --hooks: it would override the manifest's hooks = "skip".
-    linkfix_only(&stdout(&ok(&global(), &["install"])?))
+    // --no-locked: headless implies --locked, and the fixtures write no lock.
+    linkfix_only(&stdout(&ok(&global(), &["install", "--no-locked"])?))
 }
 
 fn linkfix_only(output: &str) -> Check {
@@ -105,7 +104,7 @@ fn linkfix_only(output: &str) -> Check {
 }
 
 fn global_install_for_relink() -> Check {
-    ok(&global(), &["install", "--no-linkfix"]).map(drop)
+    ok(&global(), &["install", "--no-linkfix", "--no-locked"]).map(drop)
 }
 
 /// The dependency names of the global project, as fixtures::public wrote them.
@@ -134,37 +133,25 @@ fn list_complete() -> Check {
     })
 }
 
-/// In `lvpm list`, a package in [`SKIP_HOOKS`] has its PostInstall recorded
-/// as skipped, and no other package the project lists has a skipped hook. A
-/// dependency the project does not list is not asked: the fork never runs
-/// its hooks through its parent's `hooks = "run"` (#46).
-fn hooks_ran() -> Check {
+/// In `lvpm list`, G-Image's row records its PostInstall as skipped. The
+/// local suite shows that --hooks runs hooks headless.
+fn hooks_skipped() -> Check {
     let list = stdout(&ok(&global(), &["list"])?);
-    let asked = asked()?;
-    let rows: Vec<&str> = list
-        .lines()
-        .filter(|row| {
-            let name = row.split_whitespace().next().unwrap_or_default();
-            asked.iter().any(|a| a.eq_ignore_ascii_case(name))
-        })
-        .collect();
-    let wrong: Vec<&str> = rows
-        .iter()
-        .copied()
-        .filter(|row| {
-            let name = row.split_whitespace().next().unwrap_or_default();
-            match SKIP_HOOKS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-                true => !row.contains("hooks skipped: PostInstall"),
-                false => row.contains("hooks skipped"),
-            }
-        })
-        .collect();
-    ensure(rows.len() == asked.len() && wrong.is_empty(), || {
-        format!(
-            "hooks did not run as the manifest says:\n{}\n\nlist:\n{list}",
-            wrong.join("\n")
-        )
-    })
+    let skipped = regex(r"hooks skipped: [^)]*PostInstall");
+    ensure(
+        list.lines().any(|row| {
+            row.split_whitespace()
+                .next()
+                .is_some_and(|n| n.eq_ignore_ascii_case(G_IMAGE))
+                && skipped.is_match(row)
+        }),
+        || {
+            format!(
+                "G-Image's PostInstall is not recorded as skipped:
+{list}"
+            )
+        },
+    )
 }
 
 fn records_on_disk() -> Check {
@@ -238,7 +225,7 @@ fn venv_create() -> Check {
 }
 
 fn venv_install() -> Check {
-    linkfix_only(&stdout(&ok(&venv(), &["install"])?))
+    linkfix_only(&stdout(&ok(&venv(), &["install", "--no-locked"])?))
 }
 
 fn venv_uninstall() -> Check {
@@ -249,7 +236,7 @@ fn venv_uninstall() -> Check {
 }
 
 fn venv_install_relinked() -> Check {
-    let output = stdout(&ok(&venv(), &["install", "--relink"])?);
+    let output = stdout(&ok(&venv(), &["install", "--relink", "--no-locked"])?);
     ensure(
         output.contains("linkfix: skipped (--relink selects LabVIEW instead)")
             && !output.contains("linkfix: preparing"),

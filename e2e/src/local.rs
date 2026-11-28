@@ -140,7 +140,10 @@ fn global_install() -> Check {
     std::fs::write(&sentinel, CALLER_VI).map_err(fail)?;
     *PROVIDER_HASH.lock().unwrap() = Some(hash(&sentinel)?);
 
-    let a = ok(&global(), &["install", "--relink", "--hooks"])?;
+    let a = ok(
+        &global(),
+        &["install", "--relink", "--hooks", "--no-locked"],
+    )?;
     *INSTALL_LOG.lock().unwrap() = text(&a);
     Ok(())
 }
@@ -323,7 +326,7 @@ fn venv_create() -> Check {
 }
 
 fn venv_install() -> Check {
-    ok(&venv(), &["install", "--relink"])?;
+    ok(&venv(), &["install", "--relink", "--no-locked"])?;
     let dir = venv_dir()?;
     exists(
         &dir.join("packages")

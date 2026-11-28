@@ -7,7 +7,7 @@
 //!   install whose overlay is proven by a VI that links into <vilib> running
 //!   on the venv's LabVIEW and not on the plain one; dependency-aware uninstall.
 //! - `public`: real packages (LUnit and G-Image) from the public indexes. A
-//!   headless install with hooks, every recorded file on disk, relink, an
+//!   headless install that skips the hooks, every recorded file on disk, relink, an
 //!   uninstall after which the LabVIEW tree is as it was, and the same set
 //!   relinked into a venv, which must leave the tree alone.
 //!
@@ -234,7 +234,7 @@ fn run_suite(run: &Run, suite: Suite) -> Result<bool> {
     }
     match suite {
         Suite::Local => fixtures::local(&work)?,
-        Suite::Public => fixtures::public(&work, &run.packages, &public::SKIP_HOOKS)?,
+        Suite::Public => fixtures::public(&work, &run.packages)?,
     }
 
     // The image's own process isolation by default: a GitHub-hosted
