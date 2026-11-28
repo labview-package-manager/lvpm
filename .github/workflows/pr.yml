@@ -193,6 +193,59 @@ jobs:
         shell: bash
         run: '[ ! -f out/summary.md ] || cat out/summary.md >> "$GITHUB_STEP_SUMMARY"'
 
+  # Upstream's e2e runner (e2e/, lvpm-e2e): its local and public suites, each
+  # in a fresh container of NI's image, on both platforms. See docs/linux.md.
+  upstream-e2e:
+    name: upstream-e2e (${{ matrix.os }})
+    needs: [build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, runner: ubuntu-latest, image: "nationalinstruments/labview:2026q3-linux" }
+          - { os: windows, runner: windows-2022, image: "nationalinstruments/labview:2026q3-windows" }
+    env:
+      IMAGE: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lvpm-${{ matrix.os }}
+          path: bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: lvpm-e2e-${{ matrix.os }}
+          path: bin
+      - name: Check disk space for the image
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $free = [int]((Get-PSDrive C).Free / 1GB)
+          "C: has $free GB free"
+          if ($free -lt 25) { "::error::infrastructure: $free GB free, need 25"; exit 1 }
+      - name: Start the Docker engine
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          Start-Service docker
+          docker version
+      - name: Pull ${{ matrix.image }}
+        shell: bash
+        timeout-minutes: 50
+        run: |
+          for i in 1 2 3; do
+            docker pull "$IMAGE" && exit 0
+            [ $i = 3 ] || sleep 30
+          done
+          echo "::error::infrastructure: image could not be pulled: $IMAGE"; exit 1
+      - name: lvpm-e2e run
+        shell: bash
+        run: |
+          exe=$([ "${{ matrix.os }}" = windows ] && echo .exe || true)
+          chmod +x bin/lvpm$exe bin/lvpm-e2e$exe
+          bin/lvpm-e2e$exe run --image "$IMAGE" --lvpm "bin/lvpm$exe"
+
   lint:
     name: lint
     needs: [changes]
@@ -225,7 +278,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, test, build, e2e, lint]
+    needs: [changes, test, build, e2e, upstream-e2e, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

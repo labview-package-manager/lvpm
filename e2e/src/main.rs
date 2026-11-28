@@ -28,8 +28,8 @@
 //! later one alone fails for want of an earlier one.
 //!
 //! The image must be for the host's OS, as this executable runs in it. On
-//! Linux both executables must be static (x86_64-unknown-linux-musl): NI's
-//! image is older than a runner's glibc.
+//! Linux both executables must start on the image's glibc (Ubuntu 22.04):
+//! build them there, as build.yml does, or static (x86_64-unknown-linux-musl).
 
 // The runner is a front end, not core: it reads the environment it runs in.
 #![allow(clippy::disallowed_methods)]
@@ -234,7 +234,7 @@ fn run_suite(run: &Run, suite: Suite) -> Result<bool> {
     }
     match suite {
         Suite::Local => fixtures::local(&work)?,
-        Suite::Public => fixtures::public(&work, &run.packages)?,
+        Suite::Public => fixtures::public(&work, &run.packages, &public::SKIP_HOOKS)?,
     }
 
     // The image's own process isolation by default: a GitHub-hosted

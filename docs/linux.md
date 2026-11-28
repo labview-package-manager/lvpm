@@ -5,8 +5,8 @@ the Windows IDE: files copied, then relinked and hooks run over VI Server.
 Everything below was measured on 2026-09-26 against NI's container image
 `nationalinstruments/labview:2026q3-linux` (LabVIEW 2026 Q3, Ubuntu 22.04).
 The end-to-end runner in [e2e/](../e2e/src/main.rs) repeats every check in a
-throwaway container in about two and a half minutes. In this fork CI does
-not run it yet (see [CI](#ci)).
+throwaway container in about two and a half minutes. PR CI runs it on Linux
+and Windows (see [CI](#ci)).
 
 ## Building
 
@@ -116,20 +116,19 @@ root.
 
 ## CI
 
-> **This fork (2026-10-30).** Upstream runs `lvpm-e2e` from its `build.yml`;
-> this fork kept its own workflows, which do not run it yet.
-
-- [pr.yml](../.github/workflows/pr.yml), on pull requests to `main`:
+- [pr.yml](../.github/workflows/pr.yml), on pull requests to `main` and `integration/fork`:
   `cargo test --workspace` on `windows-2022` and `ubuntu-latest`; the release
   build ([build.yml](../.github/workflows/build.yml), `windows-2022` /
   `ubuntu-22.04`) and packaging; the smoke flow from `ci/e2e/` in NI's Linux
   and Windows images; the `@labview` acceptance scenarios in the Windows image
-  only; lint.
+  only; `lvpm-e2e run` (job `upstream-e2e`: the `local` and `public` suites)
+  in `nationalinstruments/labview:2026q3-linux` on `ubuntu-latest` and
+  `2026q3-windows` on `windows-2022`; lint. Both executables come from
+  build.yml; on Linux its Ubuntu 22.04 glibc is the image's.
 - [release.yml](../.github/workflows/release.yml), on pushes to `main`: when
   the version is not tagged yet, the same build, packaging and publishing.
 
-Running `lvpm-e2e` in CI (its `local` and `public` suites, on both
-platforms) is still to do. There is no mass compile: a bad VI in a
+The e2e suites run no mass compile: a bad VI in a
 third-party package (LUnit ships one on purpose) or in LabVIEW's own
 templates says nothing about lvpm.
 

@@ -8,7 +8,7 @@ expect() { # expect <0|1> <name> <docs-only> <needs JSON>
   if [ "$got" = "$1" ]; then echo "ok   $1 $2"; else echo "FAIL want $1 got $got: $2"; failures=$((failures+1)); fi
 }
 pass='{"changes":{"result":"success"},"test":{"result":"success"},"build":{"result":"success"}}'
-docs='{"changes":{"result":"success"},"test":{"result":"success"},"build":{"result":"skipped"},"e2e":{"result":"skipped"}}'
+docs='{"changes":{"result":"success"},"test":{"result":"success"},"build":{"result":"skipped"},"e2e":{"result":"skipped"},"upstream-e2e":{"result":"skipped"}}'
 expect 0 "every job passed" false "$pass"
 expect 0 "every job passed on a docs-only PR" true "$pass"
 expect 0 "a docs-only PR with skipped jobs" true "$docs"

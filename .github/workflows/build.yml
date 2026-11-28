@@ -82,6 +82,18 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           overwrite: true
+      # The e2e runner (pr.yml's upstream-e2e) runs inside NI's image too, so
+      # it is built here, on the same glibc as lvpm.
+      - name: cargo build --release -p lvpm-e2e
+        run: cargo build --release --locked -p lvpm-e2e
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lvpm-e2e-${{ matrix.os }}
+          path: target/release/lvpm-e2e${{ matrix.os == 'windows' && '.exe' || '' }}
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
       # CARGO_MANIFEST_DIR and CARGO_BIN_EXE_lvpm are fixed at compile time, so
       # the tests are built at the path the container mounts them at.
       - name: Build the acceptance tests at C:\src\lvpm

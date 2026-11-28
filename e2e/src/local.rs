@@ -85,6 +85,10 @@ pub fn trials() -> Vec<Trial> {
             uninstall_project_dependencies,
         ),
         (
+            "install and uninstall by name edit lvpm.toml",
+            install_saves_to_manifest,
+        ),
+        (
             "uninstall: a venv bound to vipm.toml protects its dependencies",
             uninstall_vipm_manifest,
         ),
@@ -189,7 +193,12 @@ fn install_records() -> Check {
 fn backslashed_target_dir() -> Check {
     ok(
         &global(),
-        &["install", "lvpm_linux_relink_test", "--relink"],
+        &[
+            "install",
+            "lvpm_linux_relink_test",
+            "--relink",
+            "--no-project",
+        ],
     )?;
     exists(&lv("vi.lib/lvpm_linux_relink_test/sub/Relink Packages.vi"))
 }
@@ -393,8 +402,14 @@ fn uninstall_setup() -> Check {
         &ok(&venv(), &["venv", "status"])?,
         "not running on this venv",
     )?;
-    ok(&venv(), &["install", "lvpm_e2e_root", "--no-relink"])?;
-    ok(&venv(), &["install", "lvpm_e2e_other", "--no-relink"])?;
+    ok(
+        &venv(),
+        &["install", "lvpm_e2e_root", "--no-relink", "--no-project"],
+    )?;
+    ok(
+        &venv(),
+        &["install", "lvpm_e2e_other", "--no-relink", "--no-project"],
+    )?;
     for (name, dependency) in [
         ("lvpm_e2e_root", Some("lvpm_e2e_private")),
         ("lvpm_e2e_private", Some("lvpm_e2e_shared")),
@@ -433,7 +448,11 @@ fn uninstall_keep_dependencies() -> Check {
     absent(&addon("lvpm_e2e_root")?)?;
     exists(&record("lvpm_e2e_private")?)?;
     exists(&record("lvpm_e2e_shared")?)?;
-    ok(&venv(), &["install", "lvpm_e2e_root", "--no-relink"]).map(drop)
+    ok(
+        &venv(),
+        &["install", "lvpm_e2e_root", "--no-relink", "--no-project"],
+    )
+    .map(drop)
 }
 
 fn uninstall_shared_dependencies() -> Check {
@@ -487,7 +506,10 @@ fn uninstall_required_package() -> Check {
 }
 
 fn uninstall_legacy_records() -> Check {
-    ok(&venv(), &["install", "lvpm_e2e_root", "--no-relink"])?;
+    ok(
+        &venv(),
+        &["install", "lvpm_e2e_root", "--no-relink", "--no-project"],
+    )?;
     let path = record("lvpm_e2e_other")?;
     let original = std::fs::read(&path).map_err(fail)?;
     let result = (|| {
@@ -542,7 +564,10 @@ fn uninstall_project_dependencies() -> Check {
                 format!("{original}\n[dependency-groups.test]\nlvpm_e2e_private = \"*\"\n")
             };
             std::fs::write(&path, manifest).map_err(fail)?;
-            ok(&venv(), &["install", "lvpm_e2e_root", "--no-relink"])?;
+            ok(
+                &venv(),
+                &["install", "lvpm_e2e_root", "--no-relink", "--no-project"],
+            )?;
             let result = ok(
                 &venv(),
                 &["uninstall", "lvpm_e2e_root", "--with-deps", "--no-project"],
@@ -574,6 +599,80 @@ fn uninstall_project_dependencies() -> Check {
     result
 }
 
+/// A named install and uninstall in a project edit lvpm.toml, lock and sync
+/// (#54); `--group` writes [dependency-groups.<name>] (#45).
+fn install_saves_to_manifest() -> Check {
+    let path = venv().join("lvpm.toml");
+    let lock = venv().join("lvpm.lock");
+    let original = std::fs::read_to_string(&path).map_err(fail)?;
+    let original_lock = std::fs::read(&lock).ok();
+    let result = (|| {
+        let saved = ok(&venv(), &["install", "lvpm_e2e_root", "--no-relink"])?;
+        contains(&saved, "lvpm.toml: added lvpm_e2e_root = ")?;
+        let manifest = std::fs::read_to_string(&path).map_err(fail)?;
+        ensure(manifest.contains("lvpm_e2e_root = "), || {
+            format!("not saved:\n{manifest}")
+        })?;
+        ensure(
+            manifest.starts_with(original.lines().next().unwrap_or_default()),
+            || format!("the manifest's first line changed:\n{manifest}"),
+        )?;
+        exists(&record("lvpm_e2e_root")?)?;
+        ok(
+            &venv(),
+            &[
+                "install",
+                "lvpm_e2e_other",
+                "--no-relink",
+                "--group",
+                "test",
+            ],
+        )?;
+        let manifest = std::fs::read_to_string(&path).map_err(fail)?;
+        ensure(manifest.contains("[dependency-groups.test]"), || {
+            format!("no test group:\n{manifest}")
+        })?;
+        let removed = ok(&venv(), &["uninstall", "lvpm_e2e_root", "--no-relink"])?;
+        contains(&removed, "lvpm.toml: removed lvpm_e2e_root = ")?;
+        let manifest = std::fs::read_to_string(&path).map_err(fail)?;
+        ensure(!manifest.contains("lvpm_e2e_root"), || {
+            format!("still declared:\n{manifest}")
+        })?;
+        absent(&record("lvpm_e2e_root")?)?;
+        absent(&record("lvpm_e2e_private")?)?;
+        let removed = ok(
+            &venv(),
+            &[
+                "uninstall",
+                "lvpm_e2e_other",
+                "--group",
+                "test",
+                "--no-relink",
+            ],
+        )?;
+        contains(
+            &removed,
+            r#"lvpm\.toml: removed lvpm_e2e_other = ".*" \[dependency-groups\.test\]"#,
+        )?;
+        let manifest = std::fs::read_to_string(&path).map_err(fail)?;
+        ensure(!manifest.contains("lvpm_e2e_other"), || {
+            format!("still declared:\n{manifest}")
+        })?;
+        absent(&record("lvpm_e2e_other")?)
+    })();
+    let cleanup = (|| {
+        std::fs::write(&path, original).map_err(fail)?;
+        match original_lock {
+            Some(bytes) => std::fs::write(&lock, bytes).map_err(fail)?,
+            None => drop(std::fs::remove_file(&lock)),
+        }
+        // The syncs installed the project's own package too; the next checks
+        // start from an empty venv.
+        ok(&venv(), &["uninstall", "--all"]).map(drop)
+    })();
+    result.and(cleanup)
+}
+
 fn uninstall_vipm_manifest() -> Check {
     let dir = env().work.join("vipm-venv");
     std::fs::create_dir_all(&dir).map_err(fail)?;
@@ -585,7 +684,10 @@ fn uninstall_vipm_manifest() -> Check {
     .map_err(fail)?;
     ok(&dir, &["venv", "create", "--manifest", "vipm.toml"])?;
     // This fork's install has no --manifest: the venv bound to vipm.toml is the destination.
-    ok(&dir, &["install", "lvpm_e2e_root", "--no-relink"])?;
+    ok(
+        &dir,
+        &["install", "lvpm_e2e_root", "--no-relink", "--no-project"],
+    )?;
     let result = ok(
         &dir,
         &["uninstall", "lvpm_e2e_root", "--with-deps", "--no-project"],
