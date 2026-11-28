@@ -6,8 +6,9 @@
   package VI edited or resaved by mistake cannot be repaired that way;
   `lvpm uninstall` and then `lvpm install` does it.
 - Dependency conflicts are solved only when a project is locked. A named
-  install outside a project still lets the first resolution of a name win,
-  and a floor resolves to the newest version satisfying it.
+  install outside a project resolves greedily, with no backtracking: each name
+  takes the newest version satisfying the highest floor asked of it, so a
+  conflict the solver would settle can still fail.
 - No mass compile; LabVIEW recompiles installed VIs on first load.
 - Install hooks are off by default and the allowlist is by package name, not
   by VI: allowing a package allows every hook VI it ships, and a hook runs

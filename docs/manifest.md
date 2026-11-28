@@ -402,9 +402,10 @@ pass:
 
 - Each root asks for what its constraint says. A dependency declared by a
   package's own spec is always treated as a floor.
-- Resolution is depth-first from all roots at once, with no backtracking: the
-  first resolution of a name wins. Pin a version exactly in the manifest when
-  a transitive floor would otherwise pick something you do not want.
+- Resolution is depth-first from all roots at once, with no backtracking:
+  each name resolves once, to the newest version satisfying the highest floor
+  any package in the plan asks of it. Pin a version exactly in the manifest
+  when a transitive floor would otherwise pick something you do not want.
 - A transitive dependency that is already installed at a version satisfying
   its floor is left alone. A root always resolves to what the index says, and
   the installer then decides whether that is a no-op, an upgrade, or a refused

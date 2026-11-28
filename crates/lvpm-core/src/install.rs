@@ -191,11 +191,25 @@ pub fn is_installed(roots: &Roots, name: &str) -> bool {
     manifest_path(roots, name).exists()
 }
 
+/// The install record of `name`, or `None` when it is not installed. Only a
+/// missing file is `None`: a record that cannot be read or parsed is an error.
+pub fn read_manifest_if_present(roots: &Roots, name: &str) -> Result<Option<Manifest>> {
+    let p = manifest_path(roots, name);
+    match std::fs::read_to_string(&p) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .with_context(|| format!("{} is not a valid install record", p.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
+    }
+}
+
 pub fn read_manifest(roots: &Roots, name: &str) -> Result<Manifest> {
     let p = manifest_path(roots, name);
     let text = std::fs::read_to_string(&p)
         .with_context(|| format!("{name} is not installed in this target ({})", p.display()))?;
-    Ok(serde_json::from_str(&text)?)
+    serde_json::from_str(&text)
+        .with_context(|| format!("{} is not a valid install record", p.display()))
 }
 
 /// Records written before lvpm kept a dependency list. Uninstall cannot say

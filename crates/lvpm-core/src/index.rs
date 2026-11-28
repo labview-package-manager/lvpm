@@ -69,6 +69,13 @@ impl Floor {
         }
     }
 
+    /// Whether `self` asks for more than `other`: a higher version, or the
+    /// same one exclusive where `other` is inclusive.
+    pub fn exceeds(&self, other: &Floor) -> bool {
+        self.version > other.version
+            || (self.version == other.version && self.exclusive && !other.exclusive)
+    }
+
     pub fn admits(&self, candidate: &Version) -> bool {
         if self.exclusive {
             candidate > &self.version
@@ -1327,6 +1334,19 @@ mod tests {
     use crate::ops::testing::CancelOn;
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn an_exclusive_floor_exceeds_an_inclusive_one_at_the_same_version() {
+        let at = |v: &str, exclusive| Floor {
+            version: Version::parse(v),
+            exclusive,
+        };
+        assert!(at("1", true).exceeds(&at("1", false)));
+        assert!(!at("1", false).exceeds(&at("1", true)));
+        assert!(!at("1", false).exceeds(&at("1", false)));
+        assert!(at("2", false).exceeds(&at("1", true)));
+        assert!(!at("1", true).exceeds(&at("2", false)));
+    }
 
     #[test]
     fn a_github_entry_names_its_repo_and_no_other_entry_does() {

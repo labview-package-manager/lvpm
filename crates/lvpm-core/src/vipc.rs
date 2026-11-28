@@ -7,7 +7,7 @@ use crate::index::entry_from_bytes;
 use crate::lvpkg::check_name;
 use crate::ops::init::{Embedded, Seed};
 use crate::project::same_name;
-use crate::version::{Version, is_version};
+use crate::version::{Version, is_version, split_id};
 use anyhow::{Result, anyhow};
 use std::fs::File;
 use std::io::{Read, Seek};
@@ -128,9 +128,14 @@ fn target(xml: &str) -> Result<&str, String> {
 
 fn package(block: &str) -> Result<Package, String> {
     let full = field(block, "Name", "package: ")?;
-    let (name, version) = full
-        .rsplit_once('-')
+    // Not the last '-': an OGPM release suffix (`-1.1-1`) belongs to the version.
+    // Failing that, the last '-', so the error names what is not a version.
+    let (name, version) = split_id(full)
+        .map(|(n, v)| (n, v.raw))
+        .filter(|(_, v)| is_version(v))
+        .or_else(|| full.rsplit_once('-').map(|(n, v)| (n.into(), v.into())))
         .ok_or_else(|| format!("package {full}: no version (expected name-version)"))?;
+    let (name, version) = (name.as_str(), version.as_str());
     if !is_version(version) {
         return Err(format!("package {full}: {version} is not a version"));
     }
@@ -1028,7 +1033,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fork bug: a <Name> like jki_rsc_toolkits_palette-1.1-1 is split at its last '-', not by version::split_id; see #56"]
     fn an_ogpm_release_suffix_stays_on_the_version() {
         // Upstream's included_packages_come_out_of_the_vipc_with_their_bytes, first package.
         let dir = Dir::new("upstream-ogpm-suffix");
