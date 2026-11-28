@@ -1,0 +1,2 @@
+Error: pick a destination: --global [--labview-version <YYYY>] for LabVIEW itself, --prefix <DIR> for a scratch tree, or run inside a project that has a venv (`lvpm venv create`)
+hint: `lvpm targets` lists detected LabVIEW installations

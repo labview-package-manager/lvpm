@@ -95,7 +95,10 @@ impl Drop for Lab {
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// Answers one request with `body`, then closes, so a later request fails.
@@ -108,7 +111,9 @@ fn releases_server(body: &str) -> (String, JoinHandle<()>) {
     );
     let thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut request = Vec::new();
         while !request.ends_with(b"\r\n\r\n") {
             let mut byte = [0];
@@ -129,7 +134,10 @@ fn a_cached_newer_release_is_shown_in_a_terminal_and_respects_opt_outs() {
     let notice = format!("{NOTICE}: {} -> 9999.0.0", env!("CARGO_PKG_VERSION"));
     assert_eq!(stderr.matches(&notice).count(), 1, "{stderr}");
     has(&stderr, "Run the installation script again");
-    has(&stderr, "https://github.com/labview-package-manager/lvpm/releases");
+    has(
+        &stderr,
+        "https://github.com/labview-package-manager/lvpm/releases",
+    );
 
     for env in [
         ("LVPM_NO_UPDATE_CHECK", "1"),
@@ -137,7 +145,10 @@ fn a_cached_newer_release_is_shown_in_a_terminal_and_respects_opt_outs() {
         ("CI", "1"),
         ("LV_RTE_HEADLESS", "1"),
     ] {
-        lacks(&lab.interactive(&["config", "get", "cache"], &[env]), NOTICE);
+        lacks(
+            &lab.interactive(&["config", "get", "cache"], &[env]),
+            NOTICE,
+        );
     }
     for arg in ["--help", "--version"] {
         lacks(&lab.interactive(&[arg], &[]), NOTICE);
@@ -150,7 +161,10 @@ fn a_cached_newer_release_is_shown_in_a_terminal_and_respects_opt_outs() {
 fn a_failed_command_shows_no_notice() {
     let lab = Lab::new("failed");
     lab.write_cache(now(), "9999.0.0");
-    let out = lab.run(&["config", "get", "no-such-key"], &[("LVPM_TEST_TERMINAL", "1")]);
+    let out = lab.run(
+        &["config", "get", "no-such-key"],
+        &[("LVPM_TEST_TERMINAL", "1")],
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{out:?}");
     has(&stderr, "unknown config key");
@@ -161,7 +175,11 @@ fn a_failed_command_shows_no_notice() {
 fn redirected_commands_neither_check_nor_notify() {
     let lab = Lab::new("redirected");
     let state = lab.write_cache(0, "9999.0.0");
-    for args in [vec!["config", "get", "cache"], vec!["--help"], vec!["--version"]] {
+    for args in [
+        vec!["config", "get", "cache"],
+        vec!["--help"],
+        vec!["--version"],
+    ] {
         let out = lab.run(&args, &[]);
         assert!(out.status.success(), "{args:?}: {out:?}");
         assert!(out.stderr.is_empty(), "{args:?}: {out:?}");

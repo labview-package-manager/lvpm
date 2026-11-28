@@ -1,0 +1,751 @@
+//! A loopback HTTP server standing in for every feed lvpm can reach.
+//!
+//! It answers direct requests (`GET /path`) and absolute-form proxy requests
+//! (`GET http://download.ni.com/path`), routing on the path alone, so a child
+//! process pointed at it with `HTTP_PROXY` never leaves the machine. It serves
+//! a fixture `index.vipr` for a project's `[sources]` entry, bodies for the two
+//! public default feeds, and the package archives those feeds point at. Every
+//! response carries one fixed `ETag`; a request presenting it gets `304`.
+
+use crate::fixtures::FixturePackage;
+#[cfg(test)]
+use crate::http::{Reply, SOCKET_TIMEOUT, get_from};
+use crate::http::{Request, accept, accept_loop, response, shut_down};
+use md5::{Digest, Md5};
+use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::io::Read;
+use std::io::Write;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+pub const FEED_ETAG: &str = "\"lvpm-fixture-feed\"";
+/// The project `[sources]` entry points at `<server>/feed`.
+pub const PROJECT_FEED_DIR: &str = "/feed/";
+/// The default feeds' paths on `download.ni.com` and `www.jkisoft.com`.
+pub const NI_FEED_DIR: &str = "/evaluation/labview/lvtn/vipm/";
+pub const JKI_FEED_INDEX: &str = "/packages/jkisoft.ogpd";
+/// Feeds whose archives are broken in the ways a real server's can be.
+pub const FAULTY_FEED_DIR: &str = "/faulty/";
+/// A feed with one package, `broken_zip` 1.0, whose archive is not a zip.
+pub const BROKEN_FEED_DIR: &str = "/broken/";
+const BROKEN_ARCHIVE_ID: &str = "broken_zip-1.0";
+/// A feed listing more packages than `lvpm search` prints.
+pub const CATALOG_FEED_DIR: &str = "/catalog/";
+/// How many packages the catalog feed lists: more than search's cap of 40.
+pub const CATALOG_SIZE: usize = 45;
+/// A feed under this directory takes each request and closes the connection
+/// unanswered, as one that has hung up does.
+pub const SILENT_FEED_DIR: &str = "/silent/";
+const _: () = assert!(
+    CATALOG_SIZE > 40,
+    "the catalog must exceed search's cap of 40"
+);
+/// Where a listing's `Package.URL` points, relative to the listing's folder.
+const ARCHIVE_SUBDIR: &str = "packages/";
+const INDEX_FILE: &str = "index.vipr";
+
+/// An archive in the faulty feed: what its listing promises (the MD5 of
+/// `promised`) and what the server then does (`served`, or a 404 when `None`).
+struct FaultyArchive {
+    id: &'static str,
+    promised: &'static [u8],
+    served: Option<&'static [u8]>,
+}
+
+pub const NOT_AN_ARCHIVE: &[u8] = b"these bytes are not a zip archive";
+const FAULTY_ARCHIVES: &[FaultyArchive] = &[
+    // The MD5 matches what is served, which is not an archive.
+    FaultyArchive {
+        id: "corrupt-1.0",
+        promised: NOT_AN_ARCHIVE,
+        served: Some(NOT_AN_ARCHIVE),
+    },
+    // What is served is not what the listing's MD5 promised.
+    FaultyArchive {
+        id: "tampered-1.0",
+        promised: b"the archive the listing promised",
+        served: Some(b"another archive entirely"),
+    },
+    // Listed, but the server has nothing at the archive's path.
+    FaultyArchive {
+        id: "missing-1.0",
+        promised: b"never served",
+        served: None,
+    },
+];
+
+type Routes = HashMap<String, Vec<u8>>;
+/// The ETag of each path [`Feed::revise`] changed; every other path has
+/// [`FEED_ETAG`].
+type Etags = Arc<Mutex<HashMap<String, String>>>;
+type Hits = Arc<Mutex<BTreeMap<String, usize>>>;
+
+/// How long a held archive request waits for its release, and how long a test
+/// waits for a request to be held: a safety net, never what a test relies on.
+const HOLD_LIMIT: Duration = Duration::from_secs(10);
+
+/// Holds the answer to a request, once armed, until released. The
+/// feed answers one connection at a time, so one held request holds the feed.
+#[derive(Debug, Default)]
+struct Pause {
+    state: Mutex<PauseState>,
+    changed: Condvar,
+}
+
+/// What the feed holds: archive and listing requests, each on its own.
+#[derive(Debug, Default)]
+struct Pauses {
+    archive: Pause,
+    listing: Pause,
+}
+
+#[derive(Debug, Default)]
+struct PauseState {
+    /// Requests are held.
+    armed: bool,
+    /// A request is being held now.
+    held: bool,
+}
+
+impl Pause {
+    fn arm(&self) {
+        self.state.lock().expect("the pause").armed = true;
+    }
+
+    fn release(&self) {
+        self.state.lock().expect("the pause").armed = false;
+        self.changed.notify_all();
+    }
+
+    /// Called by the server with an archive request in hand: returns once the
+    /// request may be answered.
+    fn hold(&self) {
+        let mut state = self.state.lock().expect("the pause");
+        if !state.armed {
+            return;
+        }
+        state.held = true;
+        self.changed.notify_all();
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, HOLD_LIMIT, |state| state.armed)
+            .expect("the pause");
+        state.held = false;
+    }
+
+    fn wait_until_held(&self) {
+        let state = self.state.lock().expect("the pause");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, HOLD_LIMIT, |state| !state.held)
+            .expect("the pause");
+        // Unlocked first: a panic holding it would poison the pause for the feed thread.
+        let held = state.held;
+        drop(state);
+        assert!(held, "no archive request was held");
+    }
+}
+
+#[derive(Debug)]
+pub struct Feed {
+    addr: SocketAddr,
+    routes: Arc<Mutex<Routes>>,
+    etags: Etags,
+    hits: Hits,
+    stop: Arc<AtomicBool>,
+    /// While set, every archive answers 503 and the listings still answer.
+    archives_refused: Arc<AtomicBool>,
+    /// Once set, nothing is answered: each connection is closed unread.
+    down: Arc<AtomicBool>,
+    pauses: Arc<Pauses>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Feed {
+    /// Start serving `packages` on an ephemeral loopback port.
+    pub fn start(packages: &[FixturePackage]) -> Feed {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let addr = listener.local_addr().expect("bound address");
+        let routes = Arc::new(Mutex::new(routes(packages)));
+        let etags = Etags::default();
+        let hits = Hits::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let archives_refused = Arc::new(AtomicBool::new(false));
+        let down = Arc::new(AtomicBool::new(false));
+        let pauses = Arc::new(Pauses::default());
+        let thread = {
+            let (hits, stop) = (hits.clone(), stop.clone());
+            let (refused, down) = (archives_refused.clone(), down.clone());
+            let (routes, etags, pauses) = (routes.clone(), etags.clone(), pauses.clone());
+            std::thread::spawn(move || {
+                serve(
+                    listener,
+                    (&routes, &etags),
+                    &hits,
+                    &stop,
+                    &refused,
+                    &down,
+                    &pauses,
+                )
+            })
+        };
+        Feed {
+            addr,
+            routes,
+            etags,
+            hits,
+            stop,
+            archives_refused,
+            down,
+            pauses,
+            thread: Some(thread),
+        }
+    }
+
+    /// `127.0.0.1:port`, as it appears inside URLs.
+    pub fn origin(&self) -> String {
+        self.addr.to_string()
+    }
+
+    /// The value for a project's `[sources]` entry serving `dir`.
+    pub fn source_url(&self, dir: &str) -> String {
+        format!("http://{}{}", self.addr, dir.trim_end_matches('/'))
+    }
+
+    /// The `[sources]` entry for the feed of fixture packages.
+    pub fn project_source_url(&self) -> String {
+        self.source_url(PROJECT_FEED_DIR)
+    }
+
+    /// From now on the feed in `dir` lists what `listing` says, an
+    /// `index.vipr` body. It serves no archive for it. The ETag stays the
+    /// same, so a client that cached the old listing keeps it.
+    pub fn publish(&self, dir: &str, listing: &str) {
+        let mut routes = self.routes.lock().expect("the routes");
+        routes.insert(index_path(dir), listing.as_bytes().to_vec());
+    }
+
+    /// [`Feed::publish`], with a new ETag, as a feed whose listing changed
+    /// answers: a client revalidating its cached listing gets this one.
+    pub fn revise(&self, dir: &str, listing: &str) {
+        self.publish(dir, listing);
+        static REVISIONS: AtomicUsize = AtomicUsize::new(1);
+        let revision = REVISIONS.fetch_add(1, Ordering::Relaxed);
+        let mut etags = self.etags.lock().expect("the ETags");
+        etags.insert(index_path(dir), format!("\"lvpm-fixture-feed-{revision}\""));
+    }
+
+    /// From now on `path` answers `bytes`.
+    pub fn serve(&self, path: &str, bytes: Vec<u8>) {
+        let mut routes = self.routes.lock().expect("the routes");
+        routes.insert(path.to_string(), bytes);
+    }
+
+    /// The value for `HTTP_PROXY`.
+    pub fn proxy_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// From now on the feed lists its packages and serves none of them, as a
+    /// source whose archives have gone away does.
+    pub fn refuse_archives(&self) {
+        self.archives_refused.store(true, Ordering::SeqCst);
+    }
+
+    /// From now on the feed serves its archives again, after
+    /// [`Feed::refuse_archives`].
+    pub fn accept_archives(&self) {
+        self.archives_refused.store(false, Ordering::SeqCst);
+    }
+
+    /// From now on the feed answers nothing, listings and archives alike, as
+    /// one that has stopped does: every connection is closed unanswered, and
+    /// none counts as a request.
+    pub fn go_down(&self) {
+        self.down.store(true, Ordering::SeqCst);
+    }
+
+    /// From now on the feed answers again, after [`Feed::go_down`].
+    pub fn come_up(&self) {
+        self.down.store(false, Ordering::SeqCst);
+    }
+
+    /// From now on the feed takes a listing request and holds its answer until
+    /// [`Feed::release`], as a feed that is slow to answer does.
+    pub fn pause_listings(&self) {
+        self.pauses.listing.arm();
+    }
+
+    /// From now on the feed takes an archive request and holds its answer, as
+    /// a slow download does, until [`Feed::release`]. Listings are not held.
+    pub fn pause_archives(&self) {
+        self.pauses.archive.arm();
+    }
+
+    /// Block until an archive request is being held.
+    pub fn wait_for_held_archive(&self) {
+        self.pauses.archive.wait_until_held();
+    }
+
+    /// Answer what is held, and every request after it.
+    pub fn release(&self) {
+        self.pauses.archive.release();
+        self.pauses.listing.release();
+    }
+
+    /// How many requests this path has received, including `304`s.
+    pub fn hits(&self, path: &str) -> usize {
+        self.hits
+            .lock()
+            .expect("hit counter")
+            .get(path)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl Drop for Feed {
+    fn drop(&mut self) {
+        // A request still held would keep the thread from seeing `stop`.
+        self.release();
+        shut_down(self.addr, &self.stop, self.thread.take());
+    }
+}
+
+pub fn index_path(dir: &str) -> String {
+    format!("{dir}{INDEX_FILE}")
+}
+
+pub fn archive_path(dir: &str, file_name: &str) -> String {
+    format!("{dir}{ARCHIVE_SUBDIR}{file_name}")
+}
+
+fn routes(packages: &[FixturePackage]) -> Routes {
+    let mut routes = Routes::new();
+    let vipr = listing(packages, true);
+    for dir in [PROJECT_FEED_DIR, NI_FEED_DIR] {
+        routes.insert(index_path(dir), vipr.clone().into_bytes());
+        for package in packages {
+            routes.insert(archive_path(dir, &package.file_name()), package.build_vip());
+        }
+    }
+    // JKI's real feed is a package directory; the fixture one lists nothing.
+    routes.insert(JKI_FEED_INDEX.to_string(), listing(&[], false).into_bytes());
+    routes.insert(index_path(CATALOG_FEED_DIR), catalog_listing().into_bytes());
+    routes.insert(index_path(FAULTY_FEED_DIR), faulty_listing().into_bytes());
+    routes.insert(index_path(BROKEN_FEED_DIR), broken_listing().into_bytes());
+    routes.insert(
+        archive_path(BROKEN_FEED_DIR, &format!("{BROKEN_ARCHIVE_ID}.vip")),
+        NOT_AN_ARCHIVE.to_vec(),
+    );
+    for archive in FAULTY_ARCHIVES {
+        if let Some(bytes) = archive.served {
+            routes.insert(
+                archive_path(FAULTY_FEED_DIR, &format!("{}.vip", archive.id)),
+                bytes.to_vec(),
+            );
+        }
+    }
+    routes
+}
+
+/// `CATALOG_SIZE` packages named `bulk_package_NN`, none with an archive.
+fn catalog_listing() -> String {
+    let mut body = String::from("; lvpm acceptance fixture: a catalog larger than search prints\n");
+    for number in 1..=CATALOG_SIZE {
+        let id = format!("bulk_package_{number:02}-1.0");
+        body.push_str(&format!(
+            "\n[Package {id}]\nPackage.URL={ARCHIVE_SUBDIR}{id}.vip\n"
+        ));
+        body.push_str(&format!("Package.Display Name=Bulk Package {number:02}\n"));
+    }
+    body
+}
+
+fn faulty_listing() -> String {
+    let mut body = String::from("; lvpm acceptance fixture: archives that cannot be installed\n");
+    for FaultyArchive { id, promised, .. } in FAULTY_ARCHIVES {
+        body.push_str(&format!(
+            "\n[Package {id}]\nPackage.URL={ARCHIVE_SUBDIR}{id}.vip\n"
+        ));
+        body.push_str(&format!(
+            "Package.MD5={}\nPackage.Display Name={id}\n",
+            md5_hex(promised)
+        ));
+    }
+    body
+}
+
+/// `broken_zip` 1.0: a valid entry, with the MD5 of the bytes the server
+/// serves, which are not a zip archive.
+fn broken_listing() -> String {
+    format!(
+        "; lvpm acceptance fixture: an archive that is listed and served but is not a zip\n\n\
+         [Package {BROKEN_ARCHIVE_ID}]\nPackage.URL={ARCHIVE_SUBDIR}{BROKEN_ARCHIVE_ID}.vip\n\
+         Package.MD5={}\nPackage.Display Name={BROKEN_ARCHIVE_ID}\n",
+        md5_hex(NOT_AN_ARCHIVE)
+    )
+}
+
+/// An `index.vipr` (with `Package.MD5`) or an `.ogpd` (without) listing.
+pub fn listing(packages: &[FixturePackage], with_md5: bool) -> String {
+    let mut body = String::from("; lvpm acceptance fixture\n");
+    for package in packages {
+        body.push_str(&format!(
+            "\n[Package {}]\nPackage.URL={ARCHIVE_SUBDIR}{}\n",
+            package.id(),
+            package.file_name()
+        ));
+        if with_md5 {
+            body.push_str(&format!("Package.MD5={}\n", md5_hex(&package.build_vip())));
+        }
+        body.push_str(&format!("Package.Display Name={}\n", package.display_name));
+        if !package.requires.is_empty() {
+            body.push_str(&format!(
+                "Dependencies.Requires={}\n",
+                package.requires_clause()
+            ));
+        }
+        body.push_str(&format!(
+            "Platform.Exclusive_LabVIEW_Version=LabVIEW>={}\n",
+            package.lv_min
+        ));
+    }
+    body
+}
+
+pub fn md5_hex(bytes: &[u8]) -> String {
+    let mut hash = Md5::new();
+    hash.update(bytes);
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn serve(
+    listener: TcpListener,
+    served: (&Mutex<Routes>, &Etags),
+    hits: &Hits,
+    stop: &AtomicBool,
+    archives_refused: &AtomicBool,
+    down: &AtomicBool,
+    pauses: &Pauses,
+) {
+    accept_loop(listener, stop, |stream| {
+        if down.load(Ordering::SeqCst) {
+            return;
+        }
+        // One bad connection must not take the server down for the rest.
+        handle(stream, served, hits, archives_refused, pauses).ok();
+    });
+}
+
+fn handle(
+    mut stream: TcpStream,
+    (routes, etags): (&Mutex<Routes>, &Etags),
+    hits: &Hits,
+    archives_refused: &AtomicBool,
+    pauses: &Pauses,
+) -> std::io::Result<()> {
+    let request = accept(&mut stream)?;
+    *hits
+        .lock()
+        .expect("hit counter")
+        .entry(request.path.clone())
+        .or_default() += 1;
+    if request.path.starts_with(SILENT_FEED_DIR) {
+        return Ok(());
+    }
+    match request.path.ends_with(".vip") {
+        true => pauses.archive.hold(),
+        false => pauses.listing.hold(),
+    }
+    let refused = archives_refused.load(Ordering::SeqCst) && request.path.ends_with(".vip");
+    let response = match refused {
+        true => response("503 Service Unavailable", &[], b""),
+        false => {
+            let etag = etags.lock().expect("the ETags").get(&request.path).cloned();
+            let etag = etag.as_deref().unwrap_or(FEED_ETAG);
+            respond(&request, &routes.lock().expect("the routes"), etag)
+        }
+    };
+    stream.write_all(&response)
+}
+
+fn respond(request: &Request, routes: &Routes, etag: &str) -> Vec<u8> {
+    if request.method != "GET" {
+        return response("405 Method Not Allowed", &[], b"");
+    }
+    let Some(body) = routes.get(&request.path) else {
+        return response("404 Not Found", &[], b"");
+    };
+    let matched = request.header("if-none-match") == Some(etag);
+    let etag = ("ETag", etag);
+    if matched {
+        return response("304 Not Modified", &[etag], b"");
+    }
+    response(
+        "200 OK",
+        &[etag, ("Content-Type", "application/octet-stream")],
+        body,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixtures::PACKAGES;
+
+    fn get(feed: &Feed, target: &str, extra_headers: &str) -> Reply {
+        get_from(feed.addr, target, extra_headers)
+    }
+
+    fn beta() -> &'static FixturePackage {
+        PACKAGES.iter().find(|p| p.name == "beta").unwrap()
+    }
+
+    #[test]
+    fn a_feed_that_went_down_answers_nothing_and_counts_nothing() {
+        let feed = Feed::start(PACKAGES);
+        feed.go_down();
+        let mut stream = TcpStream::connect(feed.addr).unwrap();
+        stream.set_read_timeout(Some(SOCKET_TIMEOUT)).unwrap();
+        write!(
+            stream,
+            "GET /feed/index.vipr HTTP/1.1\r\nHost: test\r\n\r\n"
+        )
+        .ok();
+        let mut raw = Vec::new();
+        // Closed unanswered: the read ends empty, or is reset.
+        stream.read_to_end(&mut raw).ok();
+        assert!(raw.is_empty(), "{}", String::from_utf8_lossy(&raw));
+        assert_eq!(feed.hits("/feed/index.vipr"), 0);
+    }
+
+    #[test]
+    fn a_direct_request_gets_the_vipr_with_md5s_and_requirements() {
+        let feed = Feed::start(PACKAGES);
+        let reply = get(&feed, "/feed/index.vipr", "");
+        let body = String::from_utf8(reply.body).unwrap();
+        assert_eq!(reply.status_line, "HTTP/1.1 200 OK");
+        assert!(
+            reply.head.contains(&format!("ETag: {FEED_ETAG}")),
+            "{}",
+            reply.head
+        );
+        assert!(body.contains("[Package beta-1.0]"), "{body}");
+        assert!(
+            body.contains(&format!("Package.MD5={}", md5_hex(&beta().build_vip()))),
+            "{body}"
+        );
+        assert!(body.contains("Dependencies.Requires=alpha>=1.0"), "{body}");
+    }
+
+    #[test]
+    fn an_absolute_form_proxy_request_is_routed_by_its_path() {
+        let feed = Feed::start(PACKAGES);
+        let via_proxy = get(
+            &feed,
+            "http://download.ni.com/evaluation/labview/lvtn/vipm/index.vipr",
+            "",
+        );
+        assert_eq!(via_proxy.status_line, "HTTP/1.1 200 OK");
+        assert_eq!(
+            via_proxy.body,
+            get(&feed, "/evaluation/labview/lvtn/vipm/index.vipr", "").body
+        );
+        assert_eq!(feed.hits("/evaluation/labview/lvtn/vipm/index.vipr"), 2);
+    }
+
+    #[test]
+    fn the_jki_feed_is_a_valid_empty_package_directory() {
+        let feed = Feed::start(PACKAGES);
+        let reply = get(&feed, "http://www.jkisoft.com/packages/jkisoft.ogpd", "");
+        assert_eq!(reply.status_line, "HTTP/1.1 200 OK");
+        assert!(!reply.body.is_empty());
+        assert!(!String::from_utf8(reply.body).unwrap().contains("[Package "));
+    }
+
+    #[test]
+    fn the_catalog_feed_lists_more_packages_than_search_prints() {
+        let feed = Feed::start(PACKAGES);
+        let body = String::from_utf8(get(&feed, "/catalog/index.vipr", "").body).unwrap();
+        assert_eq!(body.matches("[Package ").count(), CATALOG_SIZE);
+        assert!(body.contains("[Package bulk_package_45-1.0]"), "{body}");
+    }
+
+    #[test]
+    fn the_faulty_feed_serves_a_non_archive_a_different_archive_and_nothing() {
+        let feed = Feed::start(PACKAGES);
+        let listing = String::from_utf8(get(&feed, "/faulty/index.vipr", "").body).unwrap();
+        for id in ["corrupt-1.0", "tampered-1.0", "missing-1.0"] {
+            assert!(listing.contains(&format!("[Package {id}]")), "{listing}");
+        }
+        let corrupt = get(&feed, "/faulty/packages/corrupt-1.0.vip", "").body;
+        assert!(listing.contains(&format!("Package.MD5={}", md5_hex(&corrupt))));
+        assert!(zip::ZipArchive::new(std::io::Cursor::new(corrupt)).is_err());
+        let tampered = get(&feed, "/faulty/packages/tampered-1.0.vip", "").body;
+        assert!(
+            !listing.contains(&md5_hex(&tampered)),
+            "the MD5 must not match"
+        );
+        let missing = get(&feed, "/faulty/packages/missing-1.0.vip", "");
+        assert_eq!(missing.status_line, "HTTP/1.1 404 Not Found");
+    }
+
+    #[test]
+    fn the_broken_feed_lists_broken_zip_with_the_md5_of_bytes_that_are_not_a_zip() {
+        let feed = Feed::start(PACKAGES);
+        let listing = String::from_utf8(get(&feed, "/broken/index.vipr", "").body).unwrap();
+        assert_eq!(listing.matches("[Package ").count(), 1, "{listing}");
+        assert!(listing.contains("[Package broken_zip-1.0]"), "{listing}");
+        let archive = get(&feed, "/broken/packages/broken_zip-1.0.vip", "");
+        assert_eq!(archive.status_line, "HTTP/1.1 200 OK");
+        assert!(listing.contains(&format!("Package.MD5={}", md5_hex(&archive.body))));
+        assert!(zip::ZipArchive::new(std::io::Cursor::new(archive.body)).is_err());
+    }
+
+    #[test]
+    fn route_builders_join_a_feed_dir_with_its_index_and_archives() {
+        assert_eq!(index_path(PROJECT_FEED_DIR), "/feed/index.vipr");
+        assert_eq!(
+            archive_path(NI_FEED_DIR, "a-1.0.vip"),
+            "/evaluation/labview/lvtn/vipm/packages/a-1.0.vip"
+        );
+    }
+
+    #[test]
+    fn an_archive_is_served_byte_for_byte() {
+        let feed = Feed::start(PACKAGES);
+        let reply = get(&feed, "/feed/packages/beta-1.0.vip", "");
+        assert_eq!(reply.body, beta().build_vip());
+    }
+
+    #[test]
+    fn a_revised_listing_gets_a_new_etag_so_a_cached_one_is_refetched() {
+        let feed = Feed::start(PACKAGES);
+        let since = |etag: &str| format!("If-None-Match: {etag}\r\n");
+        feed.revise(PROJECT_FEED_DIR, "[Package new-1.0]\n");
+        let reply = get(&feed, "/feed/index.vipr", &since(FEED_ETAG));
+        assert_eq!(reply.status_line, "HTTP/1.1 200 OK");
+        assert_eq!(reply.body, b"[Package new-1.0]\n");
+        let head = reply.head.lines();
+        let etag = head
+            .into_iter()
+            .find_map(|l| l.strip_prefix("ETag: "))
+            .unwrap();
+        let revalidated = get(&feed, "/feed/index.vipr", &since(etag));
+        assert_eq!(revalidated.status_line, "HTTP/1.1 304 Not Modified");
+        feed.revise(PROJECT_FEED_DIR, "[Package new-2.0]\n");
+        let again = get(&feed, "/feed/index.vipr", &since(etag));
+        assert_eq!(
+            again.status_line, "HTTP/1.1 200 OK",
+            "every revision is new"
+        );
+    }
+
+    #[test]
+    fn a_matching_etag_gets_304_without_a_body_and_a_stale_one_gets_the_body() {
+        let feed = Feed::start(PACKAGES);
+        let fresh = get(
+            &feed,
+            "/feed/index.vipr",
+            &format!("If-None-Match: {FEED_ETAG}\r\n"),
+        );
+        assert_eq!(fresh.status_line, "HTTP/1.1 304 Not Modified");
+        assert!(fresh.body.is_empty());
+        let stale = get(
+            &feed,
+            "/feed/index.vipr",
+            "If-None-Match: \"something-else\"\r\n",
+        );
+        assert_eq!(stale.status_line, "HTTP/1.1 200 OK");
+        assert!(!stale.body.is_empty());
+    }
+
+    #[test]
+    fn requests_are_counted_per_path_and_an_unknown_path_is_404() {
+        let feed = Feed::start(PACKAGES);
+        assert_eq!(feed.hits("/feed/index.vipr"), 0);
+        get(&feed, "/feed/index.vipr", "");
+        get(
+            &feed,
+            "/feed/index.vipr",
+            &format!("If-None-Match: {FEED_ETAG}\r\n"),
+        );
+        let missing = get(&feed, "/nope", "");
+        assert_eq!(missing.status_line, "HTTP/1.1 404 Not Found");
+        assert_eq!(feed.hits("/feed/index.vipr"), 2, "a 304 is still a request");
+        assert_eq!(feed.hits("/nope"), 1);
+        assert_eq!(feed.hits("/feed/packages/alpha-1.0.vip"), 0);
+    }
+
+    #[test]
+    fn refused_archives_answer_503_while_the_listing_is_still_served() {
+        let feed = Feed::start(PACKAGES);
+        assert_eq!(
+            get(&feed, "/feed/packages/beta-1.0.vip", "").status_line,
+            "HTTP/1.1 200 OK"
+        );
+        feed.refuse_archives();
+        let refused = get(&feed, "/feed/packages/beta-1.0.vip", "");
+        assert_eq!(refused.status_line, "HTTP/1.1 503 Service Unavailable");
+        assert!(refused.body.is_empty());
+        assert_eq!(
+            get(&feed, "/feed/index.vipr", "").status_line,
+            "HTTP/1.1 200 OK"
+        );
+        assert_eq!(feed.hits("/feed/packages/beta-1.0.vip"), 2, "still counted");
+    }
+
+    #[test]
+    fn a_paused_archive_is_answered_only_once_released_and_a_listing_is_not_held() {
+        let feed = Feed::start(PACKAGES);
+        feed.pause_archives();
+        assert_eq!(
+            get(&feed, "/feed/index.vipr", "").status_line,
+            "HTTP/1.1 200 OK"
+        );
+        let mut stream = TcpStream::connect(feed.addr).unwrap();
+        write!(
+            stream,
+            "GET /feed/packages/beta-1.0.vip HTTP/1.1\r\nHost: test\r\n\r\n"
+        )
+        .unwrap();
+        feed.wait_for_held_archive();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut early = [0u8; 1];
+        let held = stream.read(&mut early).unwrap_err().kind();
+        assert!(
+            matches!(
+                held,
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "{held:?}"
+        );
+        feed.release();
+        stream.set_read_timeout(Some(SOCKET_TIMEOUT)).unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        assert!(raw.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(raw.ends_with(&beta().build_vip()));
+    }
+
+    #[test]
+    fn dropping_the_feed_stops_its_thread() {
+        let feed = Feed::start(PACKAGES);
+        let addr = feed.addr;
+        drop(feed);
+        assert!(
+            TcpStream::connect_timeout(&addr, SOCKET_TIMEOUT).is_err(),
+            "still listening"
+        );
+    }
+}

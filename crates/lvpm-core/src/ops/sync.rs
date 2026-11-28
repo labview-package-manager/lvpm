@@ -1,0 +1,4101 @@
+//! `sync`: make a destination hold exactly what `lvpm.lock` lists.
+//!
+//! [`sync`] is the whole operation: it settles which lock to use, plans what
+//! must change, gets every archive before it changes anything, and then puts
+//! the destination right. [`plan_sync`] compares the lock with what the
+//! destination has installed and says what must change, as data: nothing is
+//! read from a source and nothing is written. Every change is a [`SyncStep`],
+//! and a removal carries the reason for it.
+
+use super::env::OpEnv;
+use super::github_index;
+use super::hook_policy::HookAllow;
+use super::index_files::IndexFiles;
+use super::install::{
+    Applied, InstallOptions, InstallPlan, PlannedPackage, announce_target, apply, finish,
+    order_dependencies_first,
+};
+use super::lock as locking;
+use super::session::{Downloads, InstallSession};
+use super::uninstall::uninstall_one;
+use crate::cache::{Stored, sha256_hex};
+use crate::errors::{
+    ArchiveFault, Cancelled, IndexHashMismatch, IndexUrlRefused, LockError, LockedArchiveProblem,
+    SyncError,
+};
+use crate::events::{Event, PackageRef, Phase, RemoveReason, SyncStep};
+use crate::index::{self, Entry, Index};
+use crate::install::{self, Manifest};
+use crate::lockfile::{self, LockedPackage, Lockfile};
+use crate::oci;
+use crate::project::{DEV_GROUP, group_key};
+use crate::project::{Project, name_key, same_name};
+use crate::version::Version;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+/// How a sync treats `lvpm.lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockPolicy {
+    /// Use a lock that represents the manifest; make a new one when there is
+    /// none, or it is out of date.
+    #[default]
+    Update,
+    /// Use the lock only when it is there and represents the manifest; fail,
+    /// and change nothing, when it does not.
+    Locked,
+    /// Use the lock as it is, out of date or not; fail when there is none.
+    Frozen,
+}
+
+/// The lock flags a front end was given.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LockFlags {
+    pub locked: bool,
+    pub frozen: bool,
+    /// Re-lock where a headless machine would otherwise refuse to.
+    pub no_locked: bool,
+}
+
+/// How strictly a sync treats the lock, and whether the machine decided it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Strictness {
+    pub policy: LockPolicy,
+    /// `policy` is [`LockPolicy::Locked`] because LabVIEW runs headless here,
+    /// and no flag asked for it.
+    pub implied_by_headless: bool,
+}
+
+/// What a sync does about the lock, given where it runs and what it was told.
+/// An explicit flag wins: `--frozen`, then `--locked`, then `--no-locked`. With
+/// none, a headless machine is strict, since nobody is there to read a diff of
+/// a lock that changed under a CI job, and a workstation re-locks.
+pub fn strictness(headless: bool, flags: LockFlags) -> Strictness {
+    let (policy, implied_by_headless) = match flags {
+        LockFlags { frozen: true, .. } => (LockPolicy::Frozen, false),
+        LockFlags { locked: true, .. } => (LockPolicy::Locked, false),
+        LockFlags {
+            no_locked: true, ..
+        } => (LockPolicy::Update, false),
+        _ if headless => (LockPolicy::Locked, true),
+        _ => (LockPolicy::Update, false),
+    };
+    Strictness {
+        policy,
+        implied_by_headless,
+    }
+}
+
+/// What a sync is asked, without the flags a front end spells it as.
+#[derive(Debug, Clone, Default)]
+pub struct SyncOptions {
+    pub lock: LockPolicy,
+    /// `lock` is [`LockPolicy::Locked`] only because LabVIEW runs headless
+    /// here (see [`strictness`]): the sync says so before anything else.
+    pub headless_implied: bool,
+    /// Leave out the packages that only dev dependencies need, and take them
+    /// out when they are installed.
+    pub no_dev: bool,
+    /// The dependency groups to install besides `[dependencies]` and dev, which
+    /// are installed unless `no_dev`. `dev` in any case names the dev group.
+    pub groups: Vec<String>,
+    /// Groups left out once `include-groups` are expanded; `dev` is `no_dev`.
+    pub without: Vec<String>,
+    /// When not empty, install these groups and what they include, and
+    /// neither `[dependencies]` nor dev unless named.
+    pub only: Vec<String>,
+    /// The install flags a sync honors: a dry run, and what the relink and the
+    /// hooks do. A sync takes the lock's versions, and all of them, so
+    /// `allow_downgrade` and `no_deps` mean nothing to it.
+    pub install: InstallOptions,
+}
+
+impl SyncOptions {
+    /// What the options select from `project`, `dev` folded to its one
+    /// spelling and `include-groups` expanded. Fails on a group `project`
+    /// does not define.
+    fn selection(&self, project: &Project) -> Result<Selection, SyncError> {
+        // `--with "a, b"` reaches here as "a" and " b".
+        let fold = |groups: &[String]| -> Vec<String> {
+            (groups.iter().map(|group| group.trim()))
+                .filter(|group| !group.is_empty())
+                .map(group_key)
+                .collect()
+        };
+        let (with, without, only) = (fold(&self.groups), fold(&self.without), fold(&self.only));
+        refuse_unknown_groups(project, &[&with[..], &without, &only].concat())?;
+        // `--only ,` would otherwise fall back to the default selection.
+        if only.is_empty() && !self.only.is_empty() {
+            return Err(anyhow::anyhow!("--only names no group").into());
+        }
+        let no_main = !only.is_empty();
+        let mut groups = project.with_includes(if no_main { &only } else { &with })?;
+        groups.retain(|group| !without.contains(group));
+        // Leaving dev out wins over a group that includes it.
+        let no_dev = match no_main {
+            true => !groups.iter().any(|group| group == DEV_GROUP),
+            false => self.no_dev || without.iter().any(|group| group == DEV_GROUP),
+        };
+        // `no_dev` alone says whether dev is selected.
+        groups.retain(|group| group != DEV_GROUP);
+        Ok(Selection {
+            no_dev,
+            groups,
+            no_main,
+            keep_listed: false,
+        })
+    }
+}
+
+/// Which of the lock's packages a sync puts on disk: those `[dependencies]`
+/// needs, those dev needs unless `no_dev`, and those a selected group needs.
+/// Under `no_main` (`--only`) only those the selected groups and dev reach.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selection {
+    pub no_dev: bool,
+    /// The selected groups as the manifest spells them, never dev: dev is
+    /// selected by `no_dev` alone.
+    pub groups: Vec<String>,
+    /// `--only`: `[dependencies]` is not selected, so what it needs is put on
+    /// disk only when a selected group needs it too.
+    pub no_main: bool,
+    /// Keep an installed package the lock lists, wanted or not: a sync that
+    /// installs only part of the lock takes nothing out but what the lock drops.
+    pub keep_listed: bool,
+}
+
+impl Selection {
+    /// The package is put on disk: `[dependencies]` needs it, or a group that
+    /// is selected does. The lock lists no groups for what `[dependencies]` needs.
+    /// Not the rule under `no_main`: `plan_sync` walks the groups then.
+    fn wants(&self, package: &LockedPackage) -> bool {
+        package.needed_by_dependencies()
+            || (package.groups.iter()).any(|group| match group == DEV_GROUP {
+                true => !self.no_dev,
+                false => self.groups.contains(group),
+            })
+    }
+}
+
+/// What the front end did about the question [`sync_asking`] puts to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// The user was asked, and said yes or no.
+    Asked(bool),
+    /// The front end went ahead without asking: `--yes`, or no terminal.
+    NotAsked,
+}
+
+/// Make the destination `env` settles hold exactly the packages `lvpm.lock`
+/// lists: install what is missing, replace what is at another version or from
+/// another archive, and take out what the lock does not list, saying so first.
+/// It asks nothing: [`sync_asking`] is the sync that does.
+///
+/// Every archive is in hand before the first change, so a missing or altered
+/// archive fails the sync with the destination, and `lvpm.lock`, as they were:
+/// a lock made here is written once the archives are in hand. A dry run reports
+/// the plan, and changes nothing.
+pub fn sync(env: &OpEnv, opts: &SyncOptions) -> Result<(), SyncError> {
+    sync_asking(env, opts, &|_| Ok(Answer::NotAsked))
+}
+
+/// [`sync`], except that a plan that removes a package the lock does not list
+/// is put to `ask` once it is said, and before anything is written or fetched.
+/// `ask` gets those removals, and answers for the user. "No" ends the sync with
+/// `SyncDeclined` and nothing changed, and so does an error of `ask`, which is
+/// the sync's error. A dry run and a plan with no such removal ask nothing.
+pub fn sync_asking(
+    env: &OpEnv,
+    opts: &SyncOptions,
+    ask: &dyn Fn(&[SyncStep]) -> anyhow::Result<Answer>,
+) -> Result<(), SyncError> {
+    if opts.headless_implied {
+        env.sink.emit(Event::HeadlessImpliesLocked);
+    }
+    let found = locking::find_manifest(env)?;
+    let (manifest_path, project) = &found;
+    let selection = opts.selection(project)?;
+    let not_selected: Vec<String> = (project.groups.iter())
+        .map(|(name, _)| name.clone())
+        .filter(|name| !selection.groups.contains(name))
+        .collect();
+    // Under `--only` the left-out groups are what was asked for, and `--with` conflicts.
+    if !not_selected.is_empty() && !selection.no_main {
+        env.sink.emit(Event::GroupsNotSelected {
+            groups: not_selected,
+        });
+    }
+    env.sink.emit(Event::PhaseStarted {
+        phase: Phase::Resolve,
+    });
+    if opts.lock == LockPolicy::Update {
+        project.labview.as_deref().ok_or(LockError::NoLabview)?;
+    }
+    let dest = env.destination()?;
+    let store = dest.store();
+    env.sink.emit(Event::ManifestInUse {
+        path: manifest_path.clone(),
+        name: project.name.clone(),
+        dependencies: project.dependencies.len(),
+        labview: project.labview.clone(),
+    });
+    announce_target(env, &store);
+
+    let lock_path = manifest_path.with_file_name(lockfile::FILE_NAME);
+    let mut settled = settle_lock(env, &found, &lock_path, opts)?;
+    refuse_groups_the_lock_lacks(project, &settled.lock, &selection)?;
+    if !project.nipm.is_empty() {
+        env.sink.emit(Event::NipmNotInstalled {
+            count: project.nipm.len(),
+        });
+    }
+
+    let plan = plan_sync(&settled.lock, &install::list_installed(&store)?, &selection);
+    // A sync that asks says what it removes in its question, after the plan.
+    let removals = removals_to_ask(&plan);
+    let asks = !removals.is_empty() && !opts.install.dry_run;
+    if settled.first_sync && !asks {
+        announce_migration(env, &plan);
+    }
+    if plan.is_empty() {
+        settled.write_lock(env, &lock_path)?;
+        // In line with the lock, but the merged palette addon may still be
+        // owed: the fix `lvpm launch` points at for a stale one.
+        if let crate::ops::Destination::Venv(v) = &dest
+            && !opts.install.dry_run
+        {
+            super::install::merge_palettes(env, v)?;
+        }
+        env.sink.emit(Event::SyncNothingToDo);
+        return Ok(());
+    }
+    if opts.install.dry_run {
+        env.sink.emit(Event::SyncPlanned {
+            steps: plan.steps,
+            dry_run: true,
+        });
+        return Ok(());
+    }
+
+    env.sink.emit(Event::SyncPlanned {
+        steps: plan.steps.clone(),
+        dry_run: false,
+    });
+    if asks && !confirm_removals(env, ask, &plan, &removals, settled.first_sync)? {
+        return Ok(());
+    }
+
+    let planned = fetch_locked(env, project, &plan.wanted)?;
+    settled.write_lock(env, &lock_path)?;
+    // The project's own lines allow hooks; a dependency's manifest never does.
+    let opts = &SyncOptions {
+        install: InstallOptions {
+            hook_allow: HookAllow::for_command(&env.config, Some(project)),
+            relink_marked: project.relink.iter().cloned().collect(),
+            ..opts.install.clone()
+        },
+        ..opts.clone()
+    };
+    let mut session = InstallSession::new(dest);
+    let applied = apply_sync(
+        env,
+        &mut session,
+        &settled.lock,
+        &plan,
+        &selection,
+        planned,
+        opts,
+    )?;
+    finish(env, &mut session, &applied, &opts.install)?;
+    Ok(())
+}
+
+/// Put `removals` to `ask`: whether the sync goes ahead. On a "no" it says so
+/// and stops; a front end that went ahead without asking is followed by the
+/// note of a first sync, which the question would have said itself.
+fn confirm_removals(
+    env: &OpEnv,
+    ask: &dyn Fn(&[SyncStep]) -> anyhow::Result<Answer>,
+    plan: &SyncPlan,
+    removals: &[SyncStep],
+    first_sync: bool,
+) -> Result<bool, SyncError> {
+    match ask(removals).map_err(SyncError::Other)? {
+        Answer::Asked(false) => {
+            env.sink.emit(Event::SyncDeclined {
+                removing: package_refs(removals),
+            });
+            Ok(false)
+        }
+        Answer::Asked(true) => Ok(true),
+        Answer::NotAsked => {
+            if first_sync {
+                announce_migration(env, plan);
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Fail, before any lock is read or written, when a selected group is not dev
+/// or a `[dependency-groups]` table of the manifest. `remove --group` asks the
+/// same of the group it takes an entry out of.
+pub(super) fn refuse_unknown_groups(project: &Project, groups: &[String]) -> Result<(), SyncError> {
+    let Some(unknown) = groups.iter().find(|group| !project.defines_group(group)) else {
+        return Ok(());
+    };
+    let mut defined: Vec<&str> = (project.groups.iter())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    defined.push(DEV_GROUP);
+    defined.sort_unstable();
+    Err(anyhow::anyhow!(
+        "unknown group '{unknown}'; defined groups: {}",
+        defined.join(", ")
+    )
+    .into())
+}
+
+/// Under `--only`, fail when the lock records no lines for a selected group
+/// (dev included) that has lines in the manifest: a `--frozen` lock older than
+/// the group would reach nothing, and every installed package would be taken
+/// out. A group with no lines of its own reaches nothing either way.
+fn refuse_groups_the_lock_lacks(
+    project: &Project,
+    lock: &Lockfile,
+    selection: &Selection,
+) -> Result<(), SyncError> {
+    let dev = (!selection.no_dev).then(|| {
+        let locked = !lock.inputs.dev_dependencies.is_empty();
+        (DEV_GROUP, !project.dev_dependencies.is_empty(), locked)
+    });
+    let groups = (selection.groups.iter()).map(|group| {
+        let lines = (project.groups.iter()).find(|(name, _)| name == group);
+        let locked = (lock.inputs.dependency_groups.get(group)).is_some_and(|l| !l.is_empty());
+        (
+            group.as_str(),
+            lines.is_some_and(|(_, l)| !l.is_empty()),
+            locked,
+        )
+    });
+    let missing = (dev.into_iter().chain(groups))
+        .find(|(_, has_lines, locked)| selection.no_main && *has_lines && !locked)
+        .map(|(group, _, _)| group);
+    match missing {
+        Some(group) => Err(anyhow::anyhow!(
+            "lvpm.lock records no group '{group}': it is older than lvpm.toml; run `lvpm lock`, or sync without --frozen"
+        )
+        .into()),
+        None => Ok(()),
+    }
+}
+
+/// The lock a sync goes by, and what is left to do about it.
+struct Settled {
+    lock: Lockfile,
+    /// The project's first sync: the lock was made because there was none.
+    first_sync: bool,
+    /// A lock made here and not yet written: see [`Settled::write_lock`].
+    pending: Option<locking::PendingLock>,
+}
+
+impl Settled {
+    /// A lock that is there already and is used as it is.
+    fn kept(lock: Lockfile) -> Settled {
+        Settled {
+            lock,
+            first_sync: false,
+            pending: None,
+        }
+    }
+
+    /// Write the lock this sync made, if it made one: the one place it is
+    /// written, once the archives are in hand, so that a sync that fails
+    /// before it changes anything leaves `lvpm.lock` as it was.
+    fn write_lock(&mut self, env: &OpEnv, lock_path: &Path) -> Result<(), SyncError> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        // Said here and not when the lock was found missing: a sync that is
+        // declined, or whose fetch fails, writes none.
+        if self.first_sync {
+            env.sink.emit(Event::SyncLockMissing {
+                path: lock_path.to_path_buf(),
+                dry_run: false,
+            });
+        }
+        Ok(pending.write(env)?)
+    }
+}
+
+/// The lock this sync goes by, and whether it is the project's first: made
+/// here because there was none. It is made, not written: [`Settled::write_lock`]
+/// writes it. A dry run makes it and never writes it.
+///
+/// A lock that was there is warned about for the requirements it records as
+/// unresolved; one made here has said so already, as it was made.
+fn settle_lock(
+    env: &OpEnv,
+    found: &(PathBuf, Project),
+    lock_path: &Path,
+    opts: &SyncOptions,
+) -> Result<Settled, SyncError> {
+    let project = &found.1;
+    match opts.lock {
+        LockPolicy::Frozen => {
+            let lock = locking::read_lock(lock_path)?;
+            // An older format reads its own markers (v1 `dev = true`) as main, so it is never used as it is.
+            if let Some(reason) = lock.format_is_outdated() {
+                return Err(LockError::Stale(reason).into());
+            }
+            Ok(Settled::kept(warn_unresolved(env, lock)))
+        }
+        LockPolicy::Locked => {
+            let lock = locking::read_lock(lock_path)?;
+            match lock.staleness(project) {
+                Some(reason) => Err(LockError::Stale(reason).into()),
+                None => Ok(Settled::kept(warn_unresolved(env, lock))),
+            }
+        }
+        LockPolicy::Update => match locking::read_lock(lock_path) {
+            Ok(lock) if lock.staleness(project).is_none() => {
+                Ok(Settled::kept(warn_unresolved(env, lock)))
+            }
+            read => {
+                let missing = matches!(read, Err(LockError::NoLock { .. }));
+                // A dry run writes nothing, so it says now what a sync says at the write.
+                if missing && opts.install.dry_run {
+                    env.sink.emit(Event::SyncLockMissing {
+                        path: lock_path.to_path_buf(),
+                        dry_run: true,
+                    });
+                }
+                let (lock, pending) = new_lock(env, found, lock_path, opts.install.dry_run)?;
+                Ok(Settled {
+                    lock,
+                    first_sync: missing,
+                    pending,
+                })
+            }
+        },
+    }
+}
+
+/// `lock`, after a warning for each requirement it records as unresolved.
+fn warn_unresolved(env: &OpEnv, lock: Lockfile) -> Lockfile {
+    for unresolved in &lock.unresolved {
+        env.sink.emit(Event::SyncUnresolved {
+            name: unresolved.name.clone(),
+            required_by: unresolved.required_by.clone(),
+        });
+    }
+    lock
+}
+
+/// The lock the manifest resolves to now, and the write of it that is owed:
+/// none on a dry run, which only says how the lock would differ from the one
+/// there.
+fn new_lock(
+    env: &OpEnv,
+    found: &(PathBuf, Project),
+    lock_path: &Path,
+    dry_run: bool,
+) -> Result<(Lockfile, Option<locking::PendingLock>), LockError> {
+    let previous = Lockfile::read(lock_path).ok();
+    let (lock, changes, after) = locking::relock(env, found, previous.as_ref())?;
+    if dry_run {
+        if !changes.is_empty() {
+            env.sink.emit(Event::LockWouldChange { changes });
+        }
+        after.into_iter().for_each(|event| env.sink.emit(event));
+        return Ok((lock, None));
+    }
+    let pending = locking::PendingLock::new(lock_path.to_path_buf(), &lock, changes, after)?;
+    Ok((lock, Some(pending)))
+}
+
+/// The first sync of a project removes what the lock it just made does not
+/// list, which nobody asked for in so many words: say so.
+pub(super) fn announce_migration(env: &OpEnv, plan: &SyncPlan) {
+    let removing = package_refs(&removals_to_ask(plan));
+    if !removing.is_empty() {
+        env.sink.emit(Event::SyncMigration { removing });
+    }
+}
+
+/// The removals a sync asks about: those of a package the lock does not list.
+/// What `--no-dev` and a group selection take out follows from what the user
+/// typed, and is not asked about.
+fn removals_to_ask(plan: &SyncPlan) -> Vec<SyncStep> {
+    (plan.steps.iter())
+        .filter(|step| {
+            matches!(
+                step,
+                SyncStep::Remove {
+                    reason: RemoveReason::NotInLock,
+                    ..
+                }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// The packages the removals take out.
+pub fn package_refs(removals: &[SyncStep]) -> Vec<PackageRef> {
+    (removals.iter())
+        .filter_map(|step| match step {
+            SyncStep::Remove { name, version, .. } => Some(PackageRef {
+                name: name.clone(),
+                version: version.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Put the destination right: take out what the plan removes, then install and
+/// replace what it lists, the archives of `planned` being already in hand.
+/// The relink, the hooks and the palette refresh are left to [`finish`], which
+/// spends what this leaves in the session.
+///
+/// The caller has said what the plan does (`SyncPlanned`).
+///
+/// A change that fails stops the rest. The error says which packages are done
+/// and which are not, so that running the sync again can finish it.
+pub fn apply_sync(
+    env: &OpEnv,
+    session: &mut InstallSession,
+    lock: &Lockfile,
+    plan: &SyncPlan,
+    selection: &Selection,
+    planned: Vec<PlannedPackage>,
+    opts: &SyncOptions,
+) -> Result<Applied, SyncError> {
+    // The first change is a removal or an install, and every archive is in
+    // hand: this is where cancelling stops being possible.
+    env.cancel.begin_unpack()?;
+    change(env, session, plan, planned, opts)
+        .map_err(|cause| incomplete(session, lock, plan, selection, &cause))
+}
+
+fn change(
+    env: &OpEnv,
+    session: &mut InstallSession,
+    plan: &SyncPlan,
+    planned: Vec<PlannedPackage>,
+    opts: &SyncOptions,
+) -> anyhow::Result<Applied> {
+    let mut removed = 0;
+    for step in &plan.steps {
+        match step {
+            SyncStep::Remove { name, .. } => removed += uninstall_one(env, session, name)?,
+            // An install of the locked version is left alone by `apply`, and
+            // this one has the wrong archive: it goes first.
+            SyncStep::Replace { name, from, to } if Version::parse(from) == Version::parse(to) => {
+                removed += uninstall_one(env, session, name)?;
+            }
+            SyncStep::Install { .. } | SyncStep::Replace { .. } => {}
+        }
+    }
+    let applied = match planned.is_empty() {
+        true => Applied::default(),
+        false => {
+            // The lock's version is the version, newer or older than what is
+            // installed.
+            let install = InstallOptions {
+                allow_downgrade: true,
+                ..opts.install.clone()
+            };
+            apply(env, session, &InstallPlan { entries: planned }, &install)?
+        }
+    };
+    Ok(Applied { removed, ..applied })
+}
+
+/// The error of a sync that stopped part-way: what is done is what the
+/// destination no longer needs a step for.
+fn incomplete(
+    session: &InstallSession,
+    lock: &Lockfile,
+    plan: &SyncPlan,
+    selection: &Selection,
+    cause: &anyhow::Error,
+) -> SyncError {
+    let left = match install::list_installed(session.store()) {
+        Ok(installed) => plan_sync(lock, &installed, selection).steps,
+        Err(_) => plan.steps.clone(),
+    };
+    let pending: HashSet<&str> = left.iter().map(SyncStep::name).collect();
+    let done = plan
+        .steps
+        .iter()
+        .filter(|step| !pending.contains(step.name()))
+        .cloned()
+        .collect();
+    SyncError::Incomplete {
+        done,
+        left,
+        cause: format!("{cause:#}"),
+    }
+}
+
+/// What a sync does to a destination.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncPlan {
+    /// Every change, for showing: removals first, then the installs and
+    /// replacements, each package after the ones it requires.
+    pub steps: Vec<SyncStep>,
+    /// The locked packages the installs and replacements put on disk, in the
+    /// order of `steps`.
+    pub wanted: Vec<LockedPackage>,
+}
+
+impl SyncPlan {
+    /// The destination already holds exactly what the lock lists.
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+}
+
+/// What it takes to make a destination equal `lock`. `installed` is what the
+/// destination holds. A package the `selection` does not want is left out of
+/// the wanted set, and is taken out when installed, unless it keeps what is
+/// listed.
+pub fn plan_sync(lock: &Lockfile, installed: &[Manifest], selection: &Selection) -> SyncPlan {
+    let locked: HashMap<String, &LockedPackage> = lock
+        .packages
+        .iter()
+        .map(|package| (name_key(&package.name), package))
+        .collect();
+    let have: HashMap<String, &Manifest> = installed
+        .iter()
+        .map(|manifest| (name_key(&manifest.name), manifest))
+        .collect();
+
+    let reached = selection
+        .no_main
+        .then(|| needed_by_groups(lock, &locked, selection));
+    let wants = |package: &LockedPackage| match &reached {
+        Some(reached) => reached.contains(&name_key(&package.name)),
+        None => selection.wants(package),
+    };
+
+    // No source lists these, so the lock cannot hold them: what is installed
+    // under such a name meets a requirement and stays.
+    let unresolved: HashSet<String> = lock
+        .unresolved
+        .iter()
+        .map(|requirement| name_key(&requirement.name))
+        .collect();
+
+    let mut steps: Vec<SyncStep> = installed
+        .iter()
+        .filter_map(|manifest| {
+            let (reason, groups) = match locked.get(&name_key(&manifest.name)) {
+                None if unresolved.contains(&name_key(&manifest.name)) => return None,
+                None => (RemoveReason::NotInLock, Vec::new()),
+                Some(package) if !selection.keep_listed && !wants(package) => unselected(package),
+                Some(_) => return None,
+            };
+            Some(SyncStep::Remove {
+                name: manifest.name.clone(),
+                version: manifest.version.clone(),
+                reason,
+                groups,
+            })
+        })
+        .collect();
+
+    let mut wanted = Vec::new();
+    let to_put_on_disk = lock.packages.iter().filter(|package| wants(package));
+    let ordered = order_dependencies_first(
+        to_put_on_disk.collect(),
+        |package| name_key(&package.name),
+        |package| package.requires.iter().map(|r| name_key(r)).collect(),
+    );
+    for package in ordered {
+        let step = match have.get(&name_key(&package.name)) {
+            None => SyncStep::Install {
+                name: package.name.clone(),
+                version: package.version.clone(),
+            },
+            Some(installed) if is_the_locked_one(installed, package) => continue,
+            Some(installed) => SyncStep::Replace {
+                name: package.name.clone(),
+                from: installed.version.clone(),
+                to: package.version.clone(),
+            },
+        };
+        steps.push(step);
+        wanted.push(package.clone());
+    }
+    SyncPlan { steps, wanted }
+}
+
+/// Every package, by name key, that the selected groups' lines, and dev's when
+/// dev is selected, reach directly or through what they require: what `--only`
+/// puts on disk. A package `[dependencies]` also needs is in it when reached.
+fn needed_by_groups(
+    lock: &Lockfile,
+    locked: &HashMap<String, &LockedPackage>,
+    selection: &Selection,
+) -> HashSet<String> {
+    let inputs = &lock.inputs;
+    let dev = (!selection.no_dev).then_some(&inputs.dev_dependencies);
+    let groups = (selection.groups.iter()).filter_map(|group| inputs.dependency_groups.get(group));
+    let mut pending: Vec<String> = (dev.into_iter().chain(groups))
+        .flat_map(|lines| lines.keys().map(|name| name_key(name)))
+        .collect();
+    let mut reached = HashSet::new();
+    while let Some(key) = pending.pop() {
+        if let Some(package) = locked.get(&key)
+            && reached.insert(key)
+        {
+            pending.extend(package.requires.iter().map(|name| name_key(name)));
+        }
+    }
+    reached
+}
+
+/// Why a locked package is taken out, and which groups need it, when no
+/// selected group does.
+fn unselected(package: &LockedPackage) -> (RemoveReason, Vec<String>) {
+    match package.groups.as_slice() {
+        // Only `--only` leaves out what `[dependencies]` needs.
+        [] => (RemoveReason::DependenciesOnly, Vec::new()),
+        [only] if only == DEV_GROUP => (RemoveReason::DevOnly, Vec::new()),
+        groups => (RemoveReason::GroupsOnly, groups.to_vec()),
+    }
+}
+
+/// The same version, from the same archive. A manifest written before the
+/// archive's SHA-256 was recorded has none, so nothing shows it is the locked
+/// archive: it is replaced from the verified one.
+fn is_the_locked_one(installed: &Manifest, locked: &LockedPackage) -> bool {
+    Version::parse(&installed.version) == Version::parse(&locked.version)
+        && installed
+            .archive_sha256
+            .as_deref()
+            .is_some_and(|sha256| sha256.eq_ignore_ascii_case(&locked.sha256))
+}
+
+/// Get every archive a sync will put on disk, before it changes anything.
+///
+/// An archive is found by its SHA-256, wherever it is: first in the cache,
+/// whose bytes are checked again because an entry can be corrupt, then in any
+/// source by name and version, keeping only the archive that hashes as locked.
+/// What is found is kept in the cache, and each package of the result reads it
+/// from there, so the bytes installed are the bytes that were checked.
+///
+/// An archive that is not found, or is found with other bytes, fails the whole
+/// fetch; every one that fails is reported.
+pub fn fetch_locked(
+    env: &OpEnv,
+    project: &Project,
+    wanted: &[LockedPackage],
+) -> Result<Vec<PlannedPackage>, SyncError> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let downloads = Downloads::open(env)?;
+    let names: Vec<String> = wanted.iter().map(|locked| locked.name.clone()).collect();
+    let mut searches: Vec<Search> = wanted
+        .iter()
+        .map(|locked| Search::in_cache(&downloads, locked))
+        .collect();
+    for source in Source::all(env, project)? {
+        if searches.iter().all(|search| search.found) {
+            break;
+        }
+        // A source that was not read for a cancel holds nothing, but that is
+        // not what the sync reports.
+        if env.cancel.is_cancelled() {
+            return Err(Cancelled.into());
+        }
+        // A repo is listed only for a package of its own that missed the cache.
+        let asking: Vec<&mut Search> = searches
+            .iter_mut()
+            .filter(|search| !search.found && source.answers_for(project, search.locked))
+            .collect();
+        if asking.is_empty() {
+            continue;
+        }
+        // An OCI package is fetched by the digest the lock records: the
+        // registry is never listed, and no other source is asked for it.
+        if let Source::Oci(feed) = &source {
+            for search in asking {
+                search.fetch_oci(&downloads, &feed.name)?;
+            }
+            continue;
+        }
+        let index = match source.index(env, &downloads, &names) {
+            Ok(index) => index,
+            // A repo that cannot be read says why; a folder that is gone and a
+            // feed that is down hold nothing.
+            Err(why) => {
+                if matches!(source, Source::GitHub(..) | Source::Index(_)) {
+                    for search in asking {
+                        search.unfetched = Some(Unfetched::plain(format!("{why:#}")));
+                    }
+                }
+                continue;
+            }
+        };
+        for search in asking {
+            search.look_in(&downloads, &index)?;
+        }
+    }
+    // The last source's load may have been cut short by a cancel, too.
+    if env.cancel.is_cancelled() {
+        return Err(Cancelled.into());
+    }
+
+    let problems: Vec<LockedArchiveProblem> =
+        searches.iter().filter_map(Search::reported).collect();
+    match problems.is_empty() {
+        true => Ok(searches.iter().map(Search::planned).collect()),
+        false => Err(SyncError::Archives(problems)),
+    }
+}
+
+/// The hunt for one locked archive.
+pub(super) struct Search<'a> {
+    locked: &'a LockedPackage,
+    /// The archive is in the cache, with the locked bytes.
+    pub(super) found: bool,
+    /// The SHA-256 of an archive that was found and is not the locked one.
+    differs: Option<String>,
+    /// Why the last entry that could not be fetched was not.
+    pub(super) unfetched: Option<Unfetched>,
+}
+
+/// Why an archive that a source lists could not be fetched, in words.
+pub(super) struct Unfetched {
+    pub(super) reason: String,
+    /// `reason` is a whole sentence, which names the package itself.
+    pub(super) in_full: bool,
+}
+
+impl Unfetched {
+    /// A cause in its own words, which a report puts after the package.
+    pub(super) fn plain(reason: String) -> Unfetched {
+        Unfetched {
+            reason,
+            in_full: false,
+        }
+    }
+
+    /// Why `why` stopped a download from an index or a feed: a file the index
+    /// lists by another SHA-256, or at a url that is not its publisher's, is a
+    /// whole sentence; any other cause is worded after the package.
+    pub(super) fn of_download(why: &anyhow::Error) -> Unfetched {
+        let in_full = if let Some(mismatch) = why.downcast_ref::<IndexHashMismatch>() {
+            Some(mismatch.to_string())
+        } else {
+            why.downcast_ref::<IndexUrlRefused>()
+                .map(ToString::to_string)
+        };
+        match in_full {
+            Some(reason) => Unfetched {
+                reason,
+                in_full: true,
+            },
+            None => Unfetched::plain(format!("{why:#}")),
+        }
+    }
+
+    /// Why `why` stopped `name` `version` from being fetched from the OCI
+    /// source `source`, by its manifest `manifest`.
+    pub(super) fn of_oci(
+        why: &anyhow::Error,
+        (name, version): (&str, &str),
+        source: &str,
+        manifest: &str,
+    ) -> Unfetched {
+        match oci::fetch_failure(why, name, version, source, manifest) {
+            Some(reason) => Unfetched {
+                reason,
+                in_full: true,
+            },
+            None => Unfetched::plain(format!("{why:#}")),
+        }
+    }
+}
+
+impl<'a> Search<'a> {
+    pub(super) fn in_cache(downloads: &Downloads, locked: &'a LockedPackage) -> Search<'a> {
+        let mut search = Search {
+            locked,
+            found: false,
+            differs: None,
+            unfetched: None,
+        };
+        match downloads.stored(&search.sha256()) {
+            Stored::Intact(_) => search.found = true,
+            Stored::Corrupt { found_sha256 } => search.differs = Some(found_sha256),
+            Stored::Absent => {}
+        }
+        search
+    }
+
+    fn sha256(&self) -> String {
+        self.locked.sha256.to_lowercase()
+    }
+
+    /// Try every entry of the index that has the locked name and version. One
+    /// that cannot be read holds nothing; one with other bytes is noted and
+    /// never used.
+    pub(super) fn look_in(
+        &mut self,
+        downloads: &Downloads,
+        index: &Index,
+    ) -> Result<(), LockError> {
+        let version = Version::parse(&self.locked.version);
+        for entry in index
+            .versions_of(&self.locked.name)
+            .into_iter()
+            .filter(|entry| entry.version == version)
+        {
+            let fetched = downloads.fetch(entry);
+            self.consider(downloads, fetched, Unfetched::of_download)?;
+            if self.found {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch the package by the manifest digest the lock records, from its OCI
+    /// source `source` (the `[sources]` name). Never by a tag.
+    pub(super) fn fetch_oci(
+        &mut self,
+        downloads: &Downloads,
+        source: &str,
+    ) -> Result<(), LockError> {
+        let Some(manifest) = self.locked.oci_reference() else {
+            // Only a hand-edited lock: say so, not "not found".
+            let (name, version) = (&self.locked.name, &self.locked.version);
+            self.unfetched = Some(Unfetched {
+                reason: format!(
+                    "{name} {version}: the lock's source and digest do not name an OCI \
+                     manifest; run lvpm lock"
+                ),
+                in_full: true,
+            });
+            return Ok(());
+        };
+        let entry = Entry {
+            name: self.locked.name.clone(),
+            version: Version::parse(&self.locked.version),
+            url: manifest.to_string(),
+            md5: None,
+            display_name: None,
+            requires: Vec::new(),
+            lv_min: None,
+            source: self.locked.source.clone(),
+            released: None,
+            index_pin: None,
+        };
+        let (name, version) = (&self.locked.name, &self.locked.version);
+        let fetched = downloads.fetch(&entry);
+        let named = (name.as_str(), version.as_str());
+        self.consider(downloads, fetched, |why| {
+            Unfetched::of_oci(why, named, source, manifest.name())
+        })
+    }
+
+    /// What one fetched candidate comes to: the locked bytes are kept and the
+    /// archive is found; other bytes are noted and never used; a fetch that
+    /// failed is remembered, as `unfetched` words it.
+    fn consider(
+        &mut self,
+        downloads: &Downloads,
+        fetched: anyhow::Result<Vec<u8>>,
+        unfetched: impl FnOnce(&anyhow::Error) -> Unfetched,
+    ) -> Result<(), LockError> {
+        let bytes = match fetched {
+            Ok(bytes) => bytes,
+            Err(why) if why.is::<Cancelled>() => return Err(Cancelled.into()),
+            Err(why) => {
+                self.unfetched = Some(unfetched(&why));
+                return Ok(());
+            }
+        };
+        let found = sha256_hex(&bytes);
+        if found == self.sha256() {
+            downloads.keep(&bytes)?;
+            self.found = true;
+        } else {
+            self.differs = Some(found);
+        }
+        Ok(())
+    }
+
+    /// What is wrong, when the archive was not found.
+    pub(super) fn problem(&self) -> Option<LockedArchiveProblem> {
+        let fault = match (&self.found, &self.differs) {
+            (true, _) => return None,
+            (false, Some(found_sha256)) => ArchiveFault::DiffersFromLock {
+                found_sha256: found_sha256.clone(),
+            },
+            (false, None) => ArchiveFault::NotFound,
+        };
+        Some(LockedArchiveProblem {
+            name: self.locked.name.clone(),
+            version: self.locked.version.clone(),
+            sha256: self.locked.sha256.clone(),
+            fault,
+        })
+    }
+
+    /// [`problem`](Search::problem), saying why when the archive was listed and
+    /// could not be fetched, which a sync tells the user instead of "not found".
+    fn reported(&self) -> Option<LockedArchiveProblem> {
+        let mut problem = self.problem()?;
+        if let (ArchiveFault::NotFound, Some(why)) = (&problem.fault, &self.unfetched) {
+            problem.fault = ArchiveFault::Unfetched {
+                reason: why.reason.clone(),
+                in_full: why.in_full,
+            };
+        }
+        Some(problem)
+    }
+
+    /// The package as a plan carries it: read from the cache, and checked
+    /// against the locked SHA-256 again when it is installed.
+    fn planned(&self) -> PlannedPackage {
+        PlannedPackage {
+            entry: Entry {
+                name: self.locked.name.clone(),
+                version: Version::parse(&self.locked.version),
+                url: format!("cache:{}", self.sha256()),
+                md5: None,
+                display_name: None,
+                requires: Vec::new(),
+                lv_min: None,
+                source: String::new(),
+                released: None,
+                index_pin: None,
+            },
+            expected_sha256: Some(self.sha256()),
+        }
+    }
+}
+
+/// A place an archive may be: the repo of each GitHub dependency, whatever was
+/// imported, each local folder, the public feeds and each hosted source of the
+/// project. They are asked one at a time, so that one that is gone does not hide
+/// what another holds.
+enum Source {
+    /// A package's own repo (name, `owner/repo`): the only source of that
+    /// package, and of no other.
+    GitHub(String, String),
+    Imported,
+    Folder(PathBuf),
+    PublicFeeds,
+    Feed(String),
+    /// A community index repo: asked for the locked names, as the lock found its
+    /// packages there.
+    Index(index::IndexFeed),
+    /// An OCI source: fetched by digest, never listed, and asked only for the
+    /// packages the lock records as from it.
+    Oci(index::OciFeed),
+}
+
+impl Source {
+    fn all(env: &OpEnv, project: &Project) -> anyhow::Result<Vec<Source>> {
+        let mut sources: Vec<Source> = (project.github.iter())
+            .map(|(name, repo)| Source::GitHub(name.clone(), repo.clone()))
+            .collect();
+        sources.push(Source::Imported);
+        sources.extend(env.local_sources().into_iter().map(Source::Folder));
+        if project.default_sources {
+            sources.push(Source::PublicFeeds);
+        }
+        let (remotes, registries) =
+            index::split_sources(project.resolved_sources()?, &project.source_pins);
+        sources.extend(remotes.into_iter().map(|remote| match remote {
+            index::Remote::Hosted(folder) => Source::Feed(folder),
+            index::Remote::Index(feed) => Source::Index(feed),
+        }));
+        sources.extend(registries.into_iter().map(Source::Oci));
+        Ok(sources)
+    }
+
+    /// Whether this source may hold the locked package: a package with a
+    /// `github` line is in that repo's releases and nowhere else, and one with
+    /// a manifest digest is in the OCI source the lock names and nowhere else; one
+    /// whose source is a community index is in that index and nowhere else.
+    fn answers_for(&self, project: &Project, locked: &LockedPackage) -> bool {
+        let name = &locked.name;
+        match self {
+            Source::GitHub(own, _) => same_name(own, name),
+            Source::Oci(feed) => locked.digest.is_some() && locked.source == feed.url.to_string(),
+            Source::Index(feed) => locked.source.eq_ignore_ascii_case(&feed.source()),
+            _ => {
+                locked.digest.is_none()
+                    && index::index_repo(&locked.source).is_none()
+                    && !project.github.keys().any(|own| same_name(own, name))
+            }
+        }
+    }
+
+    /// The source's index. A repo's is made from a fresh listing, never the
+    /// cached one: a file uploaded again with `--clobber` has a new asset id.
+    ///
+    /// A community index is asked for `wanted`, the locked names, only.
+    fn index(
+        &self,
+        env: &OpEnv,
+        downloads: &Downloads,
+        wanted: &[String],
+    ) -> anyhow::Result<Index> {
+        let (feeds, folders, defaults) = match self {
+            Source::GitHub(name, repo) => return github_entries(env, downloads, name, repo),
+            Source::Index(feed) => return index_entries(env, feed, wanted),
+            Source::Imported => (Vec::new(), Vec::new(), false),
+            Source::Folder(dir) => (Vec::new(), vec![dir.clone()], false),
+            Source::PublicFeeds => (Vec::new(), Vec::new(), true),
+            Source::Feed(url) => (vec![index::Remote::Hosted(url.clone())], Vec::new(), false),
+            // Fetched by digest in `fetch_locked`, which never asks for this.
+            Source::Oci(_) => {
+                return Ok(Index {
+                    entries: Vec::new(),
+                });
+            }
+        };
+        index::load(
+            &env.config.cache,
+            env.refresh,
+            &index::SourceSet {
+                extra: &feeds,
+                local: &folders,
+                defaults,
+                ..index::SourceSet::default()
+            },
+            &env.oci,
+            env.sink,
+            &env.cancel,
+        )
+    }
+}
+
+/// What the community index `feed` lists under the `wanted` names.
+fn index_entries(env: &OpEnv, feed: &index::IndexFeed, wanted: &[String]) -> anyhow::Result<Index> {
+    let remotes = [index::Remote::Index(feed.clone())];
+    let files = IndexFiles::open(&env.config.cache, &env.github, env.refresh)?;
+    let fetch = |feed: &index::IndexFeed, key: &str| files.read(feed, key);
+    let sources = index::SourceSet {
+        extra: &remotes,
+        wanted,
+        index_fetch: &fetch,
+        index_parse: crate::community::read_entries,
+        ..index::SourceSet::default()
+    };
+    let (cache, refresh) = (&env.config.cache, env.refresh);
+    index::load(cache, refresh, &sources, &env.oci, env.sink, &env.cancel)
+}
+
+/// The index of `name`'s files in the releases of `repo` that GitHub lists now.
+fn github_entries(
+    env: &OpEnv,
+    downloads: &Downloads,
+    name: &str,
+    repo: &str,
+) -> anyhow::Result<Index> {
+    let listing = downloads.releases(&env.github.api, repo, name, true)?;
+    let entries = (listing.files.iter())
+        .map(|file| github_index::listed(name, repo, file))
+        .collect();
+    Ok(Index { entries })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lockfile::{FORMAT_VERSION, Inputs, LOCAL_SOURCE};
+    use std::collections::BTreeMap;
+
+    fn locked(name: &str, version: &str, requires: &[&str], dev: bool) -> LockedPackage {
+        locked_in(name, version, requires, if dev { &["dev"] } else { &[] })
+    }
+
+    fn locked_in(name: &str, version: &str, requires: &[&str], groups: &[&str]) -> LockedPackage {
+        LockedPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            sha256: format!("sha-of-{name}-{version}"),
+            md5: None,
+            digest: None,
+            source: LOCAL_SOURCE.to_string(),
+            requires: requires.iter().map(|name| name.to_string()).collect(),
+            groups: groups.iter().map(|group| group.to_string()).collect(),
+            signer: None,
+            subject: None,
+        }
+    }
+
+    fn lock_of(packages: Vec<LockedPackage>) -> Lockfile {
+        Lockfile {
+            version: FORMAT_VERSION,
+            labview: "2024".to_string(),
+            inputs: Inputs {
+                defaults: false,
+                sources: Vec::new(),
+                min_age_days: 0,
+                dependencies: BTreeMap::new(),
+                dev_dependencies: BTreeMap::new(),
+                dependency_groups: BTreeMap::new(),
+                github: BTreeMap::new(),
+                policy: Default::default(),
+                ..Default::default()
+            },
+            packages,
+            unresolved: Vec::new(),
+        }
+    }
+
+    /// An install manifest for the archive the lock holds for `name` and
+    /// `version`.
+    fn installed(name: &str, version: &str) -> Manifest {
+        Manifest {
+            name: name.to_string(),
+            version: version.to_string(),
+            display_name: None,
+            installed_at: 0,
+            target: String::new(),
+            files: Vec::new(),
+            palette_files: Vec::new(),
+            dependencies: Vec::new(),
+            skipped_hooks: Vec::new(),
+            relinked: false,
+            relink_folders: Vec::new(),
+            post_install_vi: None,
+            pre_install_vi: None,
+            pre_uninstall_vi: None,
+            post_uninstall_vi: None,
+            skipped_groups: Vec::new(),
+            archive_sha256: Some(format!("sha-of-{name}-{version}")),
+        }
+    }
+
+    fn install(name: &str, version: &str) -> SyncStep {
+        SyncStep::Install {
+            name: name.to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    fn replace(name: &str, from: &str, to: &str) -> SyncStep {
+        SyncStep::Replace {
+            name: name.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    fn remove(name: &str, version: &str, reason: RemoveReason) -> SyncStep {
+        SyncStep::Remove {
+            name: name.to_string(),
+            version: version.to_string(),
+            reason,
+            groups: Vec::new(),
+        }
+    }
+
+    fn remove_for_groups(name: &str, version: &str, groups: &[&str]) -> SyncStep {
+        SyncStep::Remove {
+            name: name.to_string(),
+            version: version.to_string(),
+            reason: RemoveReason::GroupsOnly,
+            groups: groups.iter().map(|group| group.to_string()).collect(),
+        }
+    }
+
+    fn no_dev() -> Selection {
+        Selection {
+            no_dev: true,
+            ..Selection::default()
+        }
+    }
+
+    fn with_groups(groups: &[&str]) -> Selection {
+        Selection {
+            groups: groups.iter().map(|group| group.to_string()).collect(),
+            ..Selection::default()
+        }
+    }
+
+    fn alpha_and_beta() -> Lockfile {
+        lock_of(vec![
+            locked("alpha", "2.0", &[], false),
+            locked("beta", "1.0", &["alpha"], false),
+        ])
+    }
+
+    #[test]
+    fn an_empty_destination_gets_everything_the_lock_lists() {
+        let plan = plan_sync(&alpha_and_beta(), &[], &Selection::default());
+        assert_eq!(
+            plan.steps,
+            [install("alpha", "2.0"), install("beta", "1.0")]
+        );
+        let wanted: Vec<&str> = plan.wanted.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(wanted, ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_destination_that_already_matches_has_nothing_to_do() {
+        let here = [installed("alpha", "2.0"), installed("beta", "1.0")];
+        let plan = plan_sync(&alpha_and_beta(), &here, &Selection::default());
+        assert!(plan.is_empty(), "{plan:?}");
+        assert!(plan.wanted.is_empty());
+    }
+
+    #[test]
+    fn a_package_the_lock_does_not_list_is_removed_with_that_reason() {
+        let here = [
+            installed("alpha", "2.0"),
+            installed("beta", "1.0"),
+            installed("gamma", "1.0"),
+        ];
+        let plan = plan_sync(&alpha_and_beta(), &here, &Selection::default());
+        assert_eq!(
+            plan.steps,
+            [remove("gamma", "1.0", RemoveReason::NotInLock)]
+        );
+        assert!(plan.wanted.is_empty(), "a removal fetches nothing");
+    }
+
+    #[test]
+    fn a_package_the_lock_records_as_an_unresolved_requirement_is_not_removed() {
+        let mut lock = alpha_and_beta();
+        lock.unresolved = vec![lockfile::LockedUnresolved {
+            name: "Ni_Lib".to_string(),
+            required_by: "beta".to_string(),
+        }];
+        let here = [
+            installed("alpha", "2.0"),
+            installed("beta", "1.0"),
+            installed("ni_lib", "1.0"),
+            installed("gamma", "1.0"),
+        ];
+        // No source listed ni_lib, so the lock cannot hold it; it is there
+        // because the requirement is met by hand.
+        assert_eq!(
+            plan_sync(&lock, &here, &Selection::default()).steps,
+            [remove("gamma", "1.0", RemoveReason::NotInLock)]
+        );
+    }
+
+    #[test]
+    fn another_version_is_replaced_and_names_both() {
+        let here = [installed("alpha", "1.0"), installed("beta", "1.0")];
+        let plan = plan_sync(&alpha_and_beta(), &here, &Selection::default());
+        assert_eq!(plan.steps, [replace("alpha", "1.0", "2.0")]);
+        assert_eq!(plan.wanted[0].version, "2.0");
+    }
+
+    #[test]
+    fn the_same_version_from_another_archive_is_replaced() {
+        let mut other = installed("alpha", "2.0");
+        other.archive_sha256 = Some("sha-of-something-else".to_string());
+        let here = [other, installed("beta", "1.0")];
+        let plan = plan_sync(&alpha_and_beta(), &here, &Selection::default());
+        assert_eq!(plan.steps, [replace("alpha", "2.0", "2.0")]);
+    }
+
+    #[test]
+    fn an_install_from_before_archives_were_hashed_is_replaced_from_the_verified_archive() {
+        let mut legacy = installed("alpha", "2.0");
+        legacy.archive_sha256 = None;
+        let here = [legacy, installed("beta", "1.0")];
+        let plan = plan_sync(&alpha_and_beta(), &here, &Selection::default());
+        // Nothing says which archive it came from, so it is not the locked one.
+        assert_eq!(plan.steps, [replace("alpha", "2.0", "2.0")]);
+        assert_eq!(plan.wanted[0].name, "alpha");
+    }
+
+    #[test]
+    fn names_match_whatever_their_case() {
+        let lock = lock_of(vec![locked("Alpha", "2.0", &[], false)]);
+        let mut here = installed("alpha", "2.0");
+        here.archive_sha256 = Some("sha-of-Alpha-2.0".to_string());
+        assert!(plan_sync(&lock, &[here], &Selection::default()).is_empty());
+    }
+
+    fn with_a_dev_package() -> Lockfile {
+        lock_of(vec![
+            locked("alpha", "2.0", &[], false),
+            locked("beta", "1.0", &["alpha"], false),
+            locked("caraya", "1.0", &["delta"], true),
+            locked("delta", "1.0", &[], true),
+        ])
+    }
+
+    #[test]
+    fn no_dev_leaves_out_what_only_dev_dependencies_need_and_removes_it_when_installed() {
+        let everything = [
+            installed("alpha", "2.0"),
+            installed("beta", "1.0"),
+            installed("caraya", "1.0"),
+            installed("delta", "1.0"),
+        ];
+        let plan = plan_sync(&with_a_dev_package(), &everything, &no_dev());
+        assert_eq!(
+            plan.steps,
+            [
+                remove("caraya", "1.0", RemoveReason::DevOnly),
+                remove("delta", "1.0", RemoveReason::DevOnly),
+            ]
+        );
+
+        let nothing_yet = plan_sync(&with_a_dev_package(), &[], &no_dev());
+        assert_eq!(
+            nothing_yet.steps,
+            [install("alpha", "2.0"), install("beta", "1.0")]
+        );
+    }
+
+    #[test]
+    fn without_no_dev_the_dev_packages_are_wanted_like_any_other() {
+        let plan = plan_sync(&with_a_dev_package(), &[], &Selection::default());
+        assert_eq!(plan.steps.len(), 4);
+    }
+
+    #[test]
+    fn a_package_that_normal_dependencies_need_too_stays_with_no_dev() {
+        // The lock does not mark alpha dev, because beta needs it as well.
+        let lock = lock_of(vec![
+            locked("alpha", "2.0", &[], false),
+            locked("caraya", "1.0", &["alpha"], true),
+        ]);
+        let here = [installed("alpha", "2.0"), installed("caraya", "1.0")];
+        let plan = plan_sync(&lock, &here, &no_dev());
+        assert_eq!(plan.steps, [remove("caraya", "1.0", RemoveReason::DevOnly)]);
+    }
+
+    /// The lock of the `[dependencies]` alpha, dev's caraya (needing delta),
+    /// and a `ci` group that lists ci_tools (needing alpha) and caraya.
+    fn with_a_ci_group() -> Lockfile {
+        lock_of(vec![
+            locked_in("alpha", "1.0", &[], &[]),
+            locked_in("ci_tools", "1.0", &["alpha"], &["ci"]),
+            locked_in("caraya", "1.0", &["delta"], &["ci", "dev"]),
+            locked_in("delta", "1.0", &[], &["ci", "dev"]),
+        ])
+    }
+
+    fn wanted_names(selection: &Selection) -> Vec<String> {
+        let mut names: Vec<String> = plan_sync(&with_a_ci_group(), &[], selection)
+            .wanted
+            .into_iter()
+            .map(|package| package.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_selection_decides_which_packages_are_wanted() {
+        let default = &Selection::default();
+        let ci = &with_groups(&["ci"]);
+        let no_dev_and_ci = &Selection {
+            no_dev: true,
+            ..with_groups(&["ci"])
+        };
+        let ci_twice = &with_groups(&["ci", "ci"]);
+        let dev = &with_groups(&["dev"]);
+        let everything = ["alpha", "caraya", "ci_tools", "delta"];
+        for (selection, wanted) in [
+            (default, &["alpha", "caraya", "delta"][..]),
+            (&no_dev(), &["alpha"]),
+            (ci, &everything),
+            (no_dev_and_ci, &everything),
+            (ci_twice, &everything),
+            (dev, &["alpha", "caraya", "delta"]),
+        ] {
+            assert_eq!(wanted_names(selection), wanted, "{selection:?}");
+        }
+    }
+
+    #[test]
+    fn dev_in_any_case_selects_the_dev_group() {
+        let options = SyncOptions {
+            groups: vec!["Dev".to_string(), "ci".to_string()],
+            ..SyncOptions::default()
+        };
+        let project = crate::project::parse("[dependency-groups.ci]").unwrap();
+        let selection = options.selection(&project).unwrap();
+        assert_eq!(
+            (selection.groups, selection.no_dev),
+            (vec!["ci".to_string()], false)
+        );
+    }
+
+    #[test]
+    fn the_group_flags_fold_into_one_selection() {
+        let project = crate::project::parse(
+            "[dependency-groups.test]\n\
+             [dependency-groups.ci]\ninclude-groups = [\"test\"]",
+        )
+        .unwrap();
+        let list = |groups: &[&str]| groups.iter().map(|g| g.to_string()).collect::<Vec<_>>();
+        let select = |with: &[&str], without: &[&str], only: &[&str]| {
+            let options = SyncOptions {
+                groups: list(with),
+                without: list(without),
+                only: list(only),
+                ..SyncOptions::default()
+            };
+            options.selection(&project).map_err(|e| e.to_string())
+        };
+        let picked = |groups: &[&str], no_dev: bool, no_main: bool| Selection {
+            groups: list(groups),
+            no_dev,
+            no_main,
+            keep_listed: false,
+        };
+        assert_eq!(
+            select(&[" ci"], &[], &[]),
+            Ok(picked(&["test", "ci"], false, false))
+        );
+        assert_eq!(
+            select(&["ci"], &["test"], &[]),
+            Ok(picked(&["ci"], false, false))
+        );
+        assert_eq!(select(&[], &["Dev"], &[]), Ok(picked(&[], true, false)));
+        assert_eq!(
+            select(&[], &[], &["ci"]),
+            Ok(picked(&["test", "ci"], true, true))
+        );
+        assert_eq!(
+            select(&[], &[], &["ci", "DEV"]),
+            Ok(picked(&["test", "ci"], false, true))
+        );
+        for (with, without, only) in [
+            (&["nope"][..], &[][..], &[][..]),
+            (&[], &["nope"], &[]),
+            (&[], &[], &["nope"]),
+        ] {
+            let err = select(with, without, only).unwrap_err();
+            assert!(err.contains("unknown group 'nope'"), "{err}");
+        }
+        assert_eq!(
+            select(&[], &[], &[""]),
+            Err("--only names no group".to_string())
+        );
+    }
+
+    const GROUPS: &str = r#"
+[dependencies]
+delacor_lib_qmh = "7.1.2.1547"
+
+[dependency-groups.test]
+jki_lib_caraya = "*"
+oglib_error = ">=6.0"
+
+[dependency-groups.ci]
+include-groups = ["test"]
+ni_vi_analyzer_tests = "1.2.0.3"
+
+[dependency-groups.build]
+vipm_package_builder = "*"
+"#;
+
+    fn strings(groups: &[&str]) -> Vec<String> {
+        groups.iter().map(|g| g.to_string()).collect()
+    }
+
+    /// What `--with`, `--without` and `--only` select from [`GROUPS`].
+    fn select_groups(with: &[&str], without: &[&str], only: &[&str]) -> Result<Selection, String> {
+        let project = crate::project::parse(GROUPS).unwrap();
+        let options = SyncOptions {
+            groups: strings(with),
+            without: strings(without),
+            only: strings(only),
+            ..SyncOptions::default()
+        };
+        options.selection(&project).map_err(|e| e.to_string())
+    }
+
+    fn picked(groups: &[&str], no_dev: bool, no_main: bool) -> Selection {
+        Selection {
+            groups: strings(groups),
+            no_dev,
+            no_main,
+            keep_listed: false,
+        }
+    }
+
+    // Upstream also lists each selection's packages; gone: a selection names groups, the lock their packages.
+    #[test]
+    fn selection_defaults_to_main_and_follows_with_without_only() {
+        assert_eq!(select_groups(&[], &[], &[]), Ok(picked(&[], false, false)));
+        assert_eq!(
+            select_groups(&["ci"], &[], &[]),
+            Ok(picked(&["test", "ci"], false, false))
+        );
+        assert_eq!(
+            select_groups(&["ci"], &["test"], &[]),
+            Ok(picked(&["ci"], false, false))
+        );
+        assert_eq!(
+            select_groups(&[], &[], &["build"]),
+            Ok(picked(&["build"], true, true))
+        );
+        // Upstream also takes --without main; gone: main is no group, so it is refused as unknown.
+    }
+
+    #[test]
+    fn several_groups_per_flag_and_duplicates() {
+        assert_eq!(
+            select_groups(&["test", "build"], &[], &[]),
+            Ok(picked(&["test", "build"], false, false))
+        );
+        assert_eq!(
+            select_groups(&["test", "test"], &[], &[]),
+            Ok(picked(&["test"], false, false))
+        );
+        assert_eq!(
+            select_groups(&["ci", "test"], &[], &[]),
+            Ok(picked(&["test", "ci"], false, false)),
+            "test once, before the group including it"
+        );
+        assert_eq!(
+            select_groups(&["ci", "build"], &["test", "build"], &[]),
+            Ok(picked(&["ci"], false, false))
+        );
+    }
+
+    #[test]
+    fn without_a_group_that_was_not_selected_changes_nothing() {
+        assert_eq!(
+            select_groups(&[], &["build"], &[]),
+            Ok(picked(&[], false, false))
+        );
+    }
+
+    #[test]
+    fn names_are_trimmed_empty_entries_dropped_and_case_kept() {
+        assert_eq!(
+            select_groups(&[" test", "build ", ""], &[], &[]),
+            Ok(picked(&["test", "build"], false, false))
+        );
+        assert_eq!(
+            select_groups(&["ci"], &[" test "], &[]),
+            Ok(picked(&["ci"], false, false))
+        );
+        // Upstream falls back to the default for an all-empty --only; the fork refuses it (#80).
+        assert_eq!(
+            select_groups(&[], &["  "], &["", " "]),
+            Err("--only names no group".to_string())
+        );
+        let err = select_groups(&["Test"], &[], &[]).unwrap_err();
+        assert!(
+            err.contains("'Test'"),
+            "group names are case-sensitive: {err}"
+        );
+    }
+
+    #[test]
+    fn leaving_dev_out_wins_over_a_group_that_includes_it() {
+        let project =
+            crate::project::parse("[dependency-groups.ci]\ninclude-groups = [\"dev\"]").unwrap();
+        let options = SyncOptions {
+            groups: vec!["ci".to_string()],
+            no_dev: true,
+            ..SyncOptions::default()
+        };
+        let selection = options.selection(&project).unwrap();
+        assert_eq!(
+            (selection.groups, selection.no_dev),
+            (vec!["ci".to_string()], true)
+        );
+    }
+
+    #[test]
+    fn only_refuses_a_group_the_lock_records_no_lines_for() {
+        let lock = with_a_ci_group();
+        let project = crate::project::parse(
+            "[dependency-groups.docs]\nbeta = \"*\"\n[dependency-groups.all]\ninclude-groups = [\"docs\"]",
+        )
+        .unwrap();
+        let refuse =
+            |selection: &Selection| refuse_groups_the_lock_lacks(&project, &lock, selection);
+        let only = |group: &str| Selection {
+            groups: vec![group.to_string()],
+            no_main: true,
+            ..Selection::default()
+        };
+        let err = refuse(&only("docs")).unwrap_err().to_string();
+        assert!(err.contains("lvpm.lock records no group 'docs'"), "{err}");
+        let with_docs = Selection {
+            no_main: false,
+            ..only("docs")
+        };
+        assert!(refuse(&with_docs).is_ok());
+        // An include-only group has no lines to miss: a current lock lacks it too.
+        assert!(refuse(&only("all")).is_ok());
+        // A lock that recorded the group while it was empty lacks its lines too.
+        let mut empty_docs = with_a_ci_group();
+        (empty_docs.inputs.dependency_groups).insert("docs".to_string(), BTreeMap::new());
+        let err = refuse_groups_the_lock_lacks(&project, &empty_docs, &only("docs")).unwrap_err();
+        assert!(err.to_string().contains("no group 'docs'"), "{err}");
+        // dev is checked the same way, though Selection.groups never holds it.
+        let dev_project = crate::project::parse("[dev-dependencies]\ncaraya = \"*\"").unwrap();
+        let mut no_dev_lines = with_a_ci_group();
+        no_dev_lines.inputs.dev_dependencies.clear();
+        let only_dev = Selection {
+            groups: vec![],
+            ..only("docs")
+        };
+        let err = refuse_groups_the_lock_lacks(&dev_project, &no_dev_lines, &only_dev).unwrap_err();
+        assert!(err.to_string().contains("no group 'dev'"), "{err}");
+        let not_dev = Selection {
+            no_dev: true,
+            ..only_dev
+        };
+        assert!(refuse_groups_the_lock_lacks(&dev_project, &no_dev_lines, &not_dev).is_ok());
+    }
+
+    #[test]
+    fn only_removes_what_just_dependencies_need_and_keeps_what_the_group_reaches() {
+        let mut lock = with_a_ci_group();
+        lock.packages.push(locked_in("beta", "1.0", &[], &[]));
+        let line = |name: &str| (name.to_string(), "*".to_string());
+        lock.inputs.dependency_groups.insert(
+            "ci".to_string(),
+            BTreeMap::from([line("ci_tools"), line("caraya")]),
+        );
+        let here = ["alpha", "beta", "ci_tools", "caraya", "delta"].map(|n| installed(n, "1.0"));
+        let only_ci = Selection {
+            groups: vec!["ci".to_string()],
+            no_dev: true,
+            no_main: true,
+            keep_listed: false,
+        };
+        // alpha stays because ci_tools needs it; delta because caraya does.
+        assert_eq!(
+            plan_sync(&lock, &here, &only_ci).steps,
+            [remove("beta", "1.0", RemoveReason::DependenciesOnly)]
+        );
+    }
+
+    #[test]
+    fn a_package_that_only_unselected_groups_need_is_removed_naming_them() {
+        let everything = [
+            installed("alpha", "1.0"),
+            installed("ci_tools", "1.0"),
+            installed("caraya", "1.0"),
+            installed("delta", "1.0"),
+        ];
+        let plan = plan_sync(&with_a_ci_group(), &everything, &Selection::default());
+        assert_eq!(plan.steps, [remove_for_groups("ci_tools", "1.0", &["ci"])]);
+
+        let plan = plan_sync(&with_a_ci_group(), &everything, &no_dev());
+        assert_eq!(
+            plan.steps,
+            [
+                remove_for_groups("ci_tools", "1.0", &["ci"]),
+                remove_for_groups("caraya", "1.0", &["ci", "dev"]),
+                remove_for_groups("delta", "1.0", &["ci", "dev"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn keep_listed_keeps_what_is_installed_and_the_lock_lists_and_installs_only_what_is_wanted() {
+        let keep = Selection {
+            keep_listed: true,
+            ..Selection::default()
+        };
+        let here = [installed("ci_tools", "1.0"), installed("gone", "1.0")];
+        let plan = plan_sync(&with_a_ci_group(), &here, &keep);
+        assert_eq!(
+            plan.steps,
+            [
+                remove("gone", "1.0", RemoveReason::NotInLock),
+                install("alpha", "1.0"),
+                install("delta", "1.0"),
+                install("caraya", "1.0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_package_not_in_the_lock_is_not_in_the_lock_even_with_no_dev() {
+        let here = [installed("gamma", "1.0")];
+        let plan = plan_sync(&alpha_and_beta(), &here, &no_dev());
+        assert_eq!(
+            plan.steps[0],
+            remove("gamma", "1.0", RemoveReason::NotInLock)
+        );
+    }
+
+    #[test]
+    fn removals_come_first_and_each_package_follows_what_it_requires() {
+        // The lock is in name order; `aardvark` needs `zebra`.
+        let lock = lock_of(vec![
+            locked("aardvark", "1.0", &["zebra"], false),
+            locked("middle", "1.0", &["aardvark"], false),
+            locked("zebra", "1.0", &[], false),
+        ]);
+        let plan = plan_sync(&lock, &[installed("gone", "1.0")], &Selection::default());
+        assert_eq!(
+            plan.steps,
+            [
+                remove("gone", "1.0", RemoveReason::NotInLock),
+                install("zebra", "1.0"),
+                install("aardvark", "1.0"),
+                install("middle", "1.0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_requirement_cycle_does_not_loop() {
+        let lock = lock_of(vec![
+            locked("one", "1.0", &["two"], false),
+            locked("two", "1.0", &["one"], false),
+        ]);
+        assert_eq!(plan_sync(&lock, &[], &Selection::default()).steps.len(), 2);
+    }
+
+    // ---- fetching by SHA-256 ----
+
+    use crate::cache::Cache;
+    use crate::config::Config;
+    use crate::events::NullSink;
+    use std::io::Write;
+    use std::path::Path;
+
+    /// A scratch directory with a cache, a local package folder and a second
+    /// one, removed when it goes out of scope.
+    struct Scratch {
+        root: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let root =
+                std::env::temp_dir().join(format!("lvpm-sync-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("packages")).unwrap();
+            std::fs::create_dir_all(root.join("more-packages")).unwrap();
+            Scratch { root }
+        }
+
+        fn folder(&self) -> PathBuf {
+            self.root.join("packages")
+        }
+
+        fn cache(&self) -> Cache {
+            Cache::open(&self.root.join("cache")).unwrap()
+        }
+
+        fn env<'a>(&self, sink: &'a dyn EventSink, folders: Vec<PathBuf>) -> OpEnv<'a> {
+            let config = Config {
+                log_dir: Default::default(),
+                venv_title: Default::default(),
+                cache: self.root.join("cache"),
+                hooks_run: Vec::new(),
+                local_sources: folders,
+                venv_dir: PathBuf::from(".lv-venv"),
+            };
+            OpEnv::new(sink, config, Vec::new(), self.root.clone())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A `.vip` with only a spec. `tag` is written into the spec, so that two
+    /// archives of one package and version can have different bytes.
+    fn vip(name: &str, version: &str, tag: &str) -> Vec<u8> {
+        vip_requiring(name, version, "", tag)
+    }
+
+    /// `requires` is a spec's `Requires` value: `alpha>=1.0`.
+    fn vip_requiring(name: &str, version: &str, requires: &str, tag: &str) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("spec", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let mut spec = format!("[Package]\nName={name}\nVersion={version}\nDisplay Name={tag}\n");
+        if !requires.is_empty() {
+            spec.push_str(&format!("[Dependencies]\nRequires={requires}\n"));
+        }
+        spec.push_str("[Platform]\nExclusive_LabVIEW_Version=LabVIEW>=20.0\n");
+        writer.write_all(spec.as_bytes()).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn put(dir: &Path, name: &str, version: &str, bytes: &[u8]) {
+        std::fs::write(dir.join(format!("{name}-{version}.vip")), bytes).unwrap();
+    }
+
+    fn locked_as(name: &str, version: &str, bytes: &[u8]) -> LockedPackage {
+        let mut package = locked(name, version, &[], false);
+        package.sha256 = sha256_hex(bytes);
+        package
+    }
+
+    fn manifest(sources: &str) -> Project {
+        crate::project::parse(&format!(
+            "[project]\nlabview = \">=2024\"\n\n[sources]\n{sources}defaults = false\n"
+        ))
+        .unwrap()
+    }
+
+    fn problems(why: SyncError) -> Vec<LockedArchiveProblem> {
+        match why {
+            SyncError::Archives(problems) => problems,
+            other => panic!("expected archive problems, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_archive_in_the_cache_is_used_with_no_source_at_all() {
+        let scratch = Scratch::new("cache-hit");
+        let bytes = vip("alpha", "2.0", "");
+        scratch.cache().store(&bytes).unwrap();
+        let lock = locked_as("alpha", "2.0", &bytes);
+
+        let planned = fetch_locked(
+            &scratch.env(&NullSink, vec![]),
+            &manifest(""),
+            std::slice::from_ref(&lock),
+        )
+        .unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].entry.name, "alpha");
+        assert_eq!(planned[0].entry.url, format!("cache:{}", lock.sha256));
+        assert_eq!(
+            planned[0].expected_sha256.as_deref(),
+            Some(lock.sha256.as_str())
+        );
+    }
+
+    #[test]
+    fn an_archive_found_in_a_local_folder_is_kept_in_the_cache() {
+        let scratch = Scratch::new("folder");
+        let bytes = vip("alpha", "2.0", "");
+        put(&scratch.folder(), "alpha", "2.0", &bytes);
+        let lock = locked_as("alpha", "2.0", &bytes);
+
+        let env = scratch.env(&NullSink, vec![scratch.folder()]);
+        let planned = fetch_locked(&env, &manifest(""), std::slice::from_ref(&lock)).unwrap();
+        assert_eq!(planned[0].entry.url, format!("cache:{}", lock.sha256));
+        assert_eq!(
+            scratch.cache().load(&lock.sha256).unwrap().as_deref(),
+            Some(bytes.as_slice()),
+            "a plan that reads the cache needs the bytes there"
+        );
+    }
+
+    #[test]
+    fn a_source_that_has_gone_does_not_hide_the_one_that_has_the_archive() {
+        let scratch = Scratch::new("moved");
+        let bytes = vip("alpha", "2.0", "");
+        put(&scratch.root.join("more-packages"), "alpha", "2.0", &bytes);
+        let lock = locked_as("alpha", "2.0", &bytes);
+
+        // The folder the lock was made from is gone, and so is the feed.
+        let gone = scratch.root.join("no-longer-there");
+        let env = scratch.env(&NullSink, vec![gone, scratch.root.join("more-packages")]);
+        let project = manifest("dead = \"http://127.0.0.1:1/feed\"\n");
+        let planned = fetch_locked(&env, &project, &[lock]).unwrap();
+        assert_eq!(planned.len(), 1);
+    }
+
+    #[test]
+    fn an_imported_archive_needs_no_source() {
+        let scratch = Scratch::new("imported");
+        let bytes = vip("alpha", "2.0", "");
+        put(&scratch.folder(), "alpha", "2.0", &bytes);
+        index::cache_add(
+            &scratch.root.join("cache"),
+            &scratch.folder().join("alpha-2.0.vip"),
+            false,
+        )
+        .unwrap();
+        std::fs::remove_file(scratch.folder().join("alpha-2.0.vip")).unwrap();
+        let lock = locked_as("alpha", "2.0", &bytes);
+
+        let planned =
+            fetch_locked(&scratch.env(&NullSink, vec![]), &manifest(""), &[lock]).unwrap();
+        assert_eq!(planned.len(), 1);
+    }
+
+    #[test]
+    fn a_missing_archive_fails_the_whole_fetch_and_every_missing_one_is_named() {
+        let scratch = Scratch::new("missing");
+        let there = vip("alpha", "2.0", "");
+        put(&scratch.folder(), "alpha", "2.0", &there);
+        let locks = [
+            locked_as("alpha", "2.0", &there),
+            locked_as("beta", "1.0", b"nobody has these bytes"),
+            locked_as("gamma", "1.0", b"nor these"),
+        ];
+
+        let env = scratch.env(&NullSink, vec![scratch.folder()]);
+        let found = problems(fetch_locked(&env, &manifest(""), &locks).unwrap_err());
+        assert_eq!(
+            found
+                .iter()
+                .map(|problem| (
+                    problem.name.as_str(),
+                    problem.version.as_str(),
+                    &problem.fault
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("beta", "1.0", &ArchiveFault::NotFound),
+                ("gamma", "1.0", &ArchiveFault::NotFound)
+            ]
+        );
+        assert_eq!(found[0].sha256, locks[1].sha256);
+    }
+
+    #[test]
+    fn an_archive_with_other_bytes_is_never_used_and_is_told_from_a_missing_one() {
+        let scratch = Scratch::new("differs-folder");
+        let locked_bytes = vip("alpha", "2.0", "what the lock has");
+        let other_bytes = vip("alpha", "2.0", "something else");
+        put(&scratch.folder(), "alpha", "2.0", &other_bytes);
+        let lock = locked_as("alpha", "2.0", &locked_bytes);
+
+        let env = scratch.env(&NullSink, vec![scratch.folder()]);
+        let found = problems(fetch_locked(&env, &manifest(""), &[lock]).unwrap_err());
+        assert_eq!(
+            found[0].fault,
+            ArchiveFault::DiffersFromLock {
+                found_sha256: sha256_hex(&other_bytes)
+            }
+        );
+        assert!(
+            scratch
+                .cache()
+                .load(&sha256_hex(&other_bytes))
+                .unwrap()
+                .is_none(),
+            "bytes that are not the locked ones are not kept"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_cache_entry_is_an_archive_with_other_bytes() {
+        let scratch = Scratch::new("differs-cache");
+        let bytes = vip("alpha", "2.0", "");
+        let sha256 = scratch.cache().store(&bytes).unwrap();
+        let blob = scratch
+            .root
+            .join("cache/content/sha256")
+            .join(&sha256[..2])
+            .join(&sha256);
+        std::fs::write(&blob, b"not what was stored").unwrap();
+        let lock = locked_as("alpha", "2.0", &bytes);
+
+        let found = problems(
+            fetch_locked(&scratch.env(&NullSink, vec![]), &manifest(""), &[lock]).unwrap_err(),
+        );
+        assert_eq!(
+            found[0].fault,
+            ArchiveFault::DiffersFromLock {
+                found_sha256: sha256_hex(b"not what was stored")
+            }
+        );
+    }
+
+    #[test]
+    fn a_corrupt_cache_entry_is_replaced_by_the_right_archive_from_a_source() {
+        let scratch = Scratch::new("repair");
+        let bytes = vip("alpha", "2.0", "");
+        let sha256 = scratch.cache().store(&bytes).unwrap();
+        let blob = scratch
+            .root
+            .join("cache/content/sha256")
+            .join(&sha256[..2])
+            .join(&sha256);
+        std::fs::write(&blob, b"corrupt").unwrap();
+        put(&scratch.folder(), "alpha", "2.0", &bytes);
+        let lock = locked_as("alpha", "2.0", &bytes);
+
+        let env = scratch.env(&NullSink, vec![scratch.folder()]);
+        fetch_locked(&env, &manifest(""), &[lock]).unwrap();
+        assert_eq!(scratch.cache().load(&sha256).unwrap(), Some(bytes));
+    }
+
+    #[test]
+    fn a_cancel_ends_the_search_for_archives_and_is_not_an_archive_that_is_missing() {
+        let scratch = Scratch::new("cancelled-search");
+        let env = scratch.env(&NullSink, vec![]);
+        env.cancel.cancel();
+        let project = manifest("dead = \"http://127.0.0.1:1/feed\"\n");
+        let lock = locked_as("alpha", "2.0", b"nobody has these bytes");
+
+        let why = fetch_locked(&env, &project, &[lock]).unwrap_err();
+        assert!(matches!(why, SyncError::Cancelled), "{why:?}");
+    }
+
+    #[test]
+    fn a_cancel_during_the_last_sources_load_is_a_cancel_and_not_a_missing_archive() {
+        let scratch = Scratch::new("cancelled-last-load");
+        let project = manifest(
+            "dead = \"http://127.0.0.1:1/feed\"
+",
+        );
+        let token = crate::cancel::CancelToken::new();
+        // The feed is the last source; its load starts, is cancelled, and ends
+        // with nothing, with no source left for the loop to look at the token.
+        let sink = CancelOn::new(&token, |event| {
+            matches!(event, Event::FeedCheckStart { .. })
+        });
+        let mut env = scratch.env(&sink, vec![]);
+        env.cancel = token;
+        let lock = locked_as("alpha", "2.0", b"nobody has these bytes");
+
+        let why = fetch_locked(&env, &project, &[lock]).unwrap_err();
+        assert_eq!(sink.answered(), Some(true), "the cancel was not accepted");
+        assert!(matches!(why, SyncError::Cancelled), "{why:?}");
+    }
+
+    /// A project whose `alpha` comes from `o/r`, read on an API nobody serves.
+    fn github_project(scratch: &Scratch) -> (OpEnv<'static>, Project) {
+        let project = crate::project::parse(
+            "[project]\nlabview = \">=2024\"\n\n[sources]\ndefaults = false\n\n\
+             [dependencies]\nalpha = { github = \"o/r\", version = \"*\" }\n",
+        )
+        .unwrap();
+        let mut env = scratch.env(&NullSink, vec![scratch.folder()]);
+        env.github.api = "http://127.0.0.1:1".to_string();
+        (env, project)
+    }
+
+    #[test]
+    fn a_repo_that_cannot_be_read_says_why_for_its_own_package_only() {
+        let scratch = Scratch::new("github-down");
+        let (env, project) = github_project(&scratch);
+        let locks = [
+            locked_as("alpha", "2.0", b"in a release"),
+            locked_as("beta", "1.0", b"nobody has these bytes"),
+        ];
+
+        let found = problems(fetch_locked(&env, &project, &locks).unwrap_err());
+        let faults: Vec<_> = found.iter().map(|problem| &problem.fault).collect();
+        assert!(
+            matches!(faults[0], ArchiveFault::Unfetched { reason, .. }
+                if reason.starts_with("alpha (github.com/o/r): cannot read the releases")),
+            "{faults:?}"
+        );
+        assert_eq!(faults[1], &ArchiveFault::NotFound, "beta is not alpha's");
+    }
+
+    #[test]
+    fn a_repo_is_not_listed_for_an_archive_the_cache_holds() {
+        let scratch = Scratch::new("github-not-asked");
+        let (env, project) = github_project(&scratch);
+        let bytes = vip("alpha", "2.0", "");
+        scratch.cache().store(&bytes).unwrap();
+        let lock = locked_as("alpha", "2.0", &bytes);
+
+        let planned = fetch_locked(&env, &project, &[lock]).unwrap();
+        assert_eq!(planned.len(), 1, "the closed API was never asked");
+    }
+
+    #[test]
+    fn a_repo_answers_for_its_own_package_whatever_its_case_and_no_other_source_does() {
+        let (_, project) = github_project(&Scratch::new("github-answers"));
+        let repo = Source::GitHub("Alpha".into(), "o/r".into());
+        let package = |name: &str| locked_as(name, "2.0", b"");
+        assert!(repo.answers_for(&project, &package("alpha")));
+        assert!(!repo.answers_for(&project, &package("beta")));
+        assert!(Source::Imported.answers_for(&project, &package("beta")));
+        assert!(!Source::Imported.answers_for(&project, &package("ALPHA")));
+    }
+
+    #[test]
+    fn an_index_answers_for_its_locked_package_whatever_the_case_of_its_manifest_line() {
+        let (_, project) = github_project(&Scratch::new("index-answers"));
+        let index = |owner: &str, repo: &str| {
+            Source::Index(index::IndexFeed {
+                owner: owner.into(),
+                repo: repo.into(),
+            })
+        };
+        let mut alpha = locked_as("alpha", "2.0", b"");
+        alpha.source = "github-index:o/idx".to_string();
+        assert!(index("o", "idx").answers_for(&project, &alpha));
+        assert!(index("O", "IDX").answers_for(&project, &alpha));
+        assert!(!index("o", "other").answers_for(&project, &alpha));
+    }
+
+    #[test]
+    fn a_refused_index_url_is_worded_in_full_and_any_other_failure_after_the_package() {
+        let refused = IndexUrlRefused {
+            name: "alpha".into(),
+            version: "1.0".into(),
+            index: "github-index:o/r".into(),
+            publisher: "a/x".into(),
+        };
+        let said = Unfetched::of_download(&refused.clone().into());
+        assert_eq!((said.reason, said.in_full), (refused.to_string(), true));
+        let said = Unfetched::of_download(&anyhow::anyhow!("HTTP 500"));
+        assert_eq!((said.reason, said.in_full), ("HTTP 500".to_string(), false));
+    }
+
+    #[test]
+    fn an_oci_package_is_asked_of_its_own_source_and_of_no_other() {
+        let (_, project) = github_project(&Scratch::new("oci-answers"));
+        let team = |name: &str| index::OciFeed {
+            name: name.to_string(),
+            url: crate::oci::FeedUrl::parse(&format!("oci://r:5000/{name}")).unwrap(),
+            pinned: Vec::new(),
+        };
+        let mut alpha = locked_as("beta", "1.0", b"");
+        alpha.source = "oci://r:5000/team".to_string();
+        alpha.digest = Some(format!("sha256:{}", "ab".repeat(32)));
+        assert!(Source::Oci(team("team")).answers_for(&project, &alpha));
+        assert!(!Source::Oci(team("other")).answers_for(&project, &alpha));
+        assert!(!Source::Imported.answers_for(&project, &alpha));
+        assert!(!Source::Feed("http://f/index.vipr".into()).answers_for(&project, &alpha));
+        // A package with no digest is not the OCI source's, whatever its source says.
+        alpha.digest = None;
+        assert!(!Source::Oci(team("team")).answers_for(&project, &alpha));
+    }
+
+    #[test]
+    fn a_package_of_a_repo_is_not_taken_from_a_folder_when_the_repo_cannot_be_read() {
+        let scratch = Scratch::new("github-only");
+        let (env, project) = github_project(&scratch);
+        let bytes = vip("alpha", "2.0", "");
+        put(&scratch.folder(), "alpha", "2.0", &bytes);
+
+        let found = problems(
+            fetch_locked(&env, &project, &[locked_as("alpha", "2.0", &bytes)]).unwrap_err(),
+        );
+        assert!(
+            matches!(&found[0].fault, ArchiveFault::Unfetched { .. }),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_wanted_opens_nothing() {
+        let scratch = Scratch::new("nothing");
+        let env = scratch.env(&NullSink, vec![]);
+        assert!(fetch_locked(&env, &manifest(""), &[]).unwrap().is_empty());
+        assert!(!scratch.root.join("cache").exists());
+    }
+
+    // ---- the whole operation, on real files ----
+
+    use super::super::testing::CancelOn;
+    use crate::events::EventSink;
+    use crate::target::Roots;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<Event>>);
+
+    impl EventSink for Recorder {
+        fn emit(&self, event: Event) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    impl Recorder {
+        fn events(&self) -> Vec<Event> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    const MANIFEST_HEAD: &str =
+        "[project]\nlabview = \">=2024\"\n\n[sources]\ndefaults = false\n\n";
+
+    /// A project: a manifest depending on `dependencies`, and a folder of the
+    /// packages alpha 1.0 and 2.0, beta 1.0 (needing alpha), gamma 1.0.
+    fn project(tag: &str, dependencies: &[&str]) -> Scratch {
+        let scratch = Scratch::new(tag);
+        for (name, version, requires) in [
+            ("alpha", "1.0", ""),
+            ("alpha", "2.0", ""),
+            ("beta", "1.0", "alpha>=1.0"),
+            ("gamma", "1.0", ""),
+        ] {
+            put(
+                &scratch.folder(),
+                name,
+                version,
+                &vip_requiring(name, version, requires, ""),
+            );
+        }
+        scratch.write_manifest(dependencies);
+        scratch
+    }
+
+    impl Scratch {
+        fn write_manifest(&self, dependencies: &[&str]) {
+            let lines: String = dependencies
+                .iter()
+                .map(|name| format!("{name} = \"*\"\n"))
+                .collect();
+            std::fs::write(
+                self.root.join(crate::project::FILE_NAME),
+                format!("{MANIFEST_HEAD}[dependencies]\n{lines}"),
+            )
+            .unwrap();
+        }
+
+        /// An environment that syncs into `dest`, reading the local folder.
+        fn sync_env<'a>(&self, sink: &'a dyn EventSink) -> OpEnv<'a> {
+            let mut env = self.env(sink, vec![self.folder()]);
+            env.flags.prefix = Some(self.root.join("dest"));
+            env
+        }
+
+        fn sync(&self, opts: &SyncOptions) -> (Result<(), SyncError>, Vec<Event>) {
+            let sink = Recorder::default();
+            let outcome = sync(&self.sync_env(&sink), opts);
+            (outcome, sink.events())
+        }
+
+        fn installed(&self) -> Vec<(String, String)> {
+            let roots = Roots::scratch(&self.root.join("dest"));
+            install::list_installed(&roots)
+                .unwrap()
+                .into_iter()
+                .map(|manifest| (manifest.name, manifest.version))
+                .collect()
+        }
+
+        fn lock_path(&self) -> PathBuf {
+            self.root.join(lockfile::FILE_NAME)
+        }
+
+        fn lock_bytes(&self) -> Option<Vec<u8>> {
+            std::fs::read(self.lock_path()).ok()
+        }
+    }
+
+    fn pairs(packages: &[(&str, &str)]) -> Vec<(String, String)> {
+        packages
+            .iter()
+            .map(|(name, version)| (name.to_string(), version.to_string()))
+            .collect()
+    }
+
+    fn with(lock: LockPolicy) -> SyncOptions {
+        SyncOptions {
+            lock,
+            ..SyncOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_sync_installs_exactly_the_locked_set_from_the_archives_the_lock_names() {
+        let project = project("installs", &["beta"]);
+        let (outcome, _) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        assert_eq!(
+            project.installed(),
+            pairs(&[("alpha", "2.0"), ("beta", "1.0")])
+        );
+        let lock = Lockfile::read(&project.lock_path()).unwrap();
+        let roots = Roots::scratch(&project.root.join("dest"));
+        for package in &lock.packages {
+            let manifest = install::read_manifest(&roots, &package.name).unwrap();
+            assert_eq!(manifest.archive_sha256.as_deref(), Some(&*package.sha256));
+        }
+    }
+
+    #[test]
+    fn an_extra_package_is_announced_and_then_removed_when_the_front_end_does_not_ask() {
+        let project = project("extra", &["beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["beta"]);
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+        assert_eq!(
+            project.installed(),
+            pairs(&[("alpha", "2.0"), ("beta", "1.0")])
+        );
+        let announced = events
+            .iter()
+            .position(|event| {
+                matches!(event, Event::SyncPlanned { steps, dry_run: false }
+                if steps == &[remove("gamma", "1.0", RemoveReason::NotInLock)])
+            })
+            .unwrap_or_else(|| panic!("no announcement in {events:?}"));
+        let removed = events
+            .iter()
+            .position(
+                |event| matches!(event, Event::PackageRemoved { name, .. } if name == "gamma"),
+            )
+            .unwrap_or_else(|| panic!("no removal in {events:?}"));
+        assert!(announced < removed, "{events:?}");
+    }
+
+    #[test]
+    fn a_locked_version_below_the_installed_one_is_installed_as_a_replace() {
+        let project = project("downgrade", &["alpha"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        assert_eq!(project.installed(), pairs(&[("alpha", "2.0")]));
+
+        // The manifest now pins alpha 1.0, and the lock follows it down.
+        std::fs::write(
+            project.root.join(crate::project::FILE_NAME),
+            format!("{MANIFEST_HEAD}[dependencies]\nalpha = \"1.0\"\n"),
+        )
+        .unwrap();
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        assert_eq!(project.installed(), pairs(&[("alpha", "1.0")]));
+        let planned = events.iter().find_map(|event| match event {
+            Event::SyncPlanned {
+                steps,
+                dry_run: false,
+            } => Some(steps),
+            _ => None,
+        });
+        assert_eq!(planned, Some(&vec![replace("alpha", "2.0", "1.0")]));
+    }
+
+    #[test]
+    fn a_second_sync_of_the_same_project_has_nothing_to_do() {
+        let project = project("nothing-to-do", &["beta"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+        assert!(events.contains(&Event::SyncNothingToDo), "{events:?}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::PackageStart { .. } | Event::PackageRemoved { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// A project that depends on alpha, with a `ci` group holding beta.
+    fn project_with_a_ci_group(tag: &str) -> Scratch {
+        let project = project(tag, &["alpha"]);
+        let path = project.root.join(crate::project::FILE_NAME);
+        let mut manifest = std::fs::read_to_string(&path).unwrap();
+        manifest.push_str(
+            "
+[dependency-groups.ci]
+beta = \"*\"
+",
+        );
+        std::fs::write(path, manifest).unwrap();
+        project
+    }
+
+    fn selecting(groups: &[&str]) -> SyncOptions {
+        SyncOptions {
+            groups: groups.iter().map(|group| group.to_string()).collect(),
+            ..SyncOptions::default()
+        }
+    }
+
+    #[test]
+    fn an_unknown_group_fails_naming_the_defined_ones_before_a_lock_is_written() {
+        let project = project_with_a_ci_group("unknown-group-no-lock");
+        let (outcome, events) = project.sync(&selecting(&["nope"]));
+
+        assert_eq!(
+            outcome.unwrap_err().to_string(),
+            "unknown group 'nope'; defined groups: ci, dev"
+        );
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert!(project.installed().is_empty());
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::SyncLockMissing { .. } | Event::SyncPlanned { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_group_leaves_a_stale_lock_and_the_destination_as_they_were() {
+        let project = project_with_a_ci_group("unknown-group-stale-lock");
+        project.sync(&SyncOptions::default()).0.unwrap();
+        let stale = project.lock_bytes().unwrap();
+        // The manifest moves on, so the lock is stale and a sync would rewrite it.
+        project.write_manifest(&["alpha", "gamma"]);
+
+        let (outcome, _) = project.sync(&selecting(&["ci", "nope"]));
+
+        assert!(outcome.is_err());
+        assert_eq!(project.lock_bytes(), Some(stale));
+        assert_eq!(project.installed(), pairs(&[("alpha", "2.0")]));
+    }
+
+    #[test]
+    fn dev_in_any_case_and_an_empty_dev_table_are_known_groups() {
+        let project = project_with_a_ci_group("known-groups");
+        let (outcome, _) = project.sync(&selecting(&["Dev", "ci"]));
+        outcome.unwrap();
+        assert_eq!(
+            project.installed(),
+            pairs(&[("alpha", "2.0"), ("beta", "1.0")])
+        );
+    }
+
+    #[test]
+    fn a_group_that_is_no_longer_selected_is_announced_with_its_name_and_then_removed() {
+        let project = project_with_a_ci_group("group-deselected");
+        project.sync(&selecting(&["ci"])).0.unwrap();
+        assert_eq!(project.installed().len(), 2);
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        assert_eq!(project.installed(), pairs(&[("alpha", "2.0")]));
+        assert!(
+            events.iter().any(|event| matches!(event,
+                Event::SyncPlanned { steps, dry_run: false }
+                if steps == &[remove_for_groups("beta", "1.0", &["ci"])])),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_archive_fails_the_sync_before_anything_is_changed() {
+        let project = project("missing-archive", &["gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        assert_eq!(project.installed(), pairs(&[("gamma", "1.0")]));
+
+        // Now the project wants beta, which needs alpha 2.0, and nothing holds
+        // that any more.
+        project.write_manifest(&["beta"]);
+        let lock = locking_lock(&project);
+        assert_eq!(lock.packages.len(), 2, "{lock:?}");
+        std::fs::remove_file(project.folder().join("alpha-2.0.vip")).unwrap();
+        std::fs::remove_dir_all(project.root.join("cache")).unwrap();
+
+        let (outcome, events) = project.sync(&with(LockPolicy::Locked));
+        let SyncError::Archives(problems) = outcome.unwrap_err() else {
+            panic!("expected archive problems");
+        };
+        assert_eq!(problems.len(), 1);
+        assert_eq!(
+            (problems[0].name.as_str(), problems[0].fault.clone()),
+            ("alpha", ArchiveFault::NotFound)
+        );
+        assert_eq!(project.installed(), pairs(&[("gamma", "1.0")]));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::PackageStart { .. } | Event::PackageRemoved { .. }
+            )),
+            "nothing was started: {events:?}"
+        );
+    }
+
+    /// Removes `path` when the lock starts to hash `package`: after the
+    /// sources were read, and before the archive is fetched from them.
+    struct RemoveWhenHashing<'a> {
+        package: &'a str,
+        path: PathBuf,
+    }
+
+    impl EventSink for RemoveWhenHashing<'_> {
+        fn emit(&self, event: Event) {
+            if matches!(&event, Event::LockHashing { name, .. } if name == self.package) {
+                std::fs::remove_file(&self.path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_kept_archive_that_cannot_be_fetched_fails_the_sync_and_says_why() {
+        let project = project("unfetched", &["gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        let (lock, installed) = (project.lock_bytes(), project.installed());
+
+        // The lock is out of date, so it is made again keeping gamma 1.0. The
+        // cache is gone, and the folder's gamma is listed and then unreadable.
+        project.write_manifest(&["gamma", "alpha"]);
+        std::fs::remove_dir_all(project.root.join("cache")).unwrap();
+        let gamma = project.folder().join("gamma-1.0.vip");
+        let sink = RemoveWhenHashing {
+            package: "gamma",
+            path: gamma.clone(),
+        };
+        let outcome = sync(&project.sync_env(&sink), &SyncOptions::default());
+
+        let Err(SyncError::Lock(LockError::ArchivesUnavailable(failures))) = outcome else {
+            panic!("expected archives that could not be fetched, got {outcome:?}");
+        };
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            (failures[0].name.as_str(), failures[0].version.as_str()),
+            ("gamma", "1.0")
+        );
+        assert!(
+            failures[0].reason.contains("gamma-1.0.vip"),
+            "{}",
+            failures[0].reason
+        );
+        assert_eq!(
+            (project.lock_bytes(), project.installed()),
+            (lock, installed),
+            "nothing changed"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_sync_removes_nothing_even_when_it_has_nothing_to_fetch() {
+        let project = project("cancelled-removal", &["beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["beta"]);
+        locking_lock(&project);
+
+        let sink = Recorder::default();
+        let env = project.sync_env(&sink);
+        assert!(env.cancel.cancel());
+        let outcome = sync(&env, &with(LockPolicy::Locked));
+
+        assert!(matches!(outcome, Err(SyncError::Cancelled)), "{outcome:?}");
+        assert_eq!(
+            project.installed(),
+            pairs(&[("alpha", "2.0"), ("beta", "1.0"), ("gamma", "1.0")])
+        );
+    }
+
+    /// The lock for the manifest as it is, made with a sync that fetches it.
+    fn locking_lock(project: &Scratch) -> Lockfile {
+        let sink = Recorder::default();
+        locking::lock(&project.sync_env(&sink)).unwrap()
+    }
+
+    #[test]
+    fn strictness_is_set_by_a_flag_and_otherwise_by_where_the_sync_runs() {
+        let flags = |locked, frozen, no_locked| LockFlags {
+            locked,
+            frozen,
+            no_locked,
+        };
+        let is = |policy, implied_by_headless| Strictness {
+            policy,
+            implied_by_headless,
+        };
+        // (headless, locked, frozen, no_locked) -> what the sync does.
+        let matrix = [
+            (
+                false,
+                flags(false, false, false),
+                is(LockPolicy::Update, false),
+            ),
+            (
+                false,
+                flags(true, false, false),
+                is(LockPolicy::Locked, false),
+            ),
+            (
+                false,
+                flags(false, true, false),
+                is(LockPolicy::Frozen, false),
+            ),
+            (
+                false,
+                flags(false, false, true),
+                is(LockPolicy::Update, false),
+            ),
+            (
+                true,
+                flags(false, false, false),
+                is(LockPolicy::Locked, true),
+            ),
+            (
+                true,
+                flags(true, false, false),
+                is(LockPolicy::Locked, false),
+            ),
+            (
+                true,
+                flags(false, true, false),
+                is(LockPolicy::Frozen, false),
+            ),
+            (
+                true,
+                flags(false, false, true),
+                is(LockPolicy::Update, false),
+            ),
+        ];
+        for (headless, given, expected) in matrix {
+            assert_eq!(
+                strictness(headless, given),
+                expected,
+                "{headless} {given:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flag_that_contradicts_another_loses_to_the_stricter_one() {
+        // The CLI refuses these combinations; core still answers them.
+        let both = |locked, frozen, no_locked| {
+            strictness(
+                true,
+                LockFlags {
+                    locked,
+                    frozen,
+                    no_locked,
+                },
+            )
+            .policy
+        };
+        assert_eq!(both(true, true, false), LockPolicy::Frozen);
+        assert_eq!(both(true, false, true), LockPolicy::Locked);
+        assert_eq!(both(false, true, true), LockPolicy::Frozen);
+    }
+
+    #[test]
+    fn a_sync_that_headless_made_strict_says_so_before_anything_else() {
+        let project = project("headless-note", &["beta"]);
+        let (outcome, events) = project.sync(&SyncOptions {
+            headless_implied: true,
+            ..with(LockPolicy::Locked)
+        });
+        assert!(
+            matches!(outcome, Err(SyncError::Lock(LockError::NoLock { .. }))),
+            "{outcome:?}"
+        );
+        assert_eq!(events.first(), Some(&Event::HeadlessImpliesLocked));
+    }
+
+    #[test]
+    fn a_sync_nothing_made_strict_by_the_machine_says_nothing_about_headless() {
+        let project = project("no-headless-note", &["beta"]);
+        let (outcome, events) = project.sync(&with(LockPolicy::Locked));
+        assert!(outcome.is_err());
+        assert!(
+            !events.contains(&Event::HeadlessImpliesLocked),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn locked_refuses_a_missing_or_stale_lock_and_changes_nothing() {
+        let project = project("locked", &["beta"]);
+        let (outcome, _) = project.sync(&with(LockPolicy::Locked));
+        assert!(
+            matches!(outcome, Err(SyncError::Lock(LockError::NoLock { .. }))),
+            "{outcome:?}"
+        );
+        assert!(project.lock_bytes().is_none(), "no lock is written");
+        assert!(project.installed().is_empty());
+
+        project.sync(&SyncOptions::default()).0.unwrap();
+        let (lock, installed) = (project.lock_bytes(), project.installed());
+        project.write_manifest(&["beta", "gamma"]);
+        let (outcome, _) = project.sync(&with(LockPolicy::Locked));
+        assert!(
+            matches!(
+                &outcome,
+                Err(SyncError::Lock(LockError::Stale(
+                    lockfile::StaleReason::DependencyAdded { name, .. }
+                ))) if name == "gamma"
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            (project.lock_bytes(), project.installed()),
+            (lock, installed)
+        );
+    }
+
+    #[test]
+    fn frozen_syncs_a_stale_lock_as_it_is_and_fails_without_one() {
+        let project = project("frozen", &["beta"]);
+        let (outcome, _) = project.sync(&with(LockPolicy::Frozen));
+        assert!(
+            matches!(outcome, Err(SyncError::Lock(LockError::NoLock { .. }))),
+            "{outcome:?}"
+        );
+
+        locking_lock(&project);
+        let lock = project.lock_bytes();
+        project.write_manifest(&["beta", "gamma"]);
+        project.sync(&with(LockPolicy::Frozen)).0.unwrap();
+        assert_eq!(
+            project.installed(),
+            pairs(&[("alpha", "2.0"), ("beta", "1.0")])
+        );
+        assert_eq!(project.lock_bytes(), lock, "the lock was not made again");
+    }
+
+    #[test]
+    fn frozen_refuses_a_lock_in_an_older_format() {
+        let project = project("frozen-old", &["beta"]);
+        locking_lock(&project);
+        let old = project.lock_bytes();
+        let old = String::from_utf8(old.unwrap())
+            .unwrap()
+            .replace("version = 2", "version = 1");
+        std::fs::write(project.lock_path(), &old).unwrap();
+        let (outcome, _) = project.sync(&with(LockPolicy::Frozen));
+        assert!(
+            matches!(
+                outcome,
+                Err(SyncError::Lock(LockError::Stale(
+                    lockfile::StaleReason::FormatOutdated
+                )))
+            ),
+            "{outcome:?}"
+        );
+        assert!(project.installed().is_empty());
+    }
+
+    #[test]
+    fn the_first_sync_makes_the_lock_and_says_what_it_takes_out() {
+        let project = project("first", &["gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        std::fs::remove_file(project.lock_path()).unwrap();
+        project.write_manifest(&["beta"]);
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+        let lock = project.lock_path();
+        assert!(
+            events.contains(&Event::SyncLockMissing {
+                path: lock.clone(),
+                dry_run: false
+            }),
+            "{events:?}"
+        );
+        assert!(events.contains(&Event::SyncMigration {
+            removing: vec![PackageRef {
+                name: "gamma".into(),
+                version: "1.0".into()
+            }]
+        }));
+        assert!(lock.is_file());
+        assert_eq!(
+            project.installed(),
+            pairs(&[("alpha", "2.0"), ("beta", "1.0")])
+        );
+    }
+
+    #[test]
+    fn a_dry_run_says_how_the_lock_and_the_destination_would_change_and_changes_neither() {
+        let project = project("dry-run", &["beta"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["beta", "gamma"]);
+        let manifest = std::fs::read(project.root.join(crate::project::FILE_NAME)).unwrap();
+        let (lock, installed) = (project.lock_bytes(), project.installed());
+
+        let (outcome, events) = project.sync(&SyncOptions {
+            install: InstallOptions {
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+            ..SyncOptions::default()
+        });
+        outcome.unwrap();
+        assert!(
+            events.contains(&Event::LockWouldChange {
+                changes: vec![crate::events::LockChange::Added {
+                    name: "gamma".into(),
+                    version: "1.0".into()
+                }]
+            }),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&Event::SyncPlanned {
+                steps: vec![SyncStep::Install {
+                    name: "gamma".into(),
+                    version: "1.0".into()
+                }],
+                dry_run: true
+            }),
+            "{events:?}"
+        );
+        assert_eq!(
+            (project.lock_bytes(), project.installed()),
+            (lock, installed)
+        );
+        assert_eq!(
+            std::fs::read(project.root.join(crate::project::FILE_NAME)).unwrap(),
+            manifest
+        );
+    }
+
+    #[test]
+    fn a_sync_that_fails_part_way_says_what_is_done_and_what_is_left() {
+        let project = project("part-way", &["alpha", "beta"]);
+        // The lock holds alpha, whose archive is a package, and beta, whose
+        // archive is the right bytes for its hash and not a package at all.
+        let garbage = b"not a zip archive".to_vec();
+        project.scratch_cache_store(&garbage);
+        let alpha = vip("alpha", "2.0", "");
+        put(&project.folder(), "alpha", "2.0", &alpha);
+        let parsed = crate::project::read(&project.root.join(crate::project::FILE_NAME)).unwrap();
+        let mut beta = locked_as("beta", "1.0", &garbage);
+        beta.requires = vec!["alpha".to_string()];
+        let lock = Lockfile {
+            version: lockfile::FORMAT_VERSION,
+            labview: "2024".to_string(),
+            inputs: lockfile::Inputs::of(&parsed),
+            packages: vec![locked_as("alpha", "2.0", &alpha), beta],
+            unresolved: Vec::new(),
+        };
+        std::fs::write(project.lock_path(), lock.to_toml().unwrap()).unwrap();
+
+        let (outcome, _) = project.sync(&with(LockPolicy::Locked));
+        let Err(SyncError::Incomplete { done, left, cause }) = outcome else {
+            panic!("expected a sync that stopped, got {outcome:?}");
+        };
+        assert_eq!(done, [install("alpha", "2.0")]);
+        assert_eq!(left, [install("beta", "1.0")]);
+        assert!(!cause.is_empty());
+        assert_eq!(project.installed(), pairs(&[("alpha", "2.0")]));
+    }
+
+    impl Scratch {
+        fn scratch_cache_store(&self, bytes: &[u8]) {
+            self.cache().store(bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_same_version_from_another_archive_is_installed_again() {
+        let project = project("same-version", &["alpha"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        let first = read_hash(&project, "alpha");
+
+        // The same alpha 2.0, built differently, and a lock made again.
+        put(
+            &project.folder(),
+            "alpha",
+            "2.0",
+            &vip("alpha", "2.0", "rebuilt"),
+        );
+        std::fs::remove_file(project.lock_path()).unwrap();
+        project.sync(&SyncOptions::default()).0.unwrap();
+
+        let second = read_hash(&project, "alpha");
+        assert_ne!(first, second);
+        let lock = Lockfile::read(&project.lock_path()).unwrap();
+        assert_eq!(second.as_deref(), Some(&*lock.packages[0].sha256));
+    }
+
+    fn read_hash(project: &Scratch, name: &str) -> Option<String> {
+        let roots = Roots::scratch(&project.root.join("dest"));
+        install::read_manifest(&roots, name).unwrap().archive_sha256
+    }
+
+    #[test]
+    fn a_sync_needs_a_project_and_for_a_new_lock_a_labview() {
+        let bare = Scratch::new("no-project");
+        let (outcome, _) = bare.sync(&SyncOptions::default());
+        assert!(
+            matches!(outcome, Err(SyncError::Lock(LockError::NoManifest { .. }))),
+            "{outcome:?}"
+        );
+
+        let project = Scratch::new("no-labview");
+        std::fs::write(
+            project.root.join(crate::project::FILE_NAME),
+            "[project]\nname = \"x\"\n",
+        )
+        .unwrap();
+        let (outcome, _) = project.sync(&SyncOptions::default());
+        assert!(
+            matches!(outcome, Err(SyncError::Lock(LockError::NoLabview))),
+            "{outcome:?}"
+        );
+        assert!(project.lock_bytes().is_none());
+    }
+
+    /// A project whose beta needs `ni_lib_missing`, which no source lists.
+    fn project_with_an_unresolved_requirement(tag: &str) -> Scratch {
+        let project = project(tag, &["beta"]);
+        put(
+            &project.folder(),
+            "beta",
+            "1.0",
+            &vip_requiring("beta", "1.0", "alpha>=1.0,ni_lib_missing>=1.0", ""),
+        );
+        project
+    }
+
+    fn unresolved_warnings(events: &[Event]) -> Vec<&Event> {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::SyncUnresolved { .. } | Event::RequirementUnresolved { .. }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unresolved_requirement_of_the_lock_there_is_warned_about_once_at_sync() {
+        let project = project_with_an_unresolved_requirement("unresolved");
+        locking_lock(&project);
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+        assert_eq!(
+            unresolved_warnings(&events),
+            [&Event::SyncUnresolved {
+                name: "ni_lib_missing".into(),
+                required_by: "beta".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unresolved_requirement_is_warned_about_once_when_the_sync_makes_the_lock() {
+        let project = project_with_an_unresolved_requirement("unresolved-made");
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+        assert_eq!(
+            unresolved_warnings(&events),
+            [&Event::RequirementUnresolved {
+                name: "ni_lib_missing".into(),
+                required_by: "beta".into()
+            }]
+        );
+    }
+
+    // ---- the lock is written once the archives are in hand ----
+
+    /// Takes the folder and the cache away when the lock has been made, which
+    /// `project_with_an_unresolved_requirement` says by `RequirementUnresolved`
+    /// as its last word: the one event between making the lock and fetching
+    /// the archives the sync installs.
+    struct LoseArchivesOnceLocked {
+        folder: PathBuf,
+        cache: PathBuf,
+    }
+
+    impl LoseArchivesOnceLocked {
+        fn of(project: &Scratch) -> Self {
+            LoseArchivesOnceLocked {
+                folder: project.folder(),
+                cache: project.root.join("cache"),
+            }
+        }
+    }
+
+    impl EventSink for LoseArchivesOnceLocked {
+        fn emit(&self, event: Event) {
+            if matches!(event, Event::RequirementUnresolved { .. }) {
+                std::fs::remove_dir_all(&self.folder).ok();
+                std::fs::remove_dir_all(&self.cache).ok();
+            }
+        }
+    }
+
+    fn position(events: &[Event], wanted: impl Fn(&Event) -> bool) -> usize {
+        events
+            .iter()
+            .position(wanted)
+            .unwrap_or_else(|| panic!("event missing in {events:?}"))
+    }
+
+    #[test]
+    fn a_fetch_that_fails_after_the_lock_is_made_leaves_a_missing_lock_missing() {
+        let project = project_with_an_unresolved_requirement("fetch-fails-no-lock");
+        let sink = LoseArchivesOnceLocked::of(&project);
+
+        let outcome = sync(&project.sync_env(&sink), &SyncOptions::default());
+
+        assert!(
+            matches!(outcome, Err(SyncError::Archives(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert!(project.installed().is_empty());
+    }
+
+    #[test]
+    fn a_fetch_that_fails_after_the_lock_is_made_leaves_an_outdated_lock_as_it_was() {
+        let project = project_with_an_unresolved_requirement("fetch-fails-outdated");
+        project.sync(&SyncOptions::default()).0.unwrap();
+        let (lock, installed) = (project.lock_bytes().unwrap(), project.installed());
+        // gamma is new: the lock is outdated, and the sync has an archive to fetch.
+        project.write_manifest(&["beta", "gamma"]);
+        let sink = LoseArchivesOnceLocked::of(&project);
+
+        let outcome = sync(&project.sync_env(&sink), &SyncOptions::default());
+
+        assert!(
+            matches!(outcome, Err(SyncError::Archives(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(project.lock_bytes(), Some(lock));
+        assert_eq!(project.installed(), installed);
+    }
+
+    #[test]
+    fn a_first_sync_whose_destination_already_matches_still_writes_the_lock() {
+        let project = project("first-nothing-to-do", &["beta"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        assert!(project.lock_path().is_file(), "no lock was written");
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        let nothing = position(&events, |e| e == &Event::SyncNothingToDo);
+        assert!(written < nothing, "{events:?}");
+    }
+
+    #[test]
+    fn an_outdated_lock_whose_destination_already_matches_is_still_rewritten() {
+        let project = project("outdated-nothing-to-do", &["beta"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        let before = project.lock_bytes().unwrap();
+        // alpha is installed already, as beta needs it: only the lock differs.
+        project.write_manifest(&["beta", "alpha"]);
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        assert_ne!(
+            project.lock_bytes().unwrap(),
+            before,
+            "the lock was not rewritten"
+        );
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        let nothing = position(&events, |e| e == &Event::SyncNothingToDo);
+        assert!(written < nothing, "{events:?}");
+    }
+
+    #[test]
+    fn a_cancel_after_the_lock_is_made_and_before_it_is_written_is_honoured() {
+        let project = project_with_an_unresolved_requirement("cancel-before-lock-write");
+        let token = crate::cancel::CancelToken::new();
+        let sink = CancelOn::new(&token, |e| matches!(e, Event::RequirementUnresolved { .. }));
+        let mut env = project.sync_env(&sink);
+        env.cancel = token;
+
+        let outcome = sync(&env, &SyncOptions::default());
+
+        assert_eq!(sink.answered(), Some(true), "the cancel was not accepted");
+        assert!(matches!(outcome, Err(SyncError::Cancelled)), "{outcome:?}");
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert!(project.installed().is_empty());
+    }
+
+    #[test]
+    fn a_cancel_once_the_lock_is_written_is_refused_and_the_sync_finishes() {
+        let project = project("cancel-after-lock-write", &["beta"]);
+        let token = crate::cancel::CancelToken::new();
+        let sink = CancelOn::new(&token, |e| matches!(e, Event::LockWritten { .. }));
+        let mut env = project.sync_env(&sink);
+        env.cancel = token;
+
+        sync(&env, &SyncOptions::default()).unwrap();
+
+        assert_eq!(sink.answered(), Some(false), "the cancel was accepted");
+        assert_eq!(
+            project.installed(),
+            pairs(&[("alpha", "2.0"), ("beta", "1.0")])
+        );
+    }
+
+    #[test]
+    fn a_first_sync_announces_the_plan_and_then_what_it_takes_out_before_it_writes_the_lock() {
+        let project = project("event-order", &["beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        std::fs::remove_file(project.lock_path()).unwrap();
+        project.write_manifest(&["beta"]);
+
+        let (outcome, events) = project.sync(&SyncOptions::default());
+        outcome.unwrap();
+
+        let hashing = position(&events, |e| matches!(e, Event::LockHashing { .. }));
+        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
+        let migration = position(&events, |e| matches!(e, Event::SyncMigration { .. }));
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        assert!(
+            hashing < planned && planned < migration && migration < written,
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancel_before_the_lock_is_written_stops_a_sync_that_has_nothing_to_change() {
+        let project = project_with_an_unresolved_requirement("cancel-empty-plan");
+        project.sync(&SyncOptions::default()).0.unwrap();
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let installed = project.installed();
+        let token = crate::cancel::CancelToken::new();
+        let sink = CancelOn::new(&token, |e| matches!(e, Event::RequirementUnresolved { .. }));
+        let mut env = project.sync_env(&sink);
+        env.cancel = token;
+
+        let outcome = sync(&env, &SyncOptions::default());
+
+        assert_eq!(sink.answered(), Some(true), "the cancel was not accepted");
+        // The error leaves before the palette merge and `SyncNothingToDo`.
+        assert!(matches!(outcome, Err(SyncError::Cancelled)), "{outcome:?}");
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert_eq!(project.installed(), installed);
+    }
+
+    // ---- the question a sync puts before it removes ----
+
+    /// A front end that gives `answer`, and keeps what it was asked.
+    struct Question {
+        answer: Result<Answer, &'static str>,
+        asked: std::cell::RefCell<Vec<Vec<SyncStep>>>,
+    }
+
+    impl Question {
+        fn answering(answer: Answer) -> Self {
+            Question {
+                answer: Ok(answer),
+                asked: Default::default(),
+            }
+        }
+
+        fn failing(why: &'static str) -> Self {
+            Question {
+                answer: Err(why),
+                asked: Default::default(),
+            }
+        }
+
+        fn put(&self, removals: &[SyncStep]) -> anyhow::Result<Answer> {
+            self.asked.borrow_mut().push(removals.to_vec());
+            self.answer.map_err(|why| anyhow::anyhow!(why))
+        }
+
+        fn asked(&self) -> Vec<Vec<SyncStep>> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    impl Scratch {
+        fn sync_asked(
+            &self,
+            opts: &SyncOptions,
+            question: &Question,
+        ) -> (Result<(), SyncError>, Vec<Event>) {
+            let sink = Recorder::default();
+            let outcome = sync_asking(&self.sync_env(&sink), opts, &|removals| {
+                question.put(removals)
+            });
+            (outcome, sink.events())
+        }
+    }
+
+    /// beta and gamma are synced, and then the manifest asks for beta alone:
+    /// the lock is outdated, and the one it makes drops gamma, which is installed.
+    fn project_whose_new_lock_drops_gamma(tag: &str) -> Scratch {
+        let project = project(tag, &["beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["beta"]);
+        project
+    }
+
+    fn dry_run() -> SyncOptions {
+        SyncOptions {
+            install: InstallOptions {
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+            ..SyncOptions::default()
+        }
+    }
+
+    fn planned_count(events: &[Event]) -> usize {
+        let planned = |event: &&Event| matches!(event, Event::SyncPlanned { dry_run: false, .. });
+        events.iter().filter(planned).count()
+    }
+
+    const BETA_AND_ALPHA: &[(&str, &str)] = &[("alpha", "2.0"), ("beta", "1.0")];
+
+    #[test]
+    fn a_declined_sync_with_no_lock_writes_none_removes_nothing_and_says_so() {
+        let project = project_whose_new_lock_drops_gamma("declined-no-lock");
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let installed = project.installed();
+        let question = Question::answering(Answer::Asked(false));
+
+        let (outcome, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+        outcome.unwrap();
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert_eq!(project.installed(), installed);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::SyncDeclined { removing }
+                    if removing == &[PackageRef { name: "gamma".into(), version: "1.0".into() }]
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::SyncMigration { .. } | Event::PackageRemoved { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_declined_sync_leaves_an_outdated_lock_as_it_was() {
+        let project = project_whose_new_lock_drops_gamma("declined-outdated");
+        let (lock, installed) = (project.lock_bytes().unwrap(), project.installed());
+        let question = Question::answering(Answer::Asked(false));
+
+        project
+            .sync_asked(&SyncOptions::default(), &question)
+            .0
+            .unwrap();
+
+        assert_eq!(project.lock_bytes(), Some(lock));
+        assert_eq!(project.installed(), installed);
+    }
+
+    #[test]
+    fn an_accepted_sync_removes_the_package_and_writes_the_lock() {
+        let project = project_whose_new_lock_drops_gamma("accepted");
+        let question = Question::answering(Answer::Asked(true));
+
+        let (outcome, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+        outcome.unwrap();
+        assert_eq!(project.installed(), pairs(BETA_AND_ALPHA));
+        let locked = Lockfile::read(&project.lock_path()).unwrap();
+        let names: Vec<&str> = locked.packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "beta"], "the new lock was not written");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::SyncDeclined { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn the_question_is_put_once_with_exactly_the_packages_the_lock_does_not_list() {
+        let project = project("asked-two", &["alpha", "beta", "gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["alpha"]);
+        let question = Question::answering(Answer::Asked(false));
+
+        project
+            .sync_asked(&SyncOptions::default(), &question)
+            .0
+            .unwrap();
+
+        assert_eq!(
+            question.asked(),
+            [[
+                remove("beta", "1.0", RemoveReason::NotInLock),
+                remove("gamma", "1.0", RemoveReason::NotInLock)
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_failing_question_stops_the_sync_with_its_error_before_any_change() {
+        let project = project_whose_new_lock_drops_gamma("question-fails");
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let installed = project.installed();
+        let question = Question::failing("needs --yes");
+
+        let (outcome, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+        assert!(
+            matches!(&outcome, Err(SyncError::Other(why)) if why.to_string() == "needs --yes"),
+            "{outcome:?}"
+        );
+        assert_eq!(project.lock_bytes(), None, "a lock was written");
+        assert_eq!(project.installed(), installed);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::LockWritten { .. }
+                    | Event::PackageStart { .. }
+                    | Event::PackageRemoved { .. }
+                    | Event::SyncMigration { .. }
+                    | Event::SyncDeclined { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn no_question_is_put_when_nothing_is_removed_or_what_is_removed_follows_from_the_flags() {
+        let no_dev = SyncOptions {
+            no_dev: true,
+            ..SyncOptions::default()
+        };
+        let dev_only = || {
+            let project = project("no-ask-dev-only", &["alpha"]);
+            std::fs::write(
+                project.root.join(crate::project::FILE_NAME),
+                format!("{MANIFEST_HEAD}[dependencies]\nalpha = \"*\"\n\n[dev-dependencies]\ngamma = \"*\"\n"),
+            )
+            .unwrap();
+            project.sync(&SyncOptions::default()).0.unwrap();
+            project
+        };
+        let replaced = || {
+            let project = project("no-ask-replace", &["alpha"]);
+            project.sync(&SyncOptions::default()).0.unwrap();
+            std::fs::write(
+                project.root.join(crate::project::FILE_NAME),
+                format!("{MANIFEST_HEAD}[dependencies]\nalpha = \"1.0\"\n"),
+            )
+            .unwrap();
+            project
+        };
+        let group_dropped = || {
+            let project = project_with_a_ci_group("no-ask-group");
+            project.sync(&selecting(&["ci"])).0.unwrap();
+            project
+        };
+        // The last of each case: what the flags remove is planned all the same,
+        // the guard of the cases that go ahead without a question for that reason.
+        let cases = [
+            (
+                "a package to install",
+                project("no-ask-install", &["beta"]),
+                SyncOptions::default(),
+                None,
+            ),
+            (
+                "a version to replace",
+                replaced(),
+                SyncOptions::default(),
+                None,
+            ),
+            (
+                "a dev-only package",
+                dev_only(),
+                no_dev,
+                Some(RemoveReason::DevOnly),
+            ),
+            (
+                "a group no longer selected",
+                group_dropped(),
+                SyncOptions::default(),
+                Some(RemoveReason::GroupsOnly),
+            ),
+            (
+                "a dry run that would remove",
+                project_whose_new_lock_drops_gamma("no-ask-dry-run"),
+                dry_run(),
+                None,
+            ),
+        ];
+        for (label, project, opts, planned_removal) in cases {
+            let question = Question::answering(Answer::Asked(false));
+
+            let (outcome, events) = project.sync_asked(&opts, &question);
+
+            outcome.unwrap_or_else(|why| panic!("{label}: {why}"));
+            if let Some(reason) = planned_removal {
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        Event::SyncPlanned { steps, dry_run: false }
+                            if steps.iter().any(|step| matches!(
+                                step, SyncStep::Remove { reason: why, .. } if *why == reason
+                            ))
+                    )),
+                    "{label}: no removal for {reason:?} was planned: {events:?}"
+                );
+            }
+            assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new(), "{label}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::SyncDeclined { .. })),
+                "{label}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_says_it_would_remove_the_package_and_asks_nothing_and_changes_nothing() {
+        let project = project_whose_new_lock_drops_gamma("dry-run-no-ask");
+        let (lock, installed) = (project.lock_bytes(), project.installed());
+        let question = Question::answering(Answer::Asked(false));
+
+        let (outcome, events) = project.sync_asked(&dry_run(), &question);
+
+        outcome.unwrap();
+        assert!(
+            events.contains(&Event::SyncPlanned {
+                steps: vec![remove("gamma", "1.0", RemoveReason::NotInLock)],
+                dry_run: true
+            }),
+            "{events:?}"
+        );
+        assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new());
+        assert_eq!(
+            (project.lock_bytes(), project.installed()),
+            (lock, installed)
+        );
+    }
+
+    #[test]
+    fn a_dry_run_is_not_refused_by_a_front_end_that_refuses_every_question() {
+        // The CLI's answer to `--global` without a terminal: an error.
+        let project = project_whose_new_lock_drops_gamma("dry-run-not-refused");
+        let question = Question::failing("needs --yes");
+
+        let (outcome, _) = project.sync_asked(&dry_run(), &question);
+
+        outcome.unwrap();
+        assert_eq!(question.asked(), Vec::<Vec<SyncStep>>::new());
+    }
+
+    #[test]
+    fn a_declined_first_sync_does_not_say_it_is_writing_a_lock() {
+        let project = project_whose_new_lock_drops_gamma("declined-no-lock-note");
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (outcome, events) = project.sync_asked(
+            &SyncOptions::default(),
+            &Question::answering(Answer::Asked(false)),
+        );
+
+        outcome.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::SyncDeclined { .. })),
+            "the sync was not declined: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::SyncLockMissing { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_first_sync_that_goes_ahead_says_it_is_writing_a_lock_just_before_it_does() {
+        let project = project_whose_new_lock_drops_gamma("lock-note-before-write");
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (outcome, events) = project.sync_asked(
+            &SyncOptions::default(),
+            &Question::answering(Answer::Asked(true)),
+        );
+
+        outcome.unwrap();
+        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
+        let said = position(&events, |e| matches!(e, Event::SyncLockMissing { .. }));
+        let changed = position(&events, |e| matches!(e, Event::LockChanged { .. }));
+        let written = position(&events, |e| matches!(e, Event::LockWritten { .. }));
+        assert!(
+            planned < said && said < changed && changed < written,
+            "{events:?}"
+        );
+    }
+
+    /// Takes the cache away once the plan is said, and notes whether the cache
+    /// is back, as the fetch of the archives puts it, when the lock is written.
+    struct CacheBackWhenLockWritten {
+        cache: PathBuf,
+        back: Mutex<Option<bool>>,
+    }
+
+    impl EventSink for CacheBackWhenLockWritten {
+        fn emit(&self, event: Event) {
+            match event {
+                Event::SyncPlanned { .. } => {
+                    std::fs::remove_dir_all(&self.cache).unwrap();
+                }
+                Event::LockWritten { .. } => {
+                    *self.back.lock().unwrap() = Some(self.cache.exists());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn the_lock_is_written_after_the_archives_are_fetched_into_the_cache() {
+        let project = project("fetch-then-lock", &["beta"]);
+        let sink = CacheBackWhenLockWritten {
+            cache: project.root.join("cache"),
+            back: Mutex::new(None),
+        };
+
+        sync(&project.sync_env(&sink), &SyncOptions::default()).unwrap();
+
+        assert_eq!(
+            *sink.back.lock().unwrap(),
+            Some(true),
+            "the lock was written before the archives were fetched"
+        );
+    }
+
+    /// Takes the cache away once the plan is said: what is in it afterwards was
+    /// fetched after the plan.
+    struct CacheGoneOnceThePlanIsSaid {
+        cache: PathBuf,
+    }
+
+    impl EventSink for CacheGoneOnceThePlanIsSaid {
+        fn emit(&self, event: Event) {
+            if matches!(event, Event::SyncPlanned { .. }) {
+                std::fs::remove_dir_all(&self.cache).unwrap();
+            }
+        }
+    }
+
+    /// Syncs `tag`'s project, where gamma is installed and goes and alpha is
+    /// not and would be fetched, answering `answer`. Gives back whether the
+    /// cache holds anything fetched after the plan, whether the lock changed,
+    /// and the questions put.
+    fn cache_after_a_sync_that_would_fetch_alpha(
+        tag: &str,
+        answer: bool,
+    ) -> (bool, bool, Vec<Vec<SyncStep>>) {
+        let project = project(tag, &["gamma"]);
+        project.sync(&SyncOptions::default()).0.unwrap();
+        project.write_manifest(&["alpha"]);
+        let lock = project.lock_bytes();
+        let question = Question::answering(Answer::Asked(answer));
+        let sink = CacheGoneOnceThePlanIsSaid {
+            cache: project.root.join("cache"),
+        };
+
+        sync_asking(&project.sync_env(&sink), &SyncOptions::default(), &|r| {
+            question.put(r)
+        })
+        .unwrap();
+
+        (
+            project.root.join("cache").exists(),
+            project.lock_bytes() != lock,
+            question.asked(),
+        )
+    }
+
+    #[test]
+    fn a_declined_sync_has_fetched_nothing_even_with_a_package_to_install() {
+        let (cache, lock_changed, asked) =
+            cache_after_a_sync_that_would_fetch_alpha("declined-no-fetch", false);
+
+        assert_eq!(asked, [[remove("gamma", "1.0", RemoveReason::NotInLock)]]);
+        assert!(!cache, "the archives were fetched before the question");
+        assert!(!lock_changed, "the lock was changed by a decline");
+    }
+
+    #[test]
+    fn an_answered_sync_fetches_into_the_cache_after_the_plan() {
+        // The control of the test above: the same project, answered yes.
+        let (cache, ..) = cache_after_a_sync_that_would_fetch_alpha("answered-fetches", true);
+
+        assert!(cache, "alpha was not fetched after the plan");
+    }
+
+    #[test]
+    fn a_locked_or_frozen_sync_asks_once_about_a_stray_package_and_a_no_changes_nothing() {
+        for policy in [LockPolicy::Locked, LockPolicy::Frozen] {
+            let project = project("locked-stray", &["beta", "gamma"]);
+            project.sync(&SyncOptions::default()).0.unwrap();
+            // The lock follows the manifest, and gamma is left installed.
+            project.write_manifest(&["beta"]);
+            locking_lock(&project);
+            let (lock, installed) = (project.lock_bytes(), project.installed());
+            let question = Question::answering(Answer::Asked(false));
+
+            let (outcome, events) = project.sync_asked(&with(policy), &question);
+
+            outcome.unwrap();
+            assert_eq!(
+                question.asked(),
+                [[remove("gamma", "1.0", RemoveReason::NotInLock)]],
+                "{policy:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::SyncDeclined { .. })),
+                "{policy:?}: {events:?}"
+            );
+            assert_eq!(
+                (project.lock_bytes(), project.installed()),
+                (lock, installed),
+                "{policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fetch_that_fails_after_a_yes_leaves_the_lock_and_the_package_to_be_removed_as_they_were() {
+        for lock_there in [true, false] {
+            let project = project_with_an_unresolved_requirement("yes-then-fetch-fails");
+            project.write_manifest(&["alpha", "gamma"]);
+            project.sync(&SyncOptions::default()).0.unwrap();
+            // beta is new, gamma is dropped, and beta's archive is about to be lost.
+            project.write_manifest(&["beta"]);
+            if !lock_there {
+                std::fs::remove_file(project.lock_path()).unwrap();
+            }
+            let (lock, installed) = (project.lock_bytes(), project.installed());
+            let question = Question::answering(Answer::Asked(true));
+            let sink = LoseArchivesOnceLocked::of(&project);
+
+            let outcome = sync_asking(&project.sync_env(&sink), &SyncOptions::default(), &|r| {
+                question.put(r)
+            });
+
+            assert!(
+                matches!(outcome, Err(SyncError::Archives(_))),
+                "lock there {lock_there}: {outcome:?}"
+            );
+            assert_eq!(question.asked().len(), 1, "lock there {lock_there}");
+            assert_eq!(project.lock_bytes(), lock, "lock there {lock_there}");
+            assert_eq!(project.installed(), installed, "lock there {lock_there}");
+            assert_eq!(
+                installed,
+                pairs(&[("alpha", "2.0"), ("gamma", "1.0")]),
+                "gamma is still installed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_of_a_first_sync_still_says_what_it_would_take_out() {
+        let project = project_whose_new_lock_drops_gamma("dry-run-first-sync");
+        std::fs::remove_file(project.lock_path()).unwrap();
+
+        let (outcome, events) =
+            project.sync_asked(&dry_run(), &Question::answering(Answer::Asked(false)));
+
+        outcome.unwrap();
+        let migration = position(&events, |e| matches!(e, Event::SyncMigration { .. }));
+        let planned = position(&events, |e| matches!(e, Event::SyncPlanned { .. }));
+        assert!(migration < planned, "{events:?}");
+    }
+
+    #[test]
+    fn the_plan_is_announced_once_whichever_way_the_question_is_answered() {
+        let answers = [
+            ("yes", Question::answering(Answer::Asked(true))),
+            ("no", Question::answering(Answer::Asked(false))),
+            ("not asked", Question::answering(Answer::NotAsked)),
+            ("an error", Question::failing("needs --yes")),
+        ];
+        for (label, question) in answers {
+            let project = project_whose_new_lock_drops_gamma("planned-once");
+
+            let (_, events) = project.sync_asked(&SyncOptions::default(), &question);
+
+            assert_eq!(planned_count(&events), 1, "{label}: {events:?}");
+        }
+    }
+
+    #[test]
+    fn the_question_comes_after_the_plan_and_before_any_write_and_a_note_follows_only_when_not_asked()
+     {
+        for (answer, says_what_it_takes_out) in
+            [(Answer::Asked(true), false), (Answer::NotAsked, true)]
+        {
+            let project = project_whose_new_lock_drops_gamma("question-order");
+            std::fs::remove_file(project.lock_path()).unwrap();
+            let sink = Recorder::default();
+            let put_after = std::cell::Cell::new(None);
+            let ask = |_: &[SyncStep]| {
+                put_after.set(Some(sink.events().len()));
+                Ok(answer)
+            };
+
+            sync_asking(&project.sync_env(&sink), &SyncOptions::default(), &ask).unwrap();
+
+            let (events, put_after) = (sink.events(), put_after.get().unwrap());
+            let before = &events[..put_after];
+            let after = &events[put_after..];
+            assert!(
+                before
+                    .iter()
+                    .any(|e| matches!(e, Event::SyncPlanned { dry_run: false, .. })),
+                "{answer:?}: {events:?}"
+            );
+            assert!(
+                !before.iter().any(|e| matches!(
+                    e,
+                    Event::LockWritten { .. }
+                        | Event::PackageRemoved { .. }
+                        | Event::SyncMigration { .. }
+                )),
+                "{answer:?}: {events:?}"
+            );
+            assert!(
+                after.iter().any(|e| matches!(e, Event::LockWritten { .. })),
+                "{answer:?}: {events:?}"
+            );
+            assert_eq!(
+                after
+                    .iter()
+                    .any(|e| matches!(e, Event::SyncMigration { .. })),
+                says_what_it_takes_out,
+                "{answer:?}: {events:?}"
+            );
+        }
+    }
+
+    // ---- a LabVIEW installation that is not there: --global and headless ----
+
+    use super::super::route::{InstallMode, InstallRequest, install_mode};
+    use super::super::testing::FakeInstallation;
+
+    /// What `fake` holds, as the install records say.
+    fn held_by(fake: &FakeInstallation) -> Vec<(String, String)> {
+        install::list_installed(&fake.roots())
+            .unwrap()
+            .into_iter()
+            .map(|manifest| (manifest.name, manifest.version))
+            .collect()
+    }
+
+    impl Scratch {
+        /// An environment that sees `fake` as the machine's one LabVIEW.
+        fn on<'a>(&self, sink: &'a dyn EventSink, fake: &FakeInstallation) -> OpEnv<'a> {
+            let mut env = self.env(sink, vec![self.folder()]);
+            fake.place(&mut env);
+            env
+        }
+    }
+
+    /// A sync of beta and gamma and then of beta alone, both through the
+    /// destination `set_up` settles: the second takes gamma out of the
+    /// installation, as a sync does anywhere, and nothing goes elsewhere.
+    fn assert_sync_is_exact_in_the_installation(tag: &str, set_up: impl Fn(&mut OpEnv)) {
+        let project = project(tag, &["beta", "gamma"]);
+        let fake = FakeInstallation::new(&project.root);
+        let opts = SyncOptions {
+            install: InstallOptions {
+                no_relink: true,
+                ..InstallOptions::default()
+            },
+            ..SyncOptions::default()
+        };
+        let run = || {
+            let sink = Recorder::default();
+            let mut env = project.on(&sink, &fake);
+            set_up(&mut env);
+            (sync(&env, &opts), sink.events())
+        };
+
+        run().0.unwrap();
+        assert_eq!(
+            held_by(&fake),
+            pairs(&[("alpha", "2.0"), ("beta", "1.0"), ("gamma", "1.0")])
+        );
+
+        project.write_manifest(&["beta"]);
+        let (outcome, events) = run();
+        outcome.unwrap();
+        assert_eq!(held_by(&fake), pairs(&[("alpha", "2.0"), ("beta", "1.0")]));
+        assert!(
+            events.iter().any(
+                |event| matches!(event, Event::PackageRemoved { name, .. } if name == "gamma")
+            ),
+            "{events:?}"
+        );
+        // Only the project's own files, the installation and its machine
+        // places: no scratch destination, venv or store was made beside them.
+        let mut made: Vec<String> = std::fs::read_dir(&project.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        made.sort();
+        assert_eq!(
+            made,
+            [
+                "LabVIEW 2099",
+                "cache",
+                "lvpm.lock",
+                "lvpm.toml",
+                "machine",
+                "more-packages",
+                "packages"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sync_with_global_is_exact_on_the_installation() {
+        assert_sync_is_exact_in_the_installation("y8-global", |env| {
+            env.flags.global = true;
+            env.flags.labview_version = Some("2099".into());
+        });
+    }
+
+    #[test]
+    fn a_headless_sync_in_a_project_without_a_venv_is_exact_on_the_installation() {
+        assert_sync_is_exact_in_the_installation("y8-headless", |env| {
+            env.headless = true;
+            env.flags.labview_version = Some("2099".into());
+        });
+    }
+
+    #[test]
+    fn a_no_project_install_with_a_destination_flag_adds_there_and_leaves_lvpm_toml_and_lock_alone()
+    {
+        type SetUp = fn(&mut OpEnv);
+        let flagged: [(&str, SetUp); 2] = [
+            ("global", |env| {
+                env.flags.global = true;
+                env.flags.labview_version = Some("2099".into());
+            }),
+            // Alone, `--labview-version` means the installation only where
+            // nothing guards the machine: a project with no venv is refused
+            // unless LabVIEW runs headless.
+            ("headless-labview-version", |env| {
+                env.headless = true;
+                env.flags.labview_version = Some("2099".into());
+            }),
+        ];
+        for (flag, set_up) in flagged {
+            let project = project(&format!("m7-{flag}"), &["alpha"]);
+            let fake = FakeInstallation::new(&project.root);
+            locking_lock(&project);
+            let manifest_path = project.root.join(crate::project::FILE_NAME);
+            let (toml, lock) = (
+                std::fs::read(&manifest_path).unwrap(),
+                project.lock_bytes().expect("the project has a lock"),
+            );
+
+            let sink = Recorder::default();
+            let mut env = project.on(&sink, &fake);
+            set_up(&mut env);
+            let request = InstallRequest {
+                package: Some("gamma"),
+                no_project: true,
+                ..InstallRequest::default()
+            };
+            assert_eq!(
+                install_mode(&env, &request).unwrap(),
+                InstallMode::Additive,
+                "{flag}"
+            );
+            let opts = InstallOptions {
+                no_relink: true,
+                ..InstallOptions::default()
+            };
+            crate::ops::install::install(&env, Some("gamma"), &opts).unwrap();
+
+            assert_eq!(held_by(&fake), pairs(&[("gamma", "1.0")]), "{flag}");
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), toml, "{flag}");
+            assert_eq!(project.lock_bytes(), Some(lock), "{flag}");
+        }
+    }
+
+    #[test]
+    fn sync_resaves_when_asked_dependencies_first() {
+        use crate::ops::resave::fake::Fake;
+        use crate::ops::testing::{labview_2026, venv_in, vip_in};
+        let scratch = Scratch::new("resave");
+        vip_in(
+            &scratch.folder(),
+            "alpha",
+            "1.0",
+            "",
+            &["alpha/a.vi"],
+            false,
+        );
+        vip_in(
+            &scratch.folder(),
+            "beta",
+            "1.0",
+            "alpha",
+            &["beta/b.vi"],
+            false,
+        );
+        scratch.write_manifest(&["beta"]);
+        let venv = venv_in(&scratch.root);
+        let fake = Fake::saving().install();
+        let mut env = scratch.env(&NullSink, vec![scratch.folder()]);
+        env.targets = vec![labview_2026()];
+        let opts = SyncOptions {
+            install: InstallOptions {
+                resave: true,
+                ..InstallOptions::default()
+            },
+            ..SyncOptions::default()
+        };
+
+        sync(&env, &opts).unwrap();
+
+        let resaved: Vec<String> = fake.log().resaves.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(resaved, ["alpha", "beta"]);
+        for package in ["alpha", "beta"] {
+            assert!(install::is_installed(&venv.store(), package), "{package}");
+        }
+    }
+
+    #[test]
+    fn a_sync_at_a_labview_version_alone_in_a_project_with_no_venv_is_refused_saying_no_venv_and_changes_nothing()
+     {
+        use crate::ops::testing::{FakeInstallation, Recorded, env_on, scratch_dir, snapshot};
+        let dir = scratch_dir("sync-needs-global");
+        let fake = FakeInstallation::new(&dir);
+        std::fs::write(dir.join(crate::project::FILE_NAME), MANIFEST_HEAD).unwrap();
+        let before = snapshot(&dir);
+
+        let sink = Recorded::default();
+        let mut env = env_on(&sink, &dir);
+        fake.place(&mut env);
+        env.flags.labview_version = Some("2099".into());
+        let why = format!("{:#}", sync(&env, &SyncOptions::default()).unwrap_err());
+        // A manifest is a project, so its refusal comes before the one for `--labview-version` alone.
+        assert!(why.contains("but no venv"), "{why}");
+        assert_eq!(snapshot(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_default_sync_starts_no_labview_for_a_resave() {
+        use crate::ops::resave::fake::Fake;
+        use crate::ops::testing::{labview_2026, venv_in, vip_in};
+        let scratch = Scratch::new("no-resave");
+        vip_in(
+            &scratch.folder(),
+            "alpha",
+            "1.0",
+            "",
+            &["alpha/a.vi"],
+            false,
+        );
+        scratch.write_manifest(&["alpha"]);
+        let venv = venv_in(&scratch.root);
+        let fake = Fake::saving().install();
+        let mut env = scratch.env(&NullSink, vec![scratch.folder()]);
+        env.targets = vec![labview_2026()];
+
+        sync(&env, &SyncOptions::default()).unwrap();
+
+        let log = fake.log();
+        assert_eq!(log.starts, 0, "LabVIEW started");
+        assert!(log.resaves.is_empty(), "resaved: {:?}", log.resaves);
+        assert!(install::is_installed(&venv.store(), "alpha"));
+    }
+}

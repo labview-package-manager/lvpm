@@ -7,11 +7,7 @@ fn install_prepares_new_files_by_default_with_an_opt_out() {
     let packages = root.join("packages");
     std::fs::create_dir_all(&packages).unwrap();
     let manifest = root.join("lvpm.toml");
-    std::fs::write(
-        &manifest,
-        "[sources]\ndefaults = false\n[dependencies]\nlinkfix_fixture = \"*\"\n",
-    )
-    .unwrap();
+    std::fs::write(&manifest, "[sources]\ndefaults = false\n").unwrap();
     let xml = b"<Library LVVersion=\"24008000\"></Library>";
     let vi = include_bytes!("../tools/Relink Packages.vi");
     let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -51,11 +47,11 @@ fn install_prepares_new_files_by_default_with_an_opt_out() {
         std::fs::write(&existing, xml).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_lvpm"))
             .current_dir(&root)
-            .args(["install", "--manifest"])
-            .arg(&manifest)
+            // Adapted from upstream: no `--manifest` or `--no-hooks` here; a
+            // scratch prefix runs no hooks.
+            .args(["install", "linkfix_fixture", "--no-project"])
             .arg("--prefix")
             .arg(&prefix)
-            .arg("--no-hooks")
             .args(flags)
             .env("LVPM_CONFIG_CACHE", root.join("cache"))
             .env("LVPM_CONFIG_SOURCES_LOCAL", &packages)

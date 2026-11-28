@@ -2,15 +2,14 @@
 <!--
   The lvpm MSI, built by dist (dist-workspace.toml) through cargo-wix.
 
-  Started from cargo-wix's template (Copyright (C) 2017 Christopher R. Field,
-  Apache-2.0) and edited by hand, which is why dist-workspace.toml sets
-  allow-dirty = ["msi"]. A `dist generate` without that would overwrite it.
+  Taken from upstream lvpm's wix/main.wxs, itself started from cargo-wix's
+  template (Copyright (C) 2017 Christopher R. Field, Apache-2.0) and edited by
+  hand, which is why dist-workspace.toml sets allow-dirty = ["msi"]. A
+  `dist generate` without that would overwrite it.
 
   Differences from the template:
     - Per-user, no elevation: installs to %LOCALAPPDATA%\lvpm\bin, the same
       folder scripts/install.ps1 uses, and adds it to the user PATH.
-    - Ships Relink Package.vi next to lvpm.exe as relink-package.vi, which
-      is where lvpm looks for it (src/relink.rs).
     - Ships the license files and THIRD-PARTY-LICENSES.txt in
       %LOCALAPPDATA%\lvpm (THIRD-PARTY-LICENSES.txt: see about.toml).
     - No folder choice in the dialog: a per-user install cannot write to
@@ -18,6 +17,8 @@
     - Files in the user profile cannot be component key paths (ICE38), so
       each component is keyed by a value under HKCU\Software\lvpm, and the
       folders are removed on uninstall (ICE64).
+    - Ships relink-package.vi and build-app.vi beside lvpm.exe, which
+      looks for them there (crates/lvpm-core/src/relink.rs).
 
   cargo-wix variables used here: Version, CargoTargetBinDir.
 -->
@@ -27,7 +28,7 @@
         Id='*'
         Name='lvpm'
         UpgradeCode='2AE3D9AE-39AC-4BC3-A28C-187026CEEFCE'
-        Manufacturer='Jonathan Graesser'
+        Manufacturer='lvpm contributors'
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
@@ -35,7 +36,7 @@
         <Package Id='*'
             Keywords='Installer'
             Description='Open-source package manager for LabVIEW'
-            Manufacturer='Jonathan Graesser'
+            Manufacturer='lvpm contributors'
             InstallerVersion='500'
             Languages='1033'
             Compressed='yes'
@@ -69,14 +70,15 @@
                             <RemoveFolder Id='RemoveBin' Directory='Bin' On='uninstall'/>
                             <RemoveFolder Id='RemoveApplicationFolder' Directory='APPLICATIONFOLDER' On='uninstall'/>
                         </Component>
-                        <Component Id='RelinkVI' Guid='4E7A00CE-D95C-457C-A1A6-4E24C178931C'>
-                            <File
-                                Id='RelinkVIFile'
-                                Name='relink-package.vi'
-                                DiskId='1'
-                                Source='src\lv-src\relink-package.vi'/>
+                        <Component Id='RelinkVi' Guid='4D9788CF-437A-46AE-A4B8-E24872417C1A'>
+                            <File Id='relinkvi' Name='relink-package.vi' DiskId='1' Source='crates\lvpm-core\src\lv-src\relink-package.vi'/>
                             <RegistryValue Root='HKCU' Key='Software\lvpm' Name='relink-package.vi'
-                                Type='string' Value='[#RelinkVIFile]' KeyPath='yes'/>
+                                Type='string' Value='[#relinkvi]' KeyPath='yes'/>
+                        </Component>
+                        <Component Id='BuildAppVi' Guid='F2A149B8-A54B-4EAE-8EBC-6DE29EEDE08C'>
+                            <File Id='buildappvi' Name='build-app.vi' DiskId='1' Source='crates\lvpm-core\src\lv-src\build-app.vi'/>
+                            <RegistryValue Root='HKCU' Key='Software\lvpm' Name='build-app.vi'
+                                Type='string' Value='[#buildappvi]' KeyPath='yes'/>
                         </Component>
                         <Component Id='Path' Guid='5B493AB7-0E84-4A8E-8B3F-A0E99B41FE04'>
                             <Environment
@@ -91,8 +93,6 @@
                                 Type='integer' Value='1' KeyPath='yes'/>
                         </Component>
                     </Directory>
-                    <!-- lvpm's own licenses and those of the crates built into it,
-                         which their licenses ask a binary distribution to carry. -->
                     <Component Id='Notices' Guid='1964C78F-A264-4F1F-B956-C829EA8743E9'>
                         <File Id='LicenseMit' Name='LICENSE-MIT' DiskId='1' Source='LICENSE-MIT'/>
                         <File Id='LicenseApache' Name='LICENSE-APACHE' DiskId='1' Source='LICENSE-APACHE'/>
@@ -107,14 +107,15 @@
         <Feature
             Id='Binaries'
             Title='Application'
-            Description='lvpm and the LabVIEW VI it relinks packages with.'
+            Description='lvpm.'
             Level='1'
             AllowAdvertise='no'
             Display='expand'
             Absent='disallow'>
 
             <ComponentRef Id='binary0'/>
-            <ComponentRef Id='RelinkVI'/>
+            <ComponentRef Id='RelinkVi'/>
+            <ComponentRef Id='BuildAppVi'/>
             <ComponentRef Id='Notices'/>
 
             <Feature
@@ -129,7 +130,7 @@
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/labview-package-manager/lvpm'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/ThatsTheEnd/lvpm'/>
 
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>

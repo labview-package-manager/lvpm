@@ -4,9 +4,9 @@ Analysis scripts used to work out what VIPM actually asks LabVIEW to do during a
 package install. Not part of the lvpm build — plain Python 3, no dependencies.
 
 `Relink Package.vi` is the exception: it is not analysis, it is shipped code —
-`src/lv-src/relink-package.vi`, released next to the `lvpm` executable, whose
-build records its hash (`build.rs`). Editing it and rebuilding is all it takes
-to ship a new one.
+`crates/lvpm-core/src/lv-src/relink-package.vi`, released next to the `lvpm`
+executable, whose build records its hash (`crates/lvpm-core/build.rs`). Editing
+it and rebuilding is all it takes to ship a new one.
 
 ## `Relink Package.vi`
 
@@ -31,14 +31,10 @@ supported link records and prepares source-only files without LabVIEW;
 inspection commands are in the [linkfix reference](../docs/linkfix.md).
 
 It travels beside the executable (the release archives and the MSI carry it; a
-source build reads it from its checkout) and is copied to
-`%LOCALAPPDATA%\lvpm\tools\<md5>\Relink Package.vi` the first time a relink
-runs — content-keyed, so a new build never overwrites a copy LabVIEW still has
-open. A VI whose hash differs from the one lvpm was built with is refused.
-`LVPM_RELINK_VI` points lvpm at a VI on disk instead, unchecked, for trying a
-change without rebuilding. It used to be compiled into the executable;
-Microsoft Defender flagged an unsigned exe that writes a blob out and hands it
-to another process.
+source build reads it from its checkout) and is copied into lvpm's work folder
+when a relink runs. A VI whose hash differs from the one lvpm was built with is
+refused. It used to be compiled into the executable; Microsoft Defender flagged
+an unsigned exe that writes a blob out and hands it to another process.
 
 The unit of work is a package folder, taken from the `Target Dir` its spec asked
 for — `<vi.lib>/10X Engineering/AnimateX`, not `vi.lib`, and not each

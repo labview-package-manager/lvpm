@@ -1,0 +1,927 @@
+//! Relinking an installed package tree, over VI Server.
+//!
+//! Copying a `.vip`'s files is only half an install. The VIs land carrying the
+//! linker tables their build machine wrote, so the paths they declare for their
+//! subVIs and typedefs often do not resolve here — that is what makes LabVIEW
+//! open its "searching for missing subVI" dialog. Loading a VI makes LabVIEW
+//! resolve the links; only saving it persists that.
+//!
+//! The load-resolve-save cycle itself lives in LabVIEW, in
+//! `lv-src/relink-package.vi` (shipped beside the executable), whose whole interface is one string in and one
+//! boolean out:
+//!
+//! ```text
+//! Folder to relink (string)  ->  [walk, load, save]  ->  Done (bool)
+//! ```
+//!
+//! So this module is only plumbing: find the folders a package put on disk,
+//! feed them in one at a time, and wait for `Done`.
+
+use crate::events::{Event, EventSink};
+use crate::spec::Spec;
+use crate::target::Roots;
+use crate::viserver::{self, Connection, LvValue, VIRef};
+use anyhow::{Context, Result, bail};
+use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR, Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// The control the folder goes into, and the indicator that says it finished.
+const FOLDER_CONTROL: &str = "Folder to relink";
+const DONE_INDICATOR: &str = "Done";
+/// Read once `Done` goes true, if the VI has it. A string, because
+/// [`LvValue`] carries scalars and strings only — an array of clusters, which
+/// is what `Saved Items out` is, cannot be decoded without new wire work. JSON
+/// in that string parses fine on this side.
+const LOG_INDICATOR: &str = "report log out";
+
+/// A folder as LabVIEW must receive it: separators native, no trailing one.
+///
+/// LabVIEW splits a Windows path on backslashes only — a forward slash is an
+/// ordinary filename character. So `C:/vi.lib/Foo` arrives as a single
+/// unparseable component, the relink walks nothing, and it reports success
+/// over an empty list. Install manifests store forward slashes, which is how
+/// a whole relink pass came back reporting nothing at all. On Linux it is the
+/// other way round, so there the path goes as it is.
+pub(crate) fn lv_folder(folder: &Path) -> String {
+    let s = folder.to_string_lossy();
+    #[cfg(windows)]
+    let s = s.replace('/', "\\");
+    s.trim_end_matches(MAIN_SEPARATOR).to_string()
+}
+
+/// How many saved files to name before summarising the rest — the same
+/// cut-off the dry run uses for a package's files.
+const SHOWN_SAVES: usize = 6;
+
+/// The VI's report, as lines fit to print under the folder they belong to.
+///
+/// The report is a JSON array of the absolute paths the VI saved. Printed raw
+/// it is one line of escaped backslashes; here it becomes a count and the
+/// paths relative to `folder`, capped like the dry run. An empty array still
+/// says so — "walked 283, saved 0" and no report at all must not look alike.
+/// Anything that is not such an array is passed through untouched, so a VI
+/// that grows a different report keeps being heard.
+pub fn summarize_log(log: &str, folder: &Path) -> Vec<String> {
+    let Ok(saved) = serde_json::from_str::<Vec<String>>(log.trim()) else {
+        return log
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+    };
+    if saved.is_empty() {
+        return vec!["saved nothing".to_string()];
+    }
+    let base = lv_folder(folder) + MAIN_SEPARATOR_STR;
+    let mut out = vec![format!("saved {} file(s)", saved.len())];
+    for p in saved.iter().take(SHOWN_SAVES) {
+        #[cfg(windows)]
+        let rel = p.replace('/', "\\");
+        #[cfg(not(windows))]
+        let rel = p.clone();
+        let rel = rel.strip_prefix(&base).unwrap_or(&rel);
+        out.push(format!("  {rel}"));
+    }
+    if saved.len() > SHOWN_SAVES {
+        out.push(format!("  ... and {} more", saved.len() - SHOWN_SAVES));
+    }
+    out
+}
+
+/// Extensions worth relinking. Anything else a package ships — documentation,
+/// palettes, DLLs — has no linker tables to fix.
+const LV_EXTENSIONS: &[&str] = &[
+    "vi", "vit", "vim", "ctl", "ctt", "xctl", "llb", "lvlib", "lvclass", "lvproj",
+];
+
+pub(crate) fn is_lv_item(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| LV_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// Copy the relink VI that ships beside lvpm into `dir`, so LabVIEW can open
+/// it by path.
+pub fn locate_vi(dir: &Path) -> Result<PathBuf> {
+    materialize_vi(dir, "lvpm-relink-package", &shipped_vi(RELINK_VI_FILE)?)
+}
+
+pub(crate) const RELINK_VI_FILE: &str = "relink-package.vi";
+pub(crate) const BUILD_APP_VI_FILE: &str = "build-app.vi";
+
+/// The bytes of a VI lvpm ships, checked against the hash build.rs recorded.
+pub(crate) fn shipped_vi(file: &str) -> Result<Vec<u8>> {
+    let md5 = match file {
+        RELINK_VI_FILE => env!("LVPM_RELINK_VI_MD5"),
+        BUILD_APP_VI_FILE => env!("LVPM_BUILD_APP_VI_MD5"),
+        _ => unreachable!("{file} is not a VI lvpm ships"),
+    };
+    let exe = std::env::current_exe().ok();
+    first_matching(&shipped_vi_candidates(exe.as_deref(), file), md5)
+}
+
+/// Where a VI lvpm ships may be: beside the executable (a release), beside
+/// the file it resolves to when started through a link, then the checkout
+/// this lvpm was built from (`cargo run`, tests).
+///
+/// The VIs used to be compiled in and written out on use, which is what a
+/// dropper does: Microsoft Defender flagged the unsigned exe for it. The
+/// release archives and the MSI carry them as files beside `lvpm` instead.
+fn shipped_vi_candidates(exe: Option<&Path>, file: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    if let Some(exe) = exe {
+        // Windows reports the link's own path; Linux already resolves it.
+        let exe = exe.to_path_buf();
+        for exe in [exe.clone(), std::fs::canonicalize(&exe).unwrap_or(exe)] {
+            if let Some(vi) = exe.parent().map(|d| d.join(file))
+                && !found.contains(&vi)
+            {
+                found.push(vi);
+            }
+        }
+    }
+    found.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lv-src")
+            .join(file),
+    );
+    found
+}
+
+/// The bytes of the first candidate that exists, if its MD5 is `md5`. A VI
+/// from another build is refused rather than passed over, so a stale copy
+/// beside lvpm is never hidden by the checkout. Only a missing file is passed
+/// over; one that cannot be read is an error naming it.
+fn first_matching(candidates: &[PathBuf], md5: &str) -> Result<Vec<u8>> {
+    let version = env!("CARGO_PKG_VERSION");
+    let mut hit = None;
+    for p in candidates {
+        match std::fs::read(p) {
+            Ok(b) => {
+                hit = Some((p, b));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", p.display())),
+        }
+    }
+    let Some((path, bytes)) = hit else {
+        let expected = candidates
+            .first()
+            .map_or_else(String::new, |p| p.display().to_string());
+        bail!(
+            "lvpm's VI {expected} is missing: it is installed beside lvpm. \
+             Reinstall lvpm {version}"
+        );
+    };
+    let actual = crate::index::md5_hex(&bytes);
+    if actual != md5 {
+        bail!(
+            "{} (md5 {actual}) is from another lvpm build; lvpm {version} needs the one \
+             with md5 {md5}. Reinstall lvpm so the executable and its VIs come from the \
+             same release",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+/// Write `bytes` as `<stem>-<lvpm version>.vi` in `dir`, which is made, so
+/// LabVIEW can open it by path; its path. A file that already holds `bytes` is
+/// left alone: another run's LabVIEW may have it open, and Windows will not
+/// replace that. Otherwise it is written beside and renamed, so a run starting
+/// while another writes never opens half a VI.
+pub(crate) fn materialize_vi(dir: &Path, stem: &str, bytes: &[u8]) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let vi = dir.join(format!("{stem}-{}.vi", env!("CARGO_PKG_VERSION")));
+    if std::fs::read(&vi).is_ok_and(|held| held == bytes) {
+        return Ok(vi);
+    }
+    crate::ops::build::write_atomically(&vi, bytes)
+        .with_context(|| format!("materializing {stem} at {}", vi.display()))
+}
+
+/// Whether `dir` has a `resource` folder on the way to `Framework/Providers`.
+fn overlaps_providers(dir: &Path) -> bool {
+    let parts: Vec<_> = dir.components().collect();
+    parts.iter().enumerate().any(|(index, part)| {
+        if !part
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("resource")
+        {
+            return false;
+        }
+        let tail = &parts[index + 1..];
+        tail.iter()
+            .zip(["Framework", "Providers"])
+            .all(|(part, expected)| {
+                part.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(expected)
+            })
+    })
+}
+
+/// Drop any folder an already-kept folder contains, since the walk covers it.
+///
+/// Separators are normalised on the way through: a `Target Dir` carries its own
+/// forward slashes, which survive `join` and would otherwise reach LabVIEW —
+/// and the print-out — as `...\LabVIEW 2026\examples/10X Engineering`.
+fn collapse(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = dirs
+        .iter()
+        .map(|d| d.components().collect::<PathBuf>())
+        .filter(|dir| !overlaps_providers(dir))
+        .collect();
+    // Shallowest first, so a parent is always seen before its children.
+    dirs.sort_by_key(|d| d.components().count());
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if !out.iter().any(|kept| d.starts_with(kept)) {
+            out.push(d);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Collapse many packages' folder lists into one work list, keeping track of
+/// which packages each kept folder covers.
+///
+/// [`collapse`] already stops one package from walking the same tree twice;
+/// this is the same rule across the whole plan. Packages overlap constantly —
+/// one installs into `vi.lib/addons/Foo` while another owns `vi.lib/addons`,
+/// and the parent's walk covers the child. Measured on the 109-folder pass
+/// that prompted this: 18 nested folders cost 17.7 of 61 minutes, and 1113 of
+/// 6163 saved files were saved by more than one folder.
+///
+/// Shallowest first, so a parent is always kept before anything it covers; a
+/// covered folder contributes its package name to the parent instead of a
+/// walk of its own. Exact duplicates merge the same way.
+pub fn collapse_work(work: &[(String, Vec<PathBuf>)]) -> Vec<(PathBuf, Vec<String>)> {
+    let mut flat: Vec<(PathBuf, &str)> = Vec::new();
+    for (pkg, dirs) in work {
+        for d in dirs {
+            let dir = d.components().collect::<PathBuf>();
+            if !overlaps_providers(&dir) {
+                flat.push((dir, pkg));
+            }
+        }
+    }
+    flat.sort_by_key(|(d, _)| d.components().count());
+    let mut out: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for (d, pkg) in flat {
+        match out.iter_mut().find(|(kept, _)| d.starts_with(kept)) {
+            Some((_, pkgs)) => {
+                if !pkgs.iter().any(|p| p == pkg) {
+                    pkgs.push(pkg.to_string());
+                }
+            }
+            None => out.push((d, vec![pkg.to_string()])),
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The folders to relink, one per file group: the package's own folder.
+///
+/// A group's `Target Dir` is where the package asked to be installed — for
+/// anything with VIs in it that is a folder of its own, `<vi.lib>/addons/Foo`
+/// or `<user.lib>/Foo`. That is the right unit of work: it covers the whole
+/// package even where a subfolder holds the only VIs, and it stops at the
+/// package boundary. Deriving folders from the installed file paths instead
+/// would split one package across several sibling folders whenever its VIs sit
+/// in subdirectories.
+///
+/// Groups with nothing to relink — palette `.mnu` files, documentation — are
+/// dropped. So is the shared-root case: a group targeting `<vi.lib>` or
+/// `<user.lib>` itself would put every other package inside the walk, so that
+/// group falls back to the folders its own files actually landed in.
+/// The shared `resource/Framework/Providers` tree is excluded, including
+/// parent walks that would also traverse unrelated providers.
+pub fn folders_for_spec(roots: &Roots, spec: &Spec) -> Result<Vec<PathBuf>> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    for group in &spec.file_groups {
+        let lv_files: Vec<&String> = group
+            .files
+            .iter()
+            .filter(|f| is_lv_item(Path::new(f.as_str())))
+            .collect();
+        if lv_files.is_empty() {
+            continue;
+        }
+        // A venv install never wrote these, so there is nothing there to walk.
+        if roots.venv().is_some()
+            && Roots::classify(&group.target_dir)? != crate::target::TokenClass::LabView
+        {
+            continue;
+        }
+        let dir = roots.expand(&group.target_dir)?;
+        if roots.is_shared_root(&dir) {
+            for f in lv_files {
+                if let Some(p) = dir.join(f.replace('\\', "/")).parent() {
+                    dirs.push(p.to_path_buf());
+                }
+            }
+        } else {
+            dirs.push(dir);
+        }
+    }
+
+    Ok(collapse(dirs))
+}
+
+/// The same answer, reconstructed from an install manifest's file list.
+///
+/// Only for manifests written before the folders were recorded — the package
+/// folder itself is not recoverable from the file paths, so this is the
+/// per-file approximation [`folders_for_spec`] exists to avoid.
+pub fn folders_for(files: &[String]) -> Vec<PathBuf> {
+    let dirs = files
+        .iter()
+        .map(String::as_str)
+        .map(Path::new)
+        .filter(|p| is_lv_item(p))
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .collect();
+    collapse(dirs)
+}
+
+/// One VI Server session with `Relink Package.vi` loaded, reused across
+/// folders. Loading it costs a round of link resolution of its own (it pulls in
+/// JSONtext), so paying that once per install rather than once per folder is
+/// worth the reference being held.
+pub struct Relinker<'a> {
+    /// Kept so the reference can be opened again: saving VIs invalidates it.
+    vi: std::path::PathBuf,
+    conn: Connection,
+    vi_ref: VIRef,
+    timeout: Duration,
+    poll: Duration,
+    /// False once `Done` turns out not to be writable from here; the VI's own
+    /// clear then carries it alone. See [`Relinker::run`].
+    can_reset_done: bool,
+    /// A front-panel indicator to echo while the VI works, once the relink VI
+    /// grows one. Read on the same poll as `Done`, so nothing about the loop
+    /// changes when it appears — only its name has to be supplied.
+    progress: Option<String>,
+    /// The log indicator to read after each folder, and false once it turns
+    /// out not to be readable.
+    log: Option<String>,
+    /// Where the notes and the progress go.
+    sink: &'a dyn EventSink,
+}
+
+/// What one folder's relink did, as far as this side can tell.
+pub struct Outcome {
+    pub took: Duration,
+    /// Whatever the VI reported, verbatim. Empty when it reported nothing.
+    pub log: String,
+}
+
+impl<'a> Relinker<'a> {
+    /// Load the relink VI into the LabVIEW answering on `port`. Which LabVIEW
+    /// that is — the target's own, or one started on a venv — is the caller's
+    /// business; making it answer is `viserver::ensure_vi_server` or
+    /// `launch::ensure_instance`.
+    pub fn open(
+        port: u16,
+        vi: &Path,
+        timeout: Duration,
+        sink: &'a dyn EventSink,
+    ) -> Result<Relinker<'a>> {
+        // Polling only needs a round trip, but the initial load of the relink
+        // VI itself can take a while, so give reads the full budget.
+        let mut conn = Connection::connect("127.0.0.1", port, timeout)?;
+        let vi_ref = match conn.open_vi_reference(vi) {
+            Ok(r) => r,
+            Err(e) => {
+                conn.close();
+                return Err(e).with_context(|| format!("opening {}", vi.display()));
+            }
+        };
+        Ok(Relinker {
+            conn,
+            vi: vi.to_path_buf(),
+            vi_ref,
+            timeout,
+            poll: Duration::from_millis(500),
+            can_reset_done: true,
+            progress: None,
+            log: Some(LOG_INDICATOR.to_string()),
+            sink,
+        })
+    }
+
+    /// Echo this indicator while a folder is being relinked. An unreadable
+    /// name is reported once and then left alone, so naming an indicator the
+    /// VI does not have yet cannot fail an install.
+    pub fn watch(&mut self, indicator: Option<&str>) {
+        self.progress = indicator.map(str::to_string);
+    }
+
+    /// Relink one folder, returning how long LabVIEW took.
+    ///
+    /// Asynchronous plus polling rather than a blocking `Run VI`, so a long
+    /// relink reports progress instead of looking hung — and because the read
+    /// timeout then covers a round trip, not the whole job.
+    ///
+    /// The VI clears `Done` when it starts, which is what makes one reference
+    /// reusable across folders. It is cleared from here as well, before the run
+    /// rather than after it: both writes agree, and doing it first closes the
+    /// gap where a poll could still read the previous folder's `true`.
+    /// Point the VI at one folder and set it going.
+    fn start(&mut self, folder: &Path) -> Result<()> {
+        self.conn
+            .ctrl_val_set(self.vi_ref, FOLDER_CONTROL, LvValue::Str(lv_folder(folder)))?;
+
+        if self.can_reset_done
+            && let Err(e) =
+                self.conn
+                    .ctrl_val_set(self.vi_ref, DONE_INDICATOR, LvValue::Bool(false))
+        {
+            self.sink.emit(Event::RelinkDoneNotClearable {
+                indicator: DONE_INDICATOR.to_string(),
+                error: e.to_string(),
+            });
+            self.can_reset_done = false;
+        }
+        self.conn.run_vi_async(self.vi_ref)
+    }
+
+    /// Start the VI, working around error 1000 — "not in a state compatible
+    /// with this operation".
+    ///
+    /// Two things provoke it, and both clear on their own. The VI relinks by
+    /// saving VIs, and saving one from its own hierarchy invalidates the
+    /// reference we hold; and `Done` going true is the diagram finishing, not
+    /// the VI leaving the running state, so the next folder can arrive while
+    /// LabVIEW still considers it busy. A fresh reference covers the first, a
+    /// short wait the second, so each attempt does both and waits longer.
+    fn start_with_retries(&mut self, folder: &Path) -> Result<()> {
+        const WAITS_MS: [u64; 3] = [500, 2_000, 5_000];
+        let mut last = match self.start(folder) {
+            Ok(()) => return Ok(()),
+            Err(e) if viserver::error_code(&e) == Some(1000) => e,
+            Err(e) => return Err(e),
+        };
+        for (attempt, wait) in WAITS_MS.iter().enumerate() {
+            std::thread::sleep(Duration::from_millis(*wait));
+            if let Err(e) = self.reopen() {
+                return Err(e.context("reopening the relink VI after error 1000"));
+            }
+            match self.start(folder) {
+                Ok(()) => return Ok(()),
+                Err(e) if viserver::error_code(&e) == Some(1000) => last = e,
+                Err(e) => return Err(e),
+            }
+            if attempt + 1 == WAITS_MS.len() {
+                break;
+            }
+        }
+        Err(last).with_context(|| {
+            format!(
+                "the relink VI stayed busy across {} attempts over {}ms",
+                WAITS_MS.len() + 1,
+                WAITS_MS.iter().sum::<u64>()
+            )
+        })
+    }
+
+    /// Trade the reference in for a new one. The old one is released
+    /// best-effort: it may be exactly what LabVIEW has already invalidated.
+    fn reopen(&mut self) -> Result<()> {
+        let _ = self.conn.release(self.vi_ref);
+        self.vi_ref = self.conn.open_vi_reference(&self.vi)?;
+        Ok(())
+    }
+
+    pub fn run(&mut self, folder: &Path) -> Result<Outcome> {
+        let started = Instant::now();
+        self.start_with_retries(folder)?;
+        let mut last = String::new();
+        loop {
+            std::thread::sleep(self.poll);
+
+            if let Some(name) = self.progress.clone() {
+                match self.conn.ctrl_val_get(self.vi_ref, &name) {
+                    Ok(v) => {
+                        let shown = v.to_string();
+                        if shown != last {
+                            self.sink.emit(Event::RelinkProgress {
+                                elapsed: started.elapsed(),
+                                value: shown.clone(),
+                            });
+                            last = shown;
+                        }
+                    }
+                    Err(e) => {
+                        self.sink.emit(Event::RelinkProgressUnreadable {
+                            indicator: name,
+                            error: e.to_string(),
+                        });
+                        self.progress = None;
+                    }
+                }
+            }
+
+            match self.conn.ctrl_val_get(self.vi_ref, DONE_INDICATOR)? {
+                LvValue::Bool(true) => {
+                    return Ok(Outcome {
+                        took: started.elapsed(),
+                        log: self.read_log(),
+                    });
+                }
+                LvValue::Bool(false) => {}
+                other => bail!("{DONE_INDICATOR} read back as {other}, not a boolean"),
+            }
+            if started.elapsed() >= self.timeout {
+                bail!(
+                    "relink of {} still running after {}s ({DONE_INDICATOR} never went true) — \
+                     LabVIEW may be showing a dialog",
+                    folder.display(),
+                    self.timeout.as_secs()
+                );
+            }
+        }
+    }
+
+    /// Read the VI's own account of what it just did.
+    ///
+    /// Best-effort by design: a relink that worked must not be reported as
+    /// failed because the VI has no log indicator, or has not grown one yet.
+    /// The name is dropped after the first failure so 44 packages do not
+    /// produce 44 identical notes.
+    fn read_log(&mut self) -> String {
+        let Some(name) = self.log.clone() else {
+            return String::new();
+        };
+        match self.conn.ctrl_val_get(self.vi_ref, &name) {
+            Ok(LvValue::Str(s)) => s,
+            Ok(other) => other.to_string(),
+            Err(_) => {
+                self.log = None;
+                String::new()
+            }
+        }
+    }
+
+    pub fn close(mut self) {
+        let _ = self.conn.release(self.vi_ref);
+        self.conn.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_vi_is_written_whole_over_an_older_one_and_leaves_no_temp_file() {
+        let dir = crate::ops::testing::scratch_dir("materialize-vi");
+        let vi = materialize_vi(&dir, "lvpm-demo", b"old").unwrap();
+        assert_eq!(
+            vi.file_name().unwrap().to_string_lossy(),
+            format!("lvpm-demo-{}.vi", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(materialize_vi(&dir, "lvpm-demo", b"new").unwrap(), vi);
+        assert_eq!(std::fs::read(&vi).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_vi_that_is_already_there_is_not_written_again() {
+        let dir = crate::ops::testing::scratch_dir("materialize-vi-same");
+        let vi = materialize_vi(&dir, "lvpm-demo", b"same").unwrap();
+        // A read-only file cannot be replaced on Windows: succeeding proves it was left alone.
+        let mut held = std::fs::metadata(&vi).unwrap().permissions();
+        held.set_readonly(true);
+        std::fs::set_permissions(&vi, held.clone()).unwrap();
+        assert_eq!(materialize_vi(&dir, "lvpm-demo", b"same").unwrap(), vi);
+        #[allow(clippy::permissions_set_readonly_false)]
+        held.set_readonly(false);
+        std::fs::set_permissions(&vi, held).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A missing candidate is skipped, the first VI found decides: one from
+    /// another build is refused with its path and the hash this build expects,
+    /// even when a matching one comes later, and the matching one is taken.
+    #[test]
+    fn takes_only_the_vi_this_build_was_made_with() {
+        let dir = crate::ops::testing::scratch_dir("shipped-vi");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.vi");
+        let stale = dir.join("stale.vi");
+        std::fs::write(&stale, b"another build").unwrap();
+        let md5 = env!("LVPM_RELINK_VI_MD5");
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lv-src/relink-package.vi");
+        assert_eq!(
+            shipped_vi_candidates(None, RELINK_VI_FILE),
+            std::slice::from_ref(&checkout)
+        );
+        // A real exe path resolves to itself: one beside-exe candidate, then the checkout.
+        let exe = dir.join("lvpm.exe");
+        std::fs::write(&exe, b"").unwrap();
+        let exe = std::fs::canonicalize(&exe).unwrap();
+        assert_eq!(
+            shipped_vi_candidates(Some(&exe), RELINK_VI_FILE),
+            [exe.with_file_name(RELINK_VI_FILE), checkout.clone()]
+        );
+        assert_eq!(
+            crate::index::md5_hex(&shipped_vi(RELINK_VI_FILE).unwrap()),
+            md5
+        );
+
+        // A folder in place of a file is not "missing": it is reported, not passed over.
+        let unreadable = dir.join("folder.vi");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        let err = format!(
+            "{:#}",
+            first_matching(&[unreadable, checkout.clone()], md5).unwrap_err()
+        );
+        assert!(
+            err.contains("cannot read") && err.contains("folder.vi"),
+            "{err}"
+        );
+
+        let err = first_matching(std::slice::from_ref(&missing), md5)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing.vi")
+                && err.contains("beside lvpm. Reinstall lvpm")
+                && !err.contains("  "),
+            "{err}"
+        );
+
+        let err = first_matching(&[missing.clone(), stale, checkout.clone()], md5)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("stale.vi") && err.contains(md5) && !err.contains("  "),
+            "{err}"
+        );
+
+        let bytes = first_matching(&[missing, checkout], md5).unwrap();
+        assert_eq!(crate::index::md5_hex(&bytes), md5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The report as LabVIEW writes it: a JSON array of absolute paths, which
+    /// becomes a count and folder-relative names, capped past six.
+    #[cfg(windows)]
+    #[test]
+    fn summarize_log_counts_and_relativises() {
+        let folder = Path::new(r"C:\Program Files\National Instruments\LabVIEW 2026\examples\DQMH");
+        let log = r#"["C:\\Program Files\\National Instruments\\LabVIEW 2026\\examples\\DQMH\\Libraries\\A\\A.lvlib", "C:\\Program Files\\National Instruments\\LabVIEW 2026\\examples\\DQMH\\B.lvlib"]"#;
+        assert_eq!(
+            summarize_log(log, folder),
+            vec!["saved 2 file(s)", r"  Libraries\A\A.lvlib", r"  B.lvlib"]
+        );
+
+        let many: Vec<String> = (0..9).map(|i| format!(r"C:\x\{i}.vi")).collect();
+        let lines = summarize_log(&serde_json::to_string(&many).unwrap(), Path::new(r"C:\x"));
+        assert_eq!(lines.len(), 1 + SHOWN_SAVES + 1);
+        assert_eq!(lines[0], "saved 9 file(s)");
+        assert_eq!(lines[1], "  0.vi");
+        assert_eq!(lines.last().unwrap(), "  ... and 3 more");
+
+        assert_eq!(summarize_log("[]", folder), vec!["saved nothing"]);
+        // Not the array we know: pass the text through, blank lines dropped.
+        assert_eq!(
+            summarize_log("walked 3\n\nsaved 0\n", folder),
+            vec!["walked 3", "saved 0"]
+        );
+        assert!(summarize_log("", folder).is_empty());
+    }
+
+    /// The same report from LabVIEW on Linux, whose paths use forward slashes.
+    #[cfg(not(windows))]
+    #[test]
+    fn summarize_log_relativises_linux_paths() {
+        let folder = Path::new("/usr/local/natinst/LabVIEW-2026-64/examples/DQMH/");
+        let log = r#"["/usr/local/natinst/LabVIEW-2026-64/examples/DQMH/Libraries/A/A.lvlib", "/usr/local/natinst/LabVIEW-2026-64/examples/DQMH/B.lvlib"]"#;
+        assert_eq!(
+            summarize_log(log, folder),
+            vec!["saved 2 file(s)", "  Libraries/A/A.lvlib", "  B.lvlib"]
+        );
+        assert_eq!(summarize_log("[]", folder), vec!["saved nothing"]);
+    }
+
+    /// The cross-package version of `collapse`: a folder covered by another
+    /// package's folder joins that folder's run instead of getting its own,
+    /// and exact duplicates merge. Order and per-folder attribution both
+    /// matter — a failure has to be pinned on every package it walked for.
+    #[test]
+    fn collapse_work_merges_overlapping_packages() {
+        let work = vec![
+            (
+                "caraya".to_string(),
+                vec![PathBuf::from("/lv/vi.lib/addons/Caraya")],
+            ),
+            ("h5".to_string(), vec![PathBuf::from("/lv/vi.lib/addons")]),
+            (
+                "caraya_cli".to_string(),
+                vec![PathBuf::from("/lv/vi.lib/addons/Caraya")],
+            ),
+            ("dqmh".to_string(), vec![PathBuf::from("/lv/project/DQMH")]),
+        ];
+        let plan = collapse_work(&work);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].0, PathBuf::from("/lv/project/DQMH"));
+        assert_eq!(plan[0].1, ["dqmh"]);
+        assert_eq!(plan[1].0, PathBuf::from("/lv/vi.lib/addons"));
+        assert_eq!(plan[1].1, ["h5", "caraya", "caraya_cli"]);
+    }
+
+    /// Install manifests store forward slashes; LabVIEW needs backslashes, or
+    /// it takes the whole path for one filename and relinks nothing while
+    /// reporting success. A whole 101-folder pass came back empty this way.
+    #[cfg(windows)]
+    #[test]
+    fn folders_reach_labview_with_native_separators() {
+        let m = "C:/Program Files/National Instruments/LabVIEW 2026/vi.lib/Delacor/Libraries";
+        assert_eq!(
+            lv_folder(Path::new(m)),
+            r"C:\Program Files\National Instruments\LabVIEW 2026\vi.lib\Delacor\Libraries"
+        );
+        // Already native, mixed, and trailing separators all land the same way.
+        assert_eq!(lv_folder(Path::new(r"C:\vi.lib\Foo")), r"C:\vi.lib\Foo");
+        assert_eq!(lv_folder(Path::new(r"C:\vi.lib/Foo\")), r"C:\vi.lib\Foo");
+        assert_eq!(lv_folder(Path::new("C:/vi.lib/Foo/")), r"C:\vi.lib\Foo");
+    }
+
+    /// On Linux the manifest's forward slashes are already LabVIEW's own; a
+    /// backslash there would be part of a file name.
+    #[cfg(not(windows))]
+    #[test]
+    fn folders_reach_linux_labview_as_they_are() {
+        let m = "/usr/local/natinst/LabVIEW-2026-64/vi.lib/Delacor/Libraries/";
+        assert_eq!(lv_folder(Path::new(m)), m.trim_end_matches('/'));
+    }
+
+    fn f(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn group(index: usize, target_dir: &str, files: &[&str]) -> crate::spec::FileGroup {
+        crate::spec::FileGroup {
+            index,
+            target_dir: target_dir.to_string(),
+            replace_mode: "Always".to_string(),
+            files: f(files),
+            entry_prefix: format!("File Group {index}/"),
+        }
+    }
+
+    fn spec(groups: Vec<crate::spec::FileGroup>) -> Spec {
+        Spec {
+            name: "acme_lib_thing".into(),
+            version: "1.0.0.1".into(),
+            display_name: None,
+            file_groups: groups,
+            script_vis: Vec::new(),
+            requires: None,
+            lv_gate: None,
+            description: Default::default(),
+        }
+    }
+
+    /// The whole point: one folder per package, even when the VIs sit in
+    /// subdirectories and nothing is at the package root.
+    #[test]
+    fn relinks_the_package_folder_the_spec_asked_for() {
+        let roots = Roots::scratch(Path::new("/box"));
+        let got = folders_for_spec(
+            &roots,
+            &spec(vec![
+                group(
+                    1,
+                    "<vi.lib>/addons/Thing",
+                    &["sub/Deep.vi", "sub/other/More.vi"],
+                ),
+                // Palettes have nothing to relink.
+                group(2, "<menus>/Categories/Thing", &["thing.mnu", "dir.mnu"]),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(got, vec![PathBuf::from("/box/LabVIEW/vi.lib/addons/Thing")]);
+    }
+
+    /// A group aimed at a shared root must not drag every other package into
+    /// the walk, so it falls back to where its own files went.
+    #[test]
+    fn a_shared_root_target_falls_back_to_the_files_own_folders() {
+        let roots = Roots::scratch(Path::new("/box"));
+        let got = folders_for_spec(
+            &roots,
+            &spec(vec![group(
+                1,
+                "<user.lib>",
+                &["Thing/A.vi", "Thing/nested/B.vi"],
+            )]),
+        )
+        .unwrap();
+        assert_eq!(got, vec![PathBuf::from("/box/LabVIEW/user.lib/Thing")]);
+    }
+
+    #[test]
+    fn skips_shared_providers_groups_but_keeps_package_folders() {
+        let roots = Roots::scratch(Path::new("/box"));
+        let got = folders_for_spec(
+            &roots,
+            &spec(vec![
+                group(1, "<resource>/Framework/Providers", &["Thing/Provider.vi"]),
+                group(2, "<vi.lib>/addons/Thing", &["Main.vi"]),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(got, vec![PathBuf::from("/box/LabVIEW/vi.lib/addons/Thing")]);
+    }
+
+    #[test]
+    fn skips_providers_in_legacy_file_lists() {
+        let got = folders_for(&f(&[
+            "/lv/resource/Framework/Providers/Thing/Provider.vi",
+            "/lv/vi.lib/Thing/Main.vi",
+        ]));
+        assert_eq!(got, vec![PathBuf::from("/lv/vi.lib/Thing")]);
+    }
+
+    #[test]
+    fn recorded_work_cannot_walk_providers_or_their_parents() {
+        let work = vec![(
+            "thing".into(),
+            vec![
+                PathBuf::from("/lv/resource"),
+                PathBuf::from("/lv/resource/Framework"),
+                PathBuf::from("/lv/resource/Framework/Providers"),
+                PathBuf::from("/lv/resource/Framework/Providers/Thing"),
+                PathBuf::from("/lv/resource/Framework/Other"),
+                PathBuf::from("/lv/vi.lib/Thing"),
+            ],
+        )];
+        assert_eq!(
+            collapse_work(&work),
+            vec![
+                (
+                    PathBuf::from("/lv/resource/Framework/Other"),
+                    vec!["thing".into()]
+                ),
+                (PathBuf::from("/lv/vi.lib/Thing"), vec!["thing".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_one_folder_per_tree_and_drops_children() {
+        let got = folders_for(&f(&[
+            "C:/LV/vi.lib/addons/foo/Foo.lvlib",
+            "C:/LV/vi.lib/addons/foo/Open.vi",
+            "C:/LV/vi.lib/addons/foo/sub/Deep.vi",
+            "C:/LV/user.lib/bar/Bar.vi",
+        ]));
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("C:/LV/user.lib/bar"),
+                PathBuf::from("C:/LV/vi.lib/addons/foo")
+            ]
+        );
+    }
+
+    #[test]
+    fn siblings_stay_separate_rather_than_lifting_to_a_shared_parent() {
+        // Nothing lives directly in addons/, so neither package's folder may be
+        // replaced by addons/ itself.
+        let got = folders_for(&f(&[
+            "C:/LV/vi.lib/addons/foo/Foo.vi",
+            "C:/LV/vi.lib/addons/baz/Baz.vi",
+        ]));
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("C:/LV/vi.lib/addons/baz"),
+                PathBuf::from("C:/LV/vi.lib/addons/foo")
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_files_with_no_linker_tables() {
+        assert!(
+            folders_for(&f(&[
+                "C:/LV/menus/Categories/foo.mnu",
+                "C:/LV/vi.lib/addons/foo/readme.html",
+                "C:/LV/resource/foo.dll",
+            ]))
+            .is_empty()
+        );
+    }
+}

@@ -1,47 +1,57 @@
+[workspace]
+members = ["crates/lvpm-core", "crates/lvpm-testkit", "crates/lvpm-tui", "e2e"]
+# Plain `cargo test` also runs the TUI's and the testkit's tests; core's run inside tests/workspace.rs.
+# e2e/ (upstream's runner for NI's LabVIEW containers) is not built by plain `cargo build`/`test`;
+# `--workspace` builds it too.
+default-members = [".", "crates/lvpm-testkit", "crates/lvpm-tui"]
+
+[workspace.package]
+version = "0.27.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ThatsTheEnd/lvpm"
+
 [package]
 name = "lvpm"
-version = "0.3.1"
-edition = "2024"
-description = "Open-source package manager for LabVIEW"
-authors = ["Jonathan Graesser","Felipe Silva"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/labview-package-manager/lvpm"
+version.workspace = true
+edition.workspace = true
+description = "Open-source package manager for LabVIEW (.vip) packages"
+license.workspace = true
+repository.workspace = true
 
+[dependencies]
+serde = "1.0.229"
+serde_json = "1.0.151"
+lvpm-core = { path = "crates/lvpm-core" }
+lvpm-tui = { path = "crates/lvpm-tui" }
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "default-tls"] }
+
+[dev-dependencies]
+cucumber = "0.23.0"
+futures = "0.3.34"
+lvpm-testkit = { path = "crates/lvpm-testkit" }
+md-5 = "0.11.0"
+regex = "1.13.1"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+toml = { version = "1.1.5", features = ["preserve_order"] }
+zip = "9.5.1"
+
+# The MSI (wix/main.wxs, built by dist). The same upgrade code as upstream
+# lvpm's MSI: both install to %LOCALAPPDATA%\lvpm\bin, so one replaces the other.
 [package.metadata.wix]
 upgrade-guid = "2AE3D9AE-39AC-4BC3-A28C-187026CEEFCE"
 path-guid = "5B493AB7-0E84-4A8E-8B3F-A0E99B41FE04"
 license = false
 eula = false
 
-# e2e/ is the end-to-end test runner for NI's LabVIEW containers; it is not
-# part of a release, and a plain `cargo test` here does not build it.
-[workspace]
-members = ["e2e"]
-[dependencies]
-anyhow = "1.0.104"
-clap = { version = "4.6.6", features = ["derive"] }
-flate2 = "1.1.9"
-log = { version = "0.4.35", features = ["std"] }
-quick-xml = "0.38.3"
-md-5 = "0.11.0"
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "default-tls"] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
-toml = { version = "1.1.5", features = ["preserve_order"] }
-zip = "9.5.1"
-toml_edit = "0.25.19"
-semver = { version = "1.0.28", features = ["serde"] }
+[[test]]
+name = "acceptance"
+harness = false
 
-[build-dependencies]
-md-5 = "0.11.0"
-
-[target."cfg(windows)".dependencies]
-mslnk = "0.1.8"
-winreg = "0.56.0"
-
-# The profile that 'dist' will build with
+# The profile that dist builds releases with.
 [profile.dist]
 inherits = "release"
 lto = "thin"

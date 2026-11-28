@@ -1,197 +1,237 @@
-<p align="center">
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/lvpm-logo-dark.svg">
     <img alt="lvpm: open-source package manager for LabVIEW" src="docs/assets/lvpm-logo.svg" width="520">
   </picture>
-</p>
+</h1>
 
-<p align="center">
-  <a href="https://github.com/labview-package-manager/lvpm/actions/workflows/build.yml"><img alt="build" src="https://github.com/labview-package-manager/lvpm/actions/workflows/build.yml/badge.svg"></a>
-  <a href="https://github.com/labview-package-manager/lvpm/releases"><img alt="release" src="https://img.shields.io/github/v/release/labview-package-manager/lvpm?include_prereleases&sort=semver"></a>
-  <a href="https://github.com/labview-package-manager/lvpm/releases"><img alt="downloads" src="https://img.shields.io/github/downloads/labview-package-manager/lvpm/total"></a>
-  <a href="#license"><img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue"></a>
-</p>
+[![Release](https://github.com/ThatsTheEnd/lvpm/actions/workflows/tag.yml/badge.svg?branch=main)](https://github.com/ThatsTheEnd/lvpm/actions/workflows/tag.yml)
+[![Docs](https://github.com/ThatsTheEnd/lvpm/actions/workflows/docs.yml/badge.svg?branch=main)](https://thatstheend.github.io/lvpm/)
+[![Latest release](https://img.shields.io/github/v/release/ThatsTheEnd/lvpm?include_prereleases&sort=semver)](https://github.com/ThatsTheEnd/lvpm/releases)
+[![Downloads](https://img.shields.io/github/downloads/ThatsTheEnd/lvpm/total)](https://github.com/ThatsTheEnd/lvpm/releases)
+[![Rust](https://img.shields.io/badge/rust-stable%20%C2%B7%20edition%202024-orange?logo=rust)](Cargo.toml)
+[![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)](docs/install.md)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-<p align="center">
-  <a href="#install">Install</a> ·
-  <a href="#quick-start">Quick start</a> ·
-  <a href="docs/README.md">Documentation</a> ·
-  <a href="docs/roadmap.md">Roadmap</a>
-</p>
+An open-source package manager for LabVIEW.
 
-**lvpm** installs LabVIEW packages from the command line. It resolves `.vip`
-and `.ogp` packages by name from the public package directories, your own
-hosted indexes or local folders, downloads and verifies them, and unpacks
-them into a LabVIEW installation or into a project's own **[venv](docs/venvs.md)**. A project
-declares what it needs in `lvpm.toml`, so every developer and every CI job
-gets the same packages.
+**Documentation: <https://thatstheend.github.io/lvpm/>**, with a tutorial
+from an empty folder to a published package, how-to guides and the full
+reference.
 
-**Venvs are new to LabVIEW.** Until now every package went into the one
-`vi.lib` that every project on the machine shares, so two projects needing
-different versions of a library meant two LabVIEW VMs or two
-machines. A venv gives each project its own packages, the way a Python
-virtualenv or `node_modules` does: they live beside the project, LabVIEW
-mounts them as an [LVAddons](https://labviewwiki.org/wiki/LVAddons) overlay
-(LabVIEW 2024 Q1 and later), and `C:\Program Files` never changes.
+lvpm installs `.vip` and `.ogp` packages, the formats VIPM and OpenG use, and
+its own `.lvpkg`, by name. It takes them from the public package directories, your own hosted
+indexes, or local folders. It installs them either into a LabVIEW installation
+or into a project's own **venv**, so two projects on one machine can use
+different versions of the same library. Venvs are new to LabVIEW: the
+packages live beside the project, LabVIEW mounts them as an
+[LVAddons](https://labviewwiki.org/wiki/LVAddons) overlay (LabVIEW 2024 Q1
+and later), and `C:\Program Files` never changes
+([How a venv works](docs/venvs.md)). Then **linkfix** repairs the installed
+VIs' links and separates their compiled code, without starting LabVIEW
+([Linkfix](docs/linkfix.md)); `--relink` has LabVIEW load and save them
+instead. Install hooks are off by default: a package's hooks run only if
+you allow them ([Hooks](docs/labview-integration.md#hooks)).
 
-```console
-$ lvpm venv create --labview-version 2026
-$ lvpm install
-resolved 48 packages:
-  delacor_lib_qmh 7.1.2.1547
-  ...
-+ delacor_lib_qmh 7.1.2.1547 ... 65 files
-...
-done. 8766 files written.
-linkfix: preparing installed files (repair links and separate compiled code; no LabVIEW needed)
-$ lvpm launch MyProject.lvproj
+Not affiliated with JKI or NI. Working, in active development; see
+[docs/roadmap.md](docs/roadmap.md) and [Known limitations](docs/limitations.md).
+
+<!-- ANCHOR: how-it-works -->
+## How it works
+
+```mermaid
+flowchart LR
+  S["Package sources<br/>VIPM / NI indexes · GitHub releases · your indexes · local folders"] --> L["lvpm<br/>resolve · download · verify · unpack"]
+  P["lvpm.toml + lvpm.lock<br/>(optional, per project)"] -.-> L
+  L --> T["LabVIEW installation<br/>or project .lv-venv"]
+  L -- "VI Server" --> LV["LabVIEW<br/>resave a venv's packages · relink with --relink or relink = true · run allowed hooks outside a venv"]
 ```
 
-## Features
+1. lvpm resolves the package and its dependencies, downloads them and checks
+   their MD5.
+2. It unpacks them into the target: a LabVIEW installation, or a project venv
+   that LabVIEW overlays onto its own tree.
+3. Linkfix repairs the installed VIs' links without LabVIEW. Over VI Server,
+   LabVIEW relinks them only with `--relink` or for a package marked
+   `relink = true`, resaves a venv's packages, and runs the install hooks of the
+   packages you allowed, outside a venv.
 
-- **Per-project dependencies, a first for LabVIEW.** A venv keeps a
-  project's packages beside it, mounted into LabVIEW as an LVAddons overlay.
-  `C:\Program Files` never changes, and two projects can use two versions
-  of the same library on one machine.
-- **Works with the packages that exist today.** Reads VIPM's `.vip` and
-  OpenG's `.ogp` formats and the public package directories NI and JKI
-  host, plus any index or folder of `.vip` files you add.
-- **A manifest you commit.** `lvpm.toml` lists dependencies with exact pins,
-  `>=` floors or `*`, optional dependency groups (`test`, `ci`, ...), extra
-  package indexes, and per-package hook and relink settings.
-- **No LabVIEW needed to install.** Linkfix repairs the installed VIs' links
-  and separates compiled code by editing the files directly. LabVIEW is only started for install
-  hooks and an optional load-and-save relink, driven over VI Server.
-- **Built for CI.** Runs unchanged in NI's Windows and Linux LabVIEW
-  containers; a headless install takes seconds and starts no LabVIEW.
-- **Verified downloads, shared cache.** MD5 and SHA-256 checks, and a
-  content-addressed cache so a package is downloaded once per machine.
+In a project, `lvpm.toml` says what you depend on. `lvpm.lock` records the
+exact versions, so every machine and CI job gets the same packages, byte for
+byte.
+<!-- ANCHOR_END: how-it-works -->
 
 ## Install
 
 Windows 10/11 with LabVIEW 2020 or later (venvs need LabVIEW 2024 Q1 or
-later). Run the MSI from the
-[Releases](https://github.com/labview-package-manager/lvpm/releases) page, or
-in PowerShell:
+later). Run `lvpm-x86_64-pc-windows-msvc.msi` from the
+[Releases](https://github.com/ThatsTheEnd/lvpm/releases) page, or in
+PowerShell:
 
 ```powershell
 cd $env:TEMP
-irm https://raw.githubusercontent.com/labview-package-manager/lvpm/main/scripts/install.ps1 -OutFile install.ps1
+irm https://raw.githubusercontent.com/ThatsTheEnd/lvpm/main/scripts/install.ps1 -OutFile install.ps1
 .\install.ps1
 ```
 
-The script verifies the MSI's SHA-256 and installs it quietly: `lvpm.exe`
-and `relink-package.vi` per-user in `%LOCALAPPDATA%\lvpm\bin`, on your
-`PATH`, removable under **Settings → Apps**; no elevation needed.
+The script verifies the release zip's SHA-256 and puts `lvpm.exe` in
+`%LOCALAPPDATA%\lvpm\bin`, on your user `PATH`. Both install per-user and
+need no elevation. If PowerShell refuses to run the script, allow it with
+[Set-ExecutionPolicy](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/set-executionpolicy?view=powershell-7.6).
 
-On Linux x64 (from v0.3.1):
+On Linux x64:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/labview-package-manager/lvpm/main/scripts/install.sh
 sh install.sh
 ```
 
-Script options, the portable zip, building from source and Linux are covered
-in [docs/installation.md](docs/installation.md) and
-[docs/linux.md](docs/linux.md).
+It verifies the release tarball's SHA-256 and puts `lvpm` in `~/.local/bin`
+(`/usr/local/bin` as root), adding that to `PATH` in `~/.profile`. Script
+options, the checksum steps and building from source are in
+[docs/install.md](docs/install.md).
 
 ## Quick start
-
-**One package into a LabVIEW installation:**
 
 ```console
 $ lvpm targets                              # which LabVIEW installations lvpm sees
 $ lvpm search error                         # find packages in the public indexes
-$ lvpm install oglib_error --labview-version 2026
-$ lvpm list                                 # what lvpm has installed there
-$ lvpm uninstall oglib_error
+$ lvpm install oglib_error --global --labview-version 2026
+$ lvpm list --labview-version 2026          # what lvpm has installed there
+$ lvpm uninstall oglib_error --global --labview-version 2026
 ```
 
-**A project with its own venv.** Write an `lvpm.toml` at the project root:
+Or browse and install in a terminal UI: `lvpm tui`.
 
-```toml
-[project]
-name = "MyProject"
-labview = "2026"              # the oldest LabVIEW the project supports
+`--global` writes into the LabVIEW installation itself, which changes every
+project that uses it, so lvpm asks for it; `--labview-version` picks which LabVIEW
+when more than one is installed, and `--global` alone takes the only one.
+Relinking, hooks and a venv's resave need LabVIEW's VI Server (TCP) enabled, which
+is its default setting (Tools » Options » VI Server). lvpm starts LabVIEW
+itself when it is not running, and says so.
 
-[dependencies]
-delacor_lib_qmh = "7.1.2.1547"    # exactly this version
-oglib_error = ">=6.0.1"           # the newest version satisfying the floor
-
-[dependencies.test]               # installed only with --with test
-jki_lib_caraya = "*"
-```
-
-then:
+For a project, start with `lvpm init` ([Starting a project](docs/usage.md#starting-a-project)).
+It writes an `lvpm.toml` and a `.gitignore`, makes a git repository and binds a venv to your LabVIEW;
+`lvpm init --from <file.vipc>` or `--from vipm.toml` takes the dependencies over from VIPM:
 
 ```console
 $ cd C:\Git\MyProject
-$ lvpm venv create                # .lv-venv/ beside lvpm.toml, bound to LabVIEW 2026
-$ lvpm install --with test        # everything lvpm.toml lists, into .lv-venv
-$ lvpm launch MyProject.lvproj    # a LabVIEW that sees the venv
+$ lvpm init --labview-version 2026         # lvpm.toml, .gitignore, git and .lv-venv/ in one go
+$ lvpm install                              # locks lvpm.toml into lvpm.lock, installs exactly that into .lv-venv
+$ lvpm install oglib_error                  # one more dependency: lvpm.toml, lvpm.lock and .lv-venv together
+$ lvpm launch MyProject.lvproj              # a LabVIEW that sees the venv
 ```
 
-Commit `lvpm.toml`; the venv ignores itself in git. Any `lvpm` command run
-inside the project folder uses its venv, with no activation step.
+Commit `lvpm.toml` and `lvpm.lock` ([The lock file](docs/usage.md#the-lock-file)).
 
-## Commands
+A project that already has a `vipm.toml` or a `.vipc` gets its packages into
+`lvpm.toml` with `lvpm import <file>`, then `lvpm sync`
+([Importing into a project](docs/usage.md#importing-into-a-project)).
 
-| Command | What it does |
+To package your own library, add a `[distribution]` table to `lvpm.toml`
+([Building a package](docs/usage.md#building-a-package)), then:
+
+```console
+$ lvpm build                                # dist/<name>-<version>.lvpkg, no LabVIEW needed
+$ lvpm publish --to D:/feeds/packages        # copy it into a folder feed, never replacing
+```
+
+`lvpm build` checks the library's members first, so it needs a venv
+(`lvpm venv create`, `lvpm sync`) or `--no-check`.
+
+To build a LabVIEW application, add an `[application]` table with the
+`.lvproj` and the build specification
+([Building an application](docs/usage.md#building-an-application)), then run
+`lvpm build --app`. lvpm runs the build in the venv's LabVIEW and writes
+`bom.cdx.json`, an SBOM of the locked packages, next to the build. A `.lvpkg`
+carries an SBOM of its locked dependencies when `lvpm.lock` is current.
+Application builds are tested on LabVIEW 2026 only.
+
+## Why
+
+LabVIEW packaging was open before it was closed. The **OpenG Package Tools**
+(2002–2005) designed and documented all of it: the zip-with-a-`spec`
+package, the INI package directory, `Target Dir` tokens, file groups, replace
+modes, install-time script VIs, the installed-package database, dependency
+resolution, and a per-project "development system configuration" you could
+export and re-import. VIPM descends from that design and is closed source;
+the design, its documents and its source are still public at
+<https://ogpm.sourceforge.net/>.
+
+lvpm goes back to that model and finishes it: same formats, so today's `.vip`
+and `.ogp` packages and the public `.ogpd` / `.vipr` directories work as-is,
+with the LabVIEW-side work (fixing VI links, running hook VIs) done over VI
+Server, a documented TCP protocol. [docs/ogpm-model.md](docs/ogpm-model.md)
+is the reference and the term-by-term map from OGPT to lvpm.
+
+## JSON output and exit codes
+
+<!-- ANCHOR: json-output -->
+
+`--json` makes every command but the diagnostics (`app-probe`, `vi-probe`,
+`vi-save`, `vi-run`) write JSON Lines to stdout. Each event is one line,
+`{"event": "<name>", "data": {...}}`, for example
+`{"event": "phase_started", "data": {"phase": "download"}}`; an event with no
+fields has no `data`, for example `{"event": "indexes_loading"}`. The last line is
+`{"result": ...}` when the command succeeds or `{"error": "<message>"}` when
+it fails; no other line has either key. The query commands put their data in
+the result (`search`, `info`, `list`, `targets`, `config get`, `cache add`,
+`venv status`, `lock --check`, `check`); the others put `{"command": "<name>"}` there.
+`venv status` gives `{"exists": false, "status": null}` when there is no venv.
+A LabVIEW's `version` is its internal version (`26.3` for LabVIEW 2026), not
+a package version.
+Under `--json` a command never prompts: `venv remove` fails unless it gets
+`--yes` (or `LVPM_YES=1`).
+
+The exit code is the same with or without `--json`:
+
+| Code | Meaning |
 | --- | --- |
-| `lvpm install [<name>[@<version>]]` | Install a package, or everything `lvpm.toml` lists |
-| `lvpm uninstall <name>` / `--all` | Remove a package, optionally with its unshared dependencies |
-| `lvpm list` | What lvpm has installed into the target or venv |
-| `lvpm search <query>` | Search the package indexes |
-| `lvpm targets` | Detected LabVIEW installations |
-| `lvpm venv create` / `status` / `remove` | Manage the project's venv |
-| `lvpm launch [<lvproj>]` | Check the venv against the manifest and start LabVIEW on it |
-| `lvpm linkfix` / `relink` / `run-hooks` / `refresh` | Rerun one step of an install |
-| `lvpm config` / `cache add` | Settings and the package cache |
-| `lvpm import <file>` | Write VIPM's `vipm.toml` or a `.vipc` into `lvpm.toml` once |
+| 0 | The command succeeded |
+| 1 | The command failed; the message says why. For `check`, it found a problem; the findings are the result |
+| 2 | The arguments are wrong (a usage error); nothing ran |
 
-All commands and flags: [docs/commands.md](docs/commands.md).
+The event names, the result and error keys and these codes are stable: a
+change to them is a breaking change and gets a major version.
+<!-- ANCHOR_END: json-output -->
 
-## Documentation
+## Upgrading
 
-| | |
+lvpm has no `lvpm update` command. Upgrading is two steps, as in uv
+(`uv lock --upgrade`, then `uv sync`): `lvpm lock --upgrade` moves the lock to
+the newest versions the manifest allows, and `lvpm sync` installs them.
+
+```text
+lvpm lock --upgrade
+lvpm sync
+```
+
+## Learn more
+
+The documentation site, <https://thatstheend.github.io/lvpm/>, holds the docs
+below as one book, starting with a tutorial; CONTRIBUTING.md stays in the repo.
+
+| Document | What is in it |
 | --- | --- |
-| [Installation](docs/installation.md) | Install script, manual install, building from source |
-| [Commands](docs/commands.md) | Every command and flag |
-| [The manifest (`lvpm.toml`)](docs/manifest.md) | Dependencies, groups, sources, hooks and relink |
-| [VIPM's files](docs/compatibility.md) | Importing a `vipm.toml` or a `.vipc` with `lvpm import` |
-| [Venvs](docs/venvs.md) | Per-project dependencies and `lvpm launch` |
-| [What an install does](docs/install-process.md) | Linkfix, relinking, install hooks, VI Server |
-| [Package sources and cache](docs/package-sources.md) | Public directories, own indexes, local folders |
-| [Configuration](docs/configuration.md) | Settings, environment variables, logs |
-| [CI in a container](docs/ci-container.md) | NI's Docker images, headless installs |
-| [Linux](docs/linux.md) | What differs on Linux |
-| [Package notes](docs/package-notes.md) | Commonly used packages in a venv: hooks needed, what doesn't work yet |
-| [Known limitations](docs/limitations.md) | What does not work yet |
-| [All documentation](docs/README.md) | Including design notes and internals |
+| [docs/install.md](docs/install.md) | Install script options, manual and Linux install, building from source |
+| [docs/usage.md](docs/usage.md) | Commands and flags, `lvpm.toml`, `lvpm.lock`, install/uninstall/upgrade, venvs, package sources, configuration |
+| [docs/venvs.md](docs/venvs.md) | How a venv works: the overlay, its palettes, keeping the LabVIEW installation clean |
+| [docs/labview-integration.md](docs/labview-integration.md) | What an install does inside LabVIEW: linkfix, relinking, install hooks, VI Server |
+| [docs/package-notes.md](docs/package-notes.md) | Commonly used packages in a venv: which hooks they need, which don't work yet |
+| [docs/ci-docker.md](docs/ci-docker.md) | Running lvpm headless in NI's Windows container |
+| [docs/linux.md](docs/linux.md) | LabVIEW for Linux: what differs, measured in NI's Linux container |
+| [docs/manifest.md](docs/manifest.md) | The `lvpm.toml` format, and how a `vipm.toml` is read ([compatibility with VIPM](docs/manifest.md#compatibility-with-vipmtoml)) |
+| [docs/limitations.md](docs/limitations.md) | Known limitations |
+| [docs/ogpm-model.md](docs/ogpm-model.md) | The OpenG package model lvpm implements, mapped term by term |
+| [docs/adr/](docs/adr/README.md) | Architecture decisions, and why |
+| [Architecture map](https://thatstheend.github.io/lvpm/map/) | Interactive map of the code, with guided flows from `lvpm init` to an installed package |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, PR rules, releases, code layout |
 
-## Why lvpm
+## Known limitations
 
-lvpm is open source so the LabVIEW community can develop and fix the tools
-it depends on. If a feature does not work the way it should, we can improve it together.
-
-It uses the package format the OpenG Package Tools first defined, which VIPM also builds on, so the `.vip` and `.ogp` packages and the
-package directories in use today work with lvpm unchanged.
-[docs/architecture.md](docs/architecture.md) has more.
-
-## Status
-
-Working and in active development. Windows is the tested platform; Linux is
-verified in NI's container image. See [known limitations](docs/limitations.md)
-and the [roadmap](docs/roadmap.md).
-
-lvpm is not affiliated with JKI or NI.
-
-## Contributing
-
-Toolchain setup, tests and conventions are in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[docs/limitations.md](docs/limitations.md) lists what does not work yet, and
+[docs/roadmap.md](docs/roadmap.md) what is planned.
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE),
-at your option.
+MIT OR Apache-2.0

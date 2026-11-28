@@ -33,7 +33,7 @@ An OGPT package is a plain zip archive containing a `spec` file — an
 INI-format manifest — an icon, and `File Group N/` payload directories
 (design docs "Archive Format" and "Package Spec File"). A `.vip` is the same
 archive with a renamed `[Package]` section and a four-part version. The parser
-in [src/spec.rs](src/spec.rs) was written from the spec-file design document
+in [crates/lvpm-core/src/spec.rs](crates/lvpm-core/src/spec.rs) was written from the spec-file design document
 and checked against `spec` files from publicly downloadable packages. No tool
 other than a zip reader and a text editor was needed.
 
@@ -44,7 +44,7 @@ OGPM's Package Directory is a plain-text INI file, one
 `Spec.URL` and `Icon.URL` keys (design doc "Package Directories and
 Repositories"; `openg.ogpd`, 2004, in the CVS snapshot). The public feeds
 still use it; `.vipr` adds `Package.MD5` and a few `Package.*` metadata keys.
-The parser in [src/index.rs](src/index.rs) was written from the format and
+The parser in [crates/lvpm-core/src/index.rs](crates/lvpm-core/src/index.rs) was written from the format and
 by reading those files. Note that the index endpoints themselves are operated
 by NI and JKI respectively; fetching them is subject to those operators'
 terms.
@@ -62,9 +62,23 @@ package installs and diffing the two states. lvpm's installer was then
 verified by comparing the filesystem state it produces against the state a
 reference VIPM install produces: identical files, identical places.
 
+## .vip writing
+
+lvpm does not write `.vip` for VIPM; S1 wrote a `.vip` for lvpm only, and S7a removed that writer ([ADR 6](docs/adr/0006-lvpkg-only-vip-read-only.md)).
+Whether VIPM installs the `.vip` that S1's `lvpm build` writes was tested only
+through documented `vipm` commands (`install -y`, `uninstall`, `info`,
+`--version`) and VIPM's own package builder, against VIPM 26.3.0. lvpm's builds,
+re-versioned published archives and one VIPM build were installed into our own
+licensed LabVIEW installation, and the installed files were compared. VIPM
+refuses lvpm's file because it checks a package `ID` whose computation is not
+published. No VIPM code, cache or configuration was read, decompiled or
+disassembled to find it, and none will be. The conclusions are in the
+[S1b spec](docs/specs/lvpm-vip-roundtrip-s1b.md#outcome); the per-variant
+table stays outside the repository, under `target/`.
+
 ## LabVIEW VI Server wire protocol
 
-The TCP protocol spoken by [src/viserver.rs](src/viserver.rs) belongs to NI's
+The TCP protocol spoken by [crates/lvpm-core/src/viserver.rs](crates/lvpm-core/src/viserver.rs) belongs to NI's
 LabVIEW. NI publishes the VI Server *API* but not its wire format.
 The format documented in [docs/vi-server-protocol.md](docs/vi-server-protocol.md)
 was reconstructed for interoperability from two independent sources, both on
@@ -72,6 +86,41 @@ our own licensed LabVIEW installations: LabVIEW's own built-in server logging
 facility (the `Server:Logging Enabled` application property), and loopback
 packet captures of traffic between processes we ran ourselves. No NI binary
 was decompiled or disassembled.
+
+## Linker format
+
+The VI file facts that [crates/lvpm-core/src/linker.rs](crates/lvpm-core/src/linker.rs) reads (RSRC block
+list, `vers` save version, the `LIvi`/`LIfp`/`LIbd` link tables and their
+`PTH0` records, the `LVSR` separate-compiled-code bit) were worked out by
+reading VI files we own or that are openly licensed: the fixtures in
+[tests/fixtures/check/](tests/fixtures/check/README.md), saved on 2026-11-02
+with our licensed LabVIEW 2026, and the VIs inside the committed pilot
+packages. The compiled-code bit (`LVSR` u32 at byte 8, `0x400`) was found by
+comparing `Good.vi` with `NotSeparated.vi`, saved the same way except for
+that setting, and checked against every pilot library file. No NI binary was
+decompiled or disassembled.
+
+Each of `LIvi`, `LIfp` and `LIbd` is `u16 version (1 or 2) | 4-char owner (LVIN
+or LVCC, FPHP, BDHP) | u32 entry count | entries | u16 3`. The entries are not
+one structure: each starts with a 4-character link type (`VIVI`, `VILB`,
+`VIPI`, `VICC`, `VIXN`, ...) and the bytes around its `PTH0` path record differ
+by type, across the fixtures and the 216 pilot VIs. `LIbd` repeats `LIvi`'s
+links, most followed by a zero-length `PTH0` (`PTH0 00000000`, not a link);
+`LIfp` is empty in the fixtures but not in the pilots; a library member lists
+its `Lib.lvlib` as a `VILB` link. So `lvpm` finds each `PTH0` by its magic,
+bounds-checks every length, and takes a record that does not parse, or a
+section that runs past the end of the file, as unreadable. A relative link is
+stored relative to the VI file itself, so its first component is empty (up,
+from the file to its folder): `Helper.vi` beside `Good.vi` is `<empty>/Helper.vi`.
+
+An `.llb` is an RSRC file of type `LVAR` whose `UCRF` sections each hold one
+member VI as an RSRC file of its own. Its member names are listed in `ADir`
+(a 24-byte entry before each pascal name), in `CPST` (`u32 count | pascal
+names`) and in `STR#` section 1 (`u16 count | pascal names`); `lvpm` reads
+`STR#` and requires it to be consumed exactly. `Archive.llb`, a single-member
+file, lists only `InLlb.vi` there and holds the name `Removed.vi` nowhere, so
+deleting a member in place rewrites the lists; a multi-member `.llb` is not yet
+checked against this.
 
 ## What is deliberately kept out of this repository
 

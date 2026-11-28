@@ -1,0 +1,3603 @@
+//! `lock`: resolve the manifest with the solver and write `lvpm.lock`.
+//!
+//! Locking reads the manifest and the catalog and nothing else: not what is
+//! installed, not where the project lives. The solver chooses the versions;
+//! this operation then gets every chosen archive through the cache, records
+//! its SHA-256, and writes the lock in one step, so a lock that is written is
+//! complete and a failed run leaves the old one untouched.
+
+use super::attest::attest_archives;
+use super::env::OpEnv;
+use super::github_index;
+use super::session::Downloads;
+use super::snapshot::restoring_on_failure;
+use super::sync::{Search, Unfetched};
+use crate::cache::{now, sha256_hex};
+use crate::errors::{
+    ArchiveFailure, ArchiveFault, Cancelled, IndexHashMismatch, ListingFailures, LockError,
+    MovedTag,
+};
+use crate::events::{Event, LockChange};
+use crate::index::{self, Entry, Index};
+use crate::lockfile::{self, Inputs, LockedPackage, LockedUnresolved, Lockfile};
+use crate::manifest_edit::{self, DependencyTable};
+use crate::oci::Reference;
+use crate::paths;
+use crate::project::{Constraint, Feed, PackageArg, Project, name_key, same_name};
+use crate::released;
+use crate::solve::{self, AllHeldBack, Conflict, Fact, Resolution, SolveError};
+use crate::verify::Attestation;
+use crate::version::Version;
+use anyhow::Context;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+/// Resolve the project's manifest and write `lvpm.lock` beside it. The lock
+/// comes back as it was written. A lock that still represents the manifest is
+/// left as it is: nothing is resolved, fetched or written.
+pub fn lock(env: &OpEnv) -> Result<Lockfile, LockError> {
+    let found = find_manifest(env)?;
+    let (manifest_path, project) = &found;
+    // An unusable `labview` is an error even when a lock exists.
+    lv_gate(project.labview.as_deref().ok_or(LockError::NoLabview)?)?;
+    let lock_path = manifest_path.with_file_name(lockfile::FILE_NAME);
+    // A lock that cannot be read is simply not a preference: it is rewritten.
+    let previous = Lockfile::read(&lock_path).ok();
+    if let Some(current) = previous
+        .as_ref()
+        .filter(|lock| lock.staleness(project).is_none())
+    {
+        env.sink.emit(Event::LockUpToDate { path: lock_path });
+        return Ok(current.clone());
+    }
+
+    let (lock, changes, after) = relock(env, &found, previous.as_ref())?;
+    PendingLock::new(lock_path, &lock, changes, after)?.write(env)?;
+    Ok(lock)
+}
+
+/// A lock that is made and serialised and not yet on disk, so that a caller
+/// with more to do first can write it at the moment it chooses.
+///
+/// It writes the lock alone: no manifest, and no rollback. An operation that
+/// also writes the manifest, as `commit` and [`upgrade`] do, keeps
+/// [`write_manifest_and_lock`] and puts both back when it fails.
+pub(super) struct PendingLock {
+    path: PathBuf,
+    lock: Lockfile,
+    /// The lock as it is written, made up front so that a lock that cannot be
+    /// serialised fails before anything else is asked or done.
+    text: String,
+    changes: Vec<LockChange>,
+    after: Vec<Event>,
+}
+
+impl PendingLock {
+    pub(super) fn new(
+        path: PathBuf,
+        lock: &Lockfile,
+        changes: Vec<LockChange>,
+        after: Vec<Event>,
+    ) -> anyhow::Result<PendingLock> {
+        Ok(PendingLock {
+            text: lock.to_toml()?,
+            lock: lock.clone(),
+            path,
+            changes,
+            after,
+        })
+    }
+
+    /// Write the lock, and say so. A cancel is refused from here: the first
+    /// file is written.
+    pub(super) fn write(self, env: &OpEnv) -> Result<(), LockError> {
+        env.cancel.begin_unpack()?;
+        write_atomically(&self.path, &self.text)?;
+        announce_written(env, self.path, &self.lock, self.changes, self.after);
+        Ok(())
+    }
+}
+
+/// A package an upgrade moves, and the version to move it to when the caller
+/// chose one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeTarget {
+    pub name: String,
+    /// The version as the caller wrote it.
+    pub version: Option<String>,
+}
+
+impl UpgradeTarget {
+    /// `name`, or `name@version`.
+    pub fn parse(text: &str) -> Result<UpgradeTarget, String> {
+        let PackageArg { name, constraint } =
+            PackageArg::parse(text).map_err(|why| why.to_string())?;
+        Ok(UpgradeTarget {
+            name,
+            version: constraint,
+        })
+    }
+}
+
+/// What an upgrade lets move off the versions the lock holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Upgrade {
+    /// Every package, to the newest version the constraints allow.
+    Everything,
+    /// Only these packages, and whatever they force along: each to its newest
+    /// version, or to the one the caller chose.
+    Packages(Vec<UpgradeTarget>),
+}
+
+/// Re-lock, letting the packages `which` names move; every other package
+/// stays where the lock has it unless the new set cannot hold it there. A lock
+/// with nothing newer to move to is left as it is.
+///
+/// A package moved to a version its manifest constraint excludes has that
+/// constraint rewritten, keeping its kind (`1.0` stays exact, `>=1.0` stays a
+/// floor, `*` is never rewritten); a package the manifest does not list is
+/// never added to it. Nothing is written until the whole new lock is made, and
+/// if writing the manifest and the lock fails, both are put back as they were.
+pub fn upgrade(env: &OpEnv, which: &Upgrade) -> Result<Lockfile, LockError> {
+    let found = find_manifest(env)?;
+    let (manifest_path, project) = &found;
+    let gate = lv_gate(project.labview.as_deref().ok_or(LockError::NoLabview)?)?;
+    let lock_path = manifest_path.with_file_name(lockfile::FILE_NAME);
+    let (previous, moving) = match which {
+        Upgrade::Everything => (Lockfile::read(&lock_path).ok(), Moving::Everything),
+        Upgrade::Packages(targets) => {
+            let held = read_lock(&lock_path)?;
+            check_locked(&held, targets)?;
+            (Some(held), Moving::Only(targets))
+        }
+    };
+    let index = load_index(env, Some(&found), previous.as_ref(), &moving)?;
+    let pins = Pins::of(&found, moving.targets(), &index, gate)?;
+    let project = pins
+        .rewrite
+        .as_ref()
+        .map_or(project, |rewrite| &rewrite.project);
+    let (lock, changes, after) = relock_in(
+        env,
+        project,
+        &index,
+        previous.as_ref(),
+        &moving,
+        &pins.constraints,
+    )?;
+
+    if pins.rewrite.is_none() && previous.as_ref() == Some(&lock) {
+        env.sink.emit(match pins.constraints.is_empty() {
+            true => Event::LockNothingNewer { path: lock_path },
+            false => Event::LockUpToDate { path: lock_path },
+        });
+        return Ok(lock);
+    }
+    let text = lock.to_toml()?;
+    let manifest = pins
+        .rewrite
+        .as_ref()
+        .map(|rewrite| (manifest_path.as_path(), rewrite.text.as_str()));
+    // From here a cancel is refused: the first file is written.
+    env.cancel.begin_unpack()?;
+    restoring_on_failure(&[manifest_path, &lock_path], || {
+        write_manifest_and_lock(manifest, &lock_path, &text)
+    })?;
+    for update in pins.rewrite.iter().flat_map(|rewrite| &rewrite.updates) {
+        env.sink.emit(Event::ManifestUpdated {
+            name: update.name.clone(),
+            from: update.from.clone(),
+            to: update.to.clone(),
+        });
+    }
+    announce_written(env, lock_path, &lock, changes, after);
+    Ok(lock)
+}
+
+/// What changed in the lock just written, and that it is on disk; then the
+/// events that are said only once it is, `after`.
+pub(super) fn announce_written(
+    env: &OpEnv,
+    lock_path: PathBuf,
+    lock: &Lockfile,
+    changes: Vec<LockChange>,
+    after: Vec<Event>,
+) {
+    if !changes.is_empty() {
+        env.sink.emit(Event::LockChanged { changes });
+    }
+    env.sink.emit(Event::LockWritten {
+        path: lock_path,
+        packages: lock.packages.len(),
+    });
+    for event in after {
+        env.sink.emit(event);
+    }
+}
+
+/// Which locked versions a new resolution may leave.
+pub(super) enum Moving<'a> {
+    /// None: every one that still fits is kept.
+    Nothing,
+    /// Only the packages these name (in any case).
+    Only(&'a [UpgradeTarget]),
+    /// All of them.
+    Everything,
+}
+
+impl Moving<'_> {
+    pub(super) fn moves(&self, name: &str) -> bool {
+        match self {
+            Moving::Nothing => false,
+            Moving::Only(targets) => targets.iter().any(|target| same_name(&target.name, name)),
+            Moving::Everything => true,
+        }
+    }
+
+    fn targets(&self) -> &[UpgradeTarget] {
+        match self {
+            Moving::Only(targets) => targets,
+            Moving::Nothing | Moving::Everything => &[],
+        }
+    }
+}
+
+/// The versions the solver prefers: the ones `previous` holds, except those
+/// of the packages `moving` lets move.
+fn preferences(previous: Option<&Lockfile>, moving: &Moving) -> Vec<(String, Version)> {
+    previous
+        .iter()
+        .flat_map(|lock| &lock.packages)
+        .filter(|package| !moving.moves(&package.name))
+        .map(|package| (package.name.clone(), Version::parse(&package.version)))
+        .collect()
+}
+
+/// Every target is a package `held` locks, or the first one that is not is the
+/// error.
+fn check_locked(held: &Lockfile, targets: &[UpgradeTarget]) -> Result<(), LockError> {
+    match targets.iter().find(|target| {
+        !held
+            .packages
+            .iter()
+            .any(|package| same_name(&package.name, &target.name))
+    }) {
+        Some(target) => Err(LockError::NotLocked {
+            name: target.name.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// What the versions an upgrade chose ask of the solver and of the manifest.
+struct Pins {
+    /// Each chosen version as an exact constraint on top of the manifest's.
+    constraints: Vec<(String, Constraint)>,
+    /// The manifest once it admits them; `None` when it already does.
+    rewrite: Option<Rewrite>,
+}
+
+/// The manifest after an upgrade: its new text, what that reads as, and the
+/// entries that changed.
+struct Rewrite {
+    text: String,
+    project: Project,
+    updates: Vec<ManifestUpdate>,
+}
+
+/// One manifest entry whose constraint an upgrade rewrites.
+struct ManifestUpdate {
+    table: DependencyTable,
+    /// The entry's name as the manifest spells it.
+    name: String,
+    /// The constraint before and after, as the manifest writes it.
+    from: String,
+    to: String,
+}
+
+impl Pins {
+    /// The versions `targets` choose, each checked against `index` and the
+    /// LabVIEW `gate`, and the manifest at `found` changed to admit them.
+    fn of(
+        found: &(PathBuf, Project),
+        targets: &[UpgradeTarget],
+        index: &Index,
+        gate: f64,
+    ) -> Result<Pins, LockError> {
+        let mut constraints = Vec::new();
+        let mut updates = Vec::new();
+        for target in targets {
+            let Some(raw) = &target.version else {
+                continue;
+            };
+            let version = Version::parse(raw);
+            let entry = index
+                .versions_of(&target.name)
+                .into_iter()
+                .find(|entry| entry.version == version)
+                .ok_or_else(|| LockError::NoSuchVersion {
+                    name: target.name.clone(),
+                    version: raw.clone(),
+                })?;
+            if let Some(gated) = solve::gated(entry, gate) {
+                return Err(LockError::NeedsNewerLabview {
+                    name: entry.name.clone(),
+                    version: raw.clone(),
+                    needs_year: gated.needs_year,
+                    project_year: gated.project_year,
+                });
+            }
+            updates.extend(constraint_updates(&found.1, &target.name, raw, &version));
+            constraints.push((target.name.clone(), Constraint::Exact(version)));
+        }
+        for update in &updates {
+            crate::project::refuse_old_form_edit(&found.1, &update.table, &update.name)?;
+        }
+        let rewrite = match updates.is_empty() {
+            true => None,
+            false => Some(Rewrite::of(&found.0, updates)?),
+        };
+        Ok(Pins {
+            constraints,
+            rewrite,
+        })
+    }
+}
+
+impl Rewrite {
+    /// The manifest at `path` with every update applied and nothing else
+    /// changed, not yet written.
+    fn of(path: &Path, updates: Vec<ManifestUpdate>) -> anyhow::Result<Rewrite> {
+        let mut text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading manifest {}", path.display()))?;
+        for update in &updates {
+            text = manifest_edit::set(&text, &update.table, &update.name, &update.to)?;
+        }
+        let project = crate::project::parse(&text)
+            .with_context(|| format!("parsing the new manifest for {}", path.display()))?;
+        Ok(Rewrite {
+            text,
+            project,
+            updates,
+        })
+    }
+}
+
+/// The entries of `project` named `name` whose constraint excludes `version`
+/// (written `raw`), each with the constraint that admits it and is of the same
+/// kind: an exact one becomes `raw`, a floor becomes `>=raw`. `*` admits every
+/// version and is never rewritten.
+fn constraint_updates(
+    project: &Project,
+    name: &str,
+    raw: &str,
+    version: &Version,
+) -> Vec<ManifestUpdate> {
+    project
+        .tables()
+        .flat_map(|(table, entries)| {
+            entries
+                .iter()
+                .filter(|(entry, _)| same_name(entry, name))
+                .filter_map(move |(entry, constraint)| {
+                    let to = match constraint {
+                        Constraint::Exact(pinned) if pinned != version => raw.to_string(),
+                        Constraint::AtLeast(floor) if version < floor => format!(">={raw}"),
+                        _ => return None,
+                    };
+                    Some(ManifestUpdate {
+                        table: table.clone(),
+                        name: entry.clone(),
+                        from: lockfile::constraint_text(constraint),
+                        to,
+                    })
+                })
+        })
+        .collect()
+}
+
+/// A lock made, how it differs from the one it replaces, and the events to say
+/// only once it is written.
+pub(super) type Relocked = (Lockfile, Vec<LockChange>, Vec<Event>);
+
+/// The lock the manifest resolves to now, and how it differs from `previous`,
+/// with nothing written. Resolving keeps the versions `previous` chose where
+/// they still fit; every chosen archive is fetched and hashed, and each GitHub
+/// one is checked against the `[policy]`.
+pub(super) fn relock(
+    env: &OpEnv,
+    found: &(PathBuf, Project),
+    previous: Option<&Lockfile>,
+) -> Result<Relocked, LockError> {
+    let index = load_index(env, Some(found), previous, &Moving::Nothing)?;
+    relock_with(env, &found.1, &index, previous)
+}
+
+/// [`relock`] for `project` against an index already loaded.
+pub(super) fn relock_with(
+    env: &OpEnv,
+    project: &Project,
+    index: &Index,
+    previous: Option<&Lockfile>,
+) -> Result<Relocked, LockError> {
+    relock_in(env, project, index, previous, &Moving::Nothing, &[])
+}
+
+/// The version the solver chooses for `name` in `project`, keeping the
+/// versions `previous` holds where they still fit; `None` when `project` has
+/// no use for it.
+pub(super) fn resolved_version(
+    env: &OpEnv,
+    project: &Project,
+    index: &Index,
+    previous: Option<&Lockfile>,
+    name: &str,
+) -> Result<Option<Version>, LockError> {
+    let gate = lv_gate(project.labview.as_deref().ok_or(LockError::NoLabview)?)?;
+    let preferences = preferences(previous, &Moving::Nothing);
+    let resolution = resolve(
+        env,
+        project,
+        index,
+        &preferences,
+        &[],
+        &Moving::Nothing,
+        gate,
+    )?;
+    Ok(resolution
+        .packages
+        .get(&name_key(name))
+        .map(|entry| entry.version.clone()))
+}
+
+/// [`relock`] for `project` against `index`, with `moving` letting some
+/// locked versions move, and `pins` naming versions the solver must choose on
+/// top of the manifest's own constraints.
+fn relock_in(
+    env: &OpEnv,
+    project: &Project,
+    index: &Index,
+    previous: Option<&Lockfile>,
+    moving: &Moving,
+    pins: &[(String, Constraint)],
+) -> Result<Relocked, LockError> {
+    let labview = project.labview.as_deref().ok_or(LockError::NoLabview)?;
+    let gate = lv_gate(labview)?;
+    let preferences = preferences(previous, moving);
+    let resolution = resolve(env, project, index, &preferences, pins, moving, gate)?;
+    let (remotes, _) = index::split_sources(project.resolved_sources()?, &project.source_pins);
+    let feeds = index::feeds(&index::folders(&remotes), project.default_sources);
+    let pins = source_pins(project)?;
+    let hashes = hash_archives(env, index, &resolution, previous, moving, &pins, &feeds)?;
+    let attested = attest_archives(env, &resolution, &hashes, previous, &project.policy)?;
+    let lock = build(
+        project,
+        labview,
+        &resolution,
+        &hashes,
+        &attested.signers,
+        &feeds,
+    );
+
+    for unresolved in &resolution.unresolved {
+        env.sink.emit(Event::RequirementUnresolved {
+            name: unresolved.name.clone(),
+            required_by: unresolved.required_by.clone(),
+        });
+    }
+    for held in &resolution.held_back {
+        env.sink.emit(Event::HeldBack {
+            name: held.name.clone(),
+            version: held.version.clone(),
+            chosen: held.chosen.clone(),
+            released: held.released,
+            eligible: released::eligible_at(held.released, project.min_age_days),
+            min_age_days: project.min_age_days,
+        });
+    }
+    let changes = changes(previous, &lock);
+    Ok((lock, changes, attested.not_checked))
+}
+
+/// Whether `lvpm.lock` exists and still represents the manifest; the error
+/// says which it is not, and why. It reads the manifest and the lock and
+/// nothing else: no source, no cache, no network, and it writes nothing.
+pub fn check(env: &OpEnv) -> Result<(), LockError> {
+    let (manifest_path, project) = find_manifest(env)?;
+    let lock = read_lock(&manifest_path.with_file_name(lockfile::FILE_NAME))?;
+    match lock.staleness(&project) {
+        Some(reason) => Err(LockError::Stale(reason)),
+        None => Ok(()),
+    }
+}
+
+/// [`OpEnv::load_index`], with a load that was cancelled, or whose pinned OCI
+/// packages could not be listed, told apart from one that failed.
+///
+/// Each GitHub dependency of `manifest`'s project is then taken from its repo
+/// instead of the feeds (see [`github_index`]): `previous` is the lock the run
+/// starts from and `moving` says which of its versions may move. The caller
+/// passes the project as the run means it, an edit's included, in `manifest`.
+pub(super) fn load_index(
+    env: &OpEnv,
+    manifest: Option<&(PathBuf, Project)>,
+    previous: Option<&Lockfile>,
+    moving: &Moving,
+) -> Result<Index, LockError> {
+    let mut wanted = super::env::wanted_names(manifest.map(|(_, project)| project), &[]);
+    // The GitHub dependencies are read first, so that what their files require
+    // is asked of the community indexes with the rest.
+    let github = match manifest {
+        // No GitHub dependency: no cache is opened for one.
+        Some((_, project)) if !project.github.is_empty() => {
+            let downloads = Downloads::open(env)?;
+            let only = Index {
+                entries: Vec::new(),
+            };
+            let read = github_index::with_github(env, &downloads, project, previous, moving, only)?;
+            let required = read.entries.iter().flat_map(|entry| &entry.requires);
+            wanted.extend(required.map(|requirement| requirement.name.clone()));
+            Some((project, read))
+        }
+        _ => None,
+    };
+    let mut index = env
+        .load_index(manifest, &wanted)
+        .map_err(|why| -> LockError {
+            if why.is::<Cancelled>() {
+                return Cancelled.into();
+            }
+            match why.downcast::<ListingFailures>() {
+                Ok(failures) => LockError::OciListing(failures.into_failures()),
+                Err(why) => why.into(),
+            }
+        })?;
+    if let Some((project, read)) = github {
+        // A GitHub dependency comes from its repo and from nowhere else.
+        let own = |entry: &Entry| (project.github.keys()).any(|name| same_name(&entry.name, name));
+        index.entries.retain(|entry| !own(entry));
+        index.entries.extend(read.entries);
+    }
+    Ok(index)
+}
+
+/// The manifest of the project the command runs in.
+pub(super) fn find_manifest(env: &OpEnv) -> Result<(PathBuf, Project), LockError> {
+    env.manifest_for(None, None)?
+        .ok_or_else(|| LockError::NoManifest {
+            searched_from: env.cwd.clone(),
+        })
+}
+
+/// The lock at `path`, told apart as missing or unreadable.
+pub(super) fn read_lock(path: &Path) -> Result<Lockfile, LockError> {
+    Lockfile::read(path).map_err(|why| {
+        let missing = why
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+        match missing {
+            true => LockError::NoLock {
+                path: path.to_path_buf(),
+            },
+            false => LockError::UnreadableLock {
+                path: path.to_path_buf(),
+                reason: format!("{why:#}"),
+            },
+        }
+    })
+}
+
+/// The project's LabVIEW in the units of an index's `lv_min`: 24.0 for 2024.
+pub(super) fn lv_gate(labview: &str) -> Result<f64, LockError> {
+    Ok(f64::from(crate::project::labview_year(labview)? - 2000))
+}
+
+/// The solver's answer for every dependency table of the manifest and the
+/// versions in `pins`, keeping the versions in `preferences` where they still
+/// fit. The packages `moving` names are settled first: what they need moves a
+/// package that is held at its locked version, and not the other way round.
+fn resolve(
+    env: &OpEnv,
+    project: &Project,
+    index: &Index,
+    preferences: &[(String, Version)],
+    pins: &[(String, Constraint)],
+    moving: &Moving,
+    gate: f64,
+) -> Result<Resolution, LockError> {
+    let source_pins = source_pins(project)?;
+    check_listed(&source_pins, index)?;
+    let constraints: Vec<_> = project
+        .tables()
+        .flat_map(|(_, entries)| entries)
+        .chain(pins)
+        .cloned()
+        .collect();
+    let first: Vec<String> = moving
+        .targets()
+        .iter()
+        .map(|target| target.name.clone())
+        .collect();
+    let age = (project.min_age_days > 0).then(|| solve::AgeLimit {
+        now: now(),
+        days: project.min_age_days,
+    });
+    solve::solve(
+        &constraints,
+        index,
+        preferences,
+        &first,
+        Some(gate),
+        age,
+        &env.cancel,
+    )
+    .map_err(|why| match why {
+        SolveError::Conflict(conflict) => {
+            let conflict = name_pins(conflict, project, pins);
+            let conflict = name_source_pins(conflict, &source_pins);
+            LockError::Conflict(note_index_sources(
+                note_oci_sources(conflict, project),
+                project,
+            ))
+        }
+        SolveError::Cancelled => Cancelled.into(),
+    })
+}
+
+/// A dependency line that takes its package from one `[sources]` entry only.
+#[derive(PartialEq)]
+struct SourcePin<'a> {
+    /// The package, as the manifest writes it.
+    package: &'a str,
+    /// The `[sources]` name it is pinned to.
+    source: &'a str,
+    /// That source's feed URL, which is what its entries' `source` holds.
+    feed: String,
+}
+
+/// The source pins of `project`. A pin naming no `[sources]` entry is an
+/// error, not a pin left out: the manifest reader already refuses one, and
+/// ignoring it would let the package come from any source.
+fn source_pins(project: &Project) -> Result<Vec<SourcePin<'_>>, LockError> {
+    let feeds = project.resolved_sources()?;
+    (project.source_pins.iter())
+        .map(|(package, source)| {
+            let (_, feed) = (feeds.iter())
+                .find(|(name, _)| name == source)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{package}: index = {source:?} is not a [sources] name")
+                })?;
+            Ok(SourcePin {
+                package,
+                source,
+                feed: feed.owner(),
+            })
+        })
+        .collect()
+}
+
+/// A pinned package no entry of `index` is left for is one its source does not
+/// list: the load dropped the other sources' entries (see `first_source_wins`).
+fn check_listed(pins: &[SourcePin], index: &Index) -> Result<(), LockError> {
+    let Some(pin) = pins
+        .iter()
+        .find(|pin| index.versions_of(pin.package).is_empty())
+    else {
+        return Ok(());
+    };
+    Err(LockError::PinnedNotListed {
+        package: pin.package.to_string(),
+        source_name: pin.source.to_string(),
+        feed: pin.feed.clone(),
+    })
+}
+
+/// `conflict` with the pinned source of a pinned package named on the fact
+/// that says no version of it fits. A fact that does not say which source its
+/// versions are from (a held-back version, a LabVIEW gate) gets a
+/// `SourcePinned` fact, once per pin.
+fn name_source_pins(mut conflict: Conflict, pins: &[SourcePin]) -> Conflict {
+    let pin_of = |package: &str| pins.iter().find(|pin| same_name(pin.package, package));
+    let mut noted: Vec<&SourcePin> = Vec::new();
+    for fact in &mut conflict.facts {
+        match fact {
+            Fact::NoVersion {
+                package, pinned, ..
+            } => {
+                if let Some(pin) = pin_of(package) {
+                    *pinned = Some(pin.source.to_string());
+                }
+            }
+            Fact::NeedsLabview { package, .. }
+            | Fact::AllHeldBack(AllHeldBack { package, .. })
+            | Fact::VersionHeldBack { package, .. } => {
+                if let Some(pin) = pin_of(package)
+                    && !noted.contains(&pin)
+                {
+                    noted.push(pin);
+                }
+            }
+            _ => {}
+        }
+    }
+    conflict
+        .facts
+        .extend(noted.into_iter().map(|pin| Fact::SourcePinned {
+            package: pin.package.to_string(),
+            source: pin.source.to_string(),
+            feed: pin.feed.clone(),
+        }));
+    conflict
+}
+
+/// `conflict` with a note for each OCI source when a package is in no source:
+/// an OCI source lists only what the manifest pins to it, so it may be the one
+/// that has the package.
+fn note_oci_sources(mut conflict: Conflict, project: &Project) -> Conflict {
+    let unlisted = (conflict.facts.iter()).any(|fact| matches!(fact, Fact::NotListed { .. }));
+    if !unlisted {
+        return conflict;
+    }
+    let feeds = project.resolved_sources().unwrap_or_default();
+    let oci = feeds
+        .iter()
+        .filter(|(_, feed)| matches!(feed, Feed::Oci(_)));
+    conflict
+        .facts
+        .extend(oci.map(|(name, _)| Fact::OciExplicit {
+            source: name.clone(),
+        }));
+    conflict
+}
+
+/// `conflict` with a note for each community index when a package is in no
+/// source: it was asked for the package, and does not list it.
+fn note_index_sources(mut conflict: Conflict, project: &Project) -> Conflict {
+    let unlisted = (conflict.facts.iter()).any(|fact| matches!(fact, Fact::NotListed { .. }));
+    if !unlisted {
+        return conflict;
+    }
+    let feeds = project.resolved_sources().unwrap_or_default();
+    let indexes = feeds.iter().filter_map(|(_, feed)| match feed {
+        Feed::Index { owner, repo } => Some(Fact::IndexSearched {
+            repo: format!("{owner}/{repo}"),
+        }),
+        _ => None,
+    });
+    conflict.facts.extend(indexes);
+    conflict
+}
+
+/// `conflict` with each fact that only a pin asked for named as one. The
+/// solver reads a pin as one more manifest line; a fact stays a manifest fact
+/// when `project` has a line that says the same.
+fn name_pins(mut conflict: Conflict, project: &Project, pins: &[(String, Constraint)]) -> Conflict {
+    for fact in &mut conflict.facts {
+        let Fact::Manifest { package, wanted } = fact else {
+            continue;
+        };
+        let is_pin = |(name, constraint): &(String, Constraint)| {
+            same_name(name, package) && wanted_by(constraint) == *wanted
+        };
+        let says_so = (project.tables().flat_map(|(_, entries)| entries))
+            .any(|(name, constraint)| same_name(name, package) && wanted_by(constraint) == *wanted);
+        if let Some((name, Constraint::Exact(version))) = pins.iter().find(|pin| is_pin(pin))
+            && !says_so
+        {
+            *fact = Fact::Pinned {
+                package: name.clone(),
+                version: version.raw.clone(),
+            };
+        }
+    }
+    conflict
+}
+
+/// The version set a manifest constraint is, as a conflict fact spells it.
+fn wanted_by(constraint: &Constraint) -> String {
+    match constraint {
+        Constraint::Exact(version) => format!("= {version}"),
+        Constraint::AtLeast(version) => format!(">= {version}"),
+        Constraint::Any => "*".to_string(),
+    }
+}
+
+/// The SHA-256 of every chosen archive, by lowercased name. Each archive
+/// comes through the cache, so a cached one needs no network. Every archive
+/// that cannot be had is collected, and they are reported together.
+/// shortcut: when a locked archive is also wrong, only those are reported and
+/// the fetch failures wait for the next run; give the error both lists if that bites.
+///
+/// A version `previous` already locks keeps the SHA-256 it was locked with, and
+/// only bytes that hash to it count: other bytes under that version are an
+/// error, never a new pin. A source-pinned package keeps it only if `previous`
+/// recorded the source this run records for the pinned feed's entry: the
+/// same version listed by another source may be other bytes, which are then
+/// fetched fresh. The source is compared as [`build`] writes it, so
+/// nested `[sources]` folders compare the same way on both sides.
+///
+/// An OCI version `previous` locks that its source now lists at another
+/// manifest digest is an error too, unless `moving` lets that package move: only
+/// an upgrade accepts the new digest.
+fn hash_archives(
+    env: &OpEnv,
+    index: &Index,
+    resolution: &Resolution,
+    previous: Option<&Lockfile>,
+    moving: &Moving,
+    pins: &[SourcePin],
+    feeds: &[(String, String)],
+) -> Result<HashMap<String, String>, LockError> {
+    let total = resolution.packages.len();
+    // Nothing to fetch opens nothing: a manifest with no dependencies needs
+    // no cache.
+    let Some(downloads) = (total > 0).then(|| Downloads::open(env)).transpose()? else {
+        return Ok(HashMap::new());
+    };
+    let mut hashes = HashMap::new();
+    let mut failures = Vec::new();
+    let mut not_as_locked = Vec::new();
+    let mut moved = Vec::new();
+    let mut differing = Vec::new();
+    let pin_of = |entry: &Entry| pins.iter().find(|pin| same_name(pin.package, &entry.name));
+    for (position, (key, entry)) in resolution.packages.iter().enumerate() {
+        if env.cancel.is_cancelled() {
+            return Err(Cancelled.into());
+        }
+        env.sink.emit(Event::LockHashing {
+            name: entry.name.clone(),
+            version: entry.version.to_string(),
+            position: position + 1,
+            total,
+        });
+        let from_pinned_feed = |locked: &LockedPackage| {
+            !pins.iter().any(|pin| same_name(pin.package, &locked.name))
+                || locked.source == entry_source(entry, feeds)
+        };
+        if !moving.moves(&entry.name)
+            && let Some(tag) = moved_tag(previous, key, entry)
+        {
+            moved.push(tag);
+            continue;
+        }
+        if let Some(locked) = kept_of(previous, key, entry).filter(|l| from_pinned_feed(l)) {
+            let mut search = Search::in_cache(&downloads, locked);
+            if !search.found {
+                // An OCI package is fetched by the digest the lock records.
+                match (locked.digest.is_some(), pin_of(entry)) {
+                    (true, Some(pin)) => search.fetch_oci(&downloads, pin.source)?,
+                    _ => search.look_in(&downloads, index)?,
+                }
+            }
+            match (search.problem(), search.unfetched) {
+                (None, _) => {
+                    hashes.insert(key.clone(), locked.sha256.clone());
+                }
+                // Not found because it could not be fetched: that is what to say.
+                (Some(problem), Some(why)) if problem.fault == ArchiveFault::NotFound => failures
+                    .push(ArchiveFailure {
+                        name: entry.name.clone(),
+                        version: entry.version.to_string(),
+                        reason: why.reason,
+                        in_full: why.in_full,
+                    }),
+                (Some(problem), _) => not_as_locked.push(problem),
+            }
+            continue;
+        }
+        match downloads.fetch(entry) {
+            Ok(bytes) => {
+                hashes.insert(key.clone(), sha256_hex(&bytes));
+            }
+            Err(why) if why.is::<Cancelled>() => return Err(Cancelled.into()),
+            Err(why) if why.is::<IndexHashMismatch>() => differing.push(
+                why.downcast::<IndexHashMismatch>()
+                    .expect("checked by is above"),
+            ),
+            Err(why) => {
+                let oci_manifest = index::oci_reference(entry);
+                let digest = oci_manifest.as_ref().and_then(Reference::digest);
+                let unfetched = match (digest, pin_of(entry)) {
+                    (Some(digest), Some(pin)) => Unfetched::of_oci(
+                        &why,
+                        (&entry.name, &entry.version.to_string()),
+                        pin.source,
+                        digest,
+                    ),
+                    _ => Unfetched::of_download(&why),
+                };
+                failures.push(ArchiveFailure {
+                    name: entry.name.clone(),
+                    version: entry.version.to_string(),
+                    reason: unfetched.reason,
+                    in_full: unfetched.in_full,
+                })
+            }
+        }
+    }
+    if !moved.is_empty() {
+        return Err(LockError::TagMoved(moved));
+    }
+    if !not_as_locked.is_empty() {
+        return Err(LockError::LockedArchives(not_as_locked));
+    }
+    if !differing.is_empty() {
+        return Err(LockError::IndexFilesDiffer(differing));
+    }
+    match failures.is_empty() {
+        true => Ok(hashes),
+        false => Err(LockError::ArchivesUnavailable(failures)),
+    }
+}
+
+/// The OCI version `previous` locks from `entry`'s source at a manifest digest
+/// other than `entry`'s: its tag moved. A version locked from another source
+/// is not this: that is a package changing source.
+fn moved_tag(previous: Option<&Lockfile>, key: &str, entry: &Entry) -> Option<MovedTag> {
+    let oci_manifest = index::oci_reference(entry)?;
+    let found = oci_manifest.digest()?;
+    let locked = previous?.packages.iter().find(|package| {
+        name_key(&package.name) == key
+            && Version::parse(&package.version) == entry.version
+            && package.source == entry.source
+    })?;
+    let was = locked.digest.as_deref().filter(|digest| *digest != found)?;
+    Some(MovedTag {
+        name: entry.name.clone(),
+        version: entry.version.to_string(),
+        locked: was.to_string(),
+        found: found.to_string(),
+    })
+}
+
+/// The `source` the lock records for a package from `entry`'s feed: an OCI
+/// source's own URL, which no feed folder contains, a community index's
+/// `github-index:owner/repo`, or the feed's index URL.
+fn entry_source(entry: &Entry, feeds: &[(String, String)]) -> String {
+    match index::oci_reference(entry).is_some() || index::index_repo(&entry.source).is_some() {
+        true => entry.source.clone(),
+        false => index::source_of(&entry.url, feeds),
+    }
+}
+
+/// The package `previous` locks that `entry` (named `key`) stands for: the same
+/// version, for a GitHub entry the same repo, and the same OCI manifest digest
+/// or none on both sides: a tag that moved is other bytes under the same
+/// version, and a package whose pin was removed is not the OCI row it was. A
+/// package kept keeps the SHA-256, and the signer, it was locked with.
+pub(super) fn kept_of<'a>(
+    previous: Option<&'a Lockfile>,
+    key: &str,
+    entry: &Entry,
+) -> Option<&'a LockedPackage> {
+    previous?.packages.iter().find(|package| {
+        name_key(&package.name) == key
+            && Version::parse(&package.version) == entry.version
+            && from_same_repo(package, entry)
+            && index::oci_reference(entry)
+                .as_ref()
+                .and_then(Reference::digest)
+                == package.digest.as_deref()
+    })
+}
+
+/// The `source` the lock records for a package that comes from `repo`.
+pub(super) fn github_lock_source(repo: &str) -> String {
+    format!("https://github.com/{repo}")
+}
+
+/// Whether `package`, as the previous lock holds it, is where `entry` comes
+/// from. A GitHub entry and a community index entry are told apart: the lock's
+/// `source` for any other is the feed's, which is known only after the run. The
+/// index's pin was never checked against bytes locked from another source, so
+/// those are not kept for its entry.
+/// shortcut: a package that moves from a repo to a feed keeps its pin; check
+/// the feed's source here when that bites.
+fn from_same_repo(package: &LockedPackage, entry: &Entry) -> bool {
+    if index::index_repo(&entry.source).is_some() {
+        return package.source.eq_ignore_ascii_case(&entry.source);
+    }
+    index::github_repo(entry).is_none_or(|repo| {
+        package
+            .source
+            .eq_ignore_ascii_case(&github_lock_source(repo))
+    })
+}
+
+/// The lock a resolution makes, given the hash of each archive in it and who
+/// built the ones that have an attestation.
+fn build(
+    project: &Project,
+    labview: &str,
+    resolution: &Resolution,
+    hashes: &HashMap<String, String>,
+    signers: &HashMap<String, Attestation>,
+    feeds: &[(String, String)],
+) -> Lockfile {
+    let reached: Vec<(Option<String>, HashSet<String>)> = project
+        .tables()
+        .map(|(table, entries)| {
+            let group = table.group().map(str::to_string);
+            (group, reachable_from(entries, resolution))
+        })
+        .collect();
+    let packages = resolution
+        .packages
+        .iter()
+        .map(|(key, entry)| LockedPackage {
+            name: entry.name.clone(),
+            version: entry.version.to_string(),
+            sha256: hashes[key].clone(),
+            md5: entry.md5.clone(),
+            digest: (index::oci_reference(entry).as_ref())
+                .and_then(Reference::digest)
+                .map(str::to_string),
+            source: match index::github_repo(entry) {
+                Some(repo) => github_lock_source(repo),
+                None => entry_source(entry, feeds),
+            },
+            requires: locked_requirements(entry, resolution),
+            groups: groups_needing(key, &reached),
+            signer: signers.get(key).map(|built| built.signer.clone()),
+            subject: signers.get(key).map(|built| built.subject.clone()),
+        })
+        .collect();
+    let unresolved = resolution
+        .unresolved
+        .iter()
+        .map(|unresolved| LockedUnresolved {
+            name: unresolved.name.clone(),
+            required_by: unresolved.required_by.clone(),
+        })
+        .collect();
+    Lockfile {
+        version: lockfile::FORMAT_VERSION,
+        labview: labview.trim().to_string(),
+        inputs: Inputs::of(project),
+        packages,
+        unresolved,
+    }
+}
+
+/// The locked packages `entry` requires, by their locked names. A requirement
+/// no source lists is not here: the lock records it as unresolved.
+fn locked_requirements(entry: &Entry, resolution: &Resolution) -> Vec<String> {
+    entry
+        .requires
+        .iter()
+        .filter_map(|requirement| resolution.packages.get(&name_key(&requirement.name)))
+        .map(|required| required.name.clone())
+        .collect()
+}
+
+/// The tables other than `[dependencies]` that need the package `key`, sorted,
+/// given what each table reaches (`None` is `[dependencies]`); none at all
+/// when `[dependencies]` needs it, since every selection installs it then.
+fn groups_needing(key: &str, reached: &[(Option<String>, HashSet<String>)]) -> Vec<String> {
+    if reached
+        .iter()
+        .any(|(group, keys)| group.is_none() && keys.contains(key))
+    {
+        return Vec::new();
+    }
+    let mut groups: Vec<String> = reached
+        .iter()
+        .filter(|(_, keys)| keys.contains(key))
+        .filter_map(|(group, _)| group.clone())
+        .collect();
+    groups.sort();
+    groups.dedup();
+    groups
+}
+
+/// Every package, by lowercased name, that one table's `entries` need directly
+/// or through other packages.
+fn reachable_from(entries: &[(String, Constraint)], resolution: &Resolution) -> HashSet<String> {
+    let mut reached = HashSet::new();
+    let mut pending: Vec<String> = entries.iter().map(|(name, _)| name_key(name)).collect();
+    while let Some(key) = pending.pop() {
+        let Some(entry) = resolution.packages.get(&key) else {
+            continue;
+        };
+        if reached.insert(key) {
+            pending.extend(
+                entry
+                    .requires
+                    .iter()
+                    .map(|requirement| name_key(&requirement.name)),
+            );
+        }
+    }
+    reached
+}
+
+/// How `new` differs from `old`, by package name; every package is added when
+/// there is no `old`.
+fn changes(old: Option<&Lockfile>, new: &Lockfile) -> Vec<LockChange> {
+    let versions = |lock: Option<&Lockfile>| -> BTreeMap<String, (String, String)> {
+        lock.iter()
+            .flat_map(|lock| &lock.packages)
+            .map(|package| {
+                (
+                    name_key(&package.name),
+                    (package.name.clone(), package.version.clone()),
+                )
+            })
+            .collect()
+    };
+    let (old, new) = (versions(old), versions(Some(new)));
+    let keys: std::collections::BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+    keys.into_iter()
+        .filter_map(|key| match (old.get(key), new.get(key)) {
+            (None, Some((name, version))) => Some(LockChange::Added {
+                name: name.clone(),
+                version: version.clone(),
+            }),
+            (Some((name, version)), None) => Some(LockChange::Removed {
+                name: name.clone(),
+                version: version.clone(),
+            }),
+            (Some((_, from)), Some((name, to))) if from != to => Some(LockChange::Changed {
+                name: name.clone(),
+                from: from.clone(),
+                to: to.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Write the manifest `text`, when there is one to write, and then the lock.
+/// The caller puts both back when anything after this fails
+/// ([`restoring_on_failure`]), so that the two never disagree on disk.
+pub(super) fn write_manifest_and_lock(
+    manifest: Option<(&Path, &str)>,
+    lock_path: &Path,
+    lock_text: &str,
+) -> anyhow::Result<()> {
+    if let Some((path, text)) = manifest {
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    }
+    write_atomically(lock_path, lock_text)
+}
+
+/// The new text goes beside the old file first and replaces it in one step:
+/// whoever reads the lock sees the old one or the new one, never half of it.
+/// Each write stages to a file of its own, so two processes in one project
+/// never rename each other's half-written file into place; whatever fails,
+/// the staged file does not stay.
+fn write_atomically(path: &Path, text: &str) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if tests::write_is_made_to_fail(path) {
+        anyhow::bail!("writing {} failed, as a test asked", path.display());
+    }
+    let staged = paths::staging_path(path);
+    let replaced = std::fs::write(&staged, text)
+        .with_context(|| format!("writing {}", staged.display()))
+        .and_then(|()| {
+            std::fs::rename(&staged, path).with_context(|| format!("replacing {}", path.display()))
+        });
+    if replaced.is_err() {
+        std::fs::remove_file(&staged).ok();
+    }
+    replaced
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::events::EventSink;
+    use crate::index::Requirement;
+    use crate::lockfile::{LOCAL_SOURCE, StaleReason};
+    use crate::ops::testing::CancelOn;
+    use crate::solve::Unresolved;
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    thread_local! {
+        /// The one file this test's thread cannot write: the seam that lets a
+        /// test fail a write that comes after the manifest's own.
+        static UNWRITABLE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn write_is_made_to_fail(path: &Path) -> bool {
+        UNWRITABLE.with(|file| file.borrow().as_deref() == Some(path))
+    }
+
+    // ---- the pure parts ----
+
+    fn entry(name: &str, version: &str, requires: &[&str], url: &str) -> Entry {
+        Entry {
+            name: name.to_string(),
+            version: Version::parse(version),
+            url: url.to_string(),
+            md5: None,
+            display_name: None,
+            requires: requires
+                .iter()
+                .map(|required| Requirement {
+                    name: required.to_string(),
+                    min: None,
+                    min_exclusive: false,
+                })
+                .collect(),
+            lv_min: None,
+            source: String::new(),
+            released: None,
+            index_pin: None,
+        }
+    }
+
+    #[test]
+    fn a_locked_package_stands_for_a_github_entry_only_from_the_same_repo() {
+        let locked = |source: &str| LockedPackage {
+            name: "pkg".into(),
+            version: "1.0".into(),
+            sha256: "ab".into(),
+            md5: None,
+            digest: None,
+            source: source.into(),
+            requires: Vec::new(),
+            groups: Vec::new(),
+            signer: None,
+            subject: None,
+        };
+        let mut github = entry("pkg", "1.0", &[], "http://api/assets/1");
+        github.source = index::github_source("o/r");
+        let feed = entry("pkg", "1.0", &[], "http://feed/pkg-1.0.vip");
+
+        assert!(from_same_repo(&locked("https://github.com/O/R"), &github));
+        assert!(!from_same_repo(
+            &locked("https://github.com/fork/r"),
+            &github
+        ));
+        assert!(!from_same_repo(&locked("http://feed/index.vipr"), &github));
+        assert!(from_same_repo(&locked("http://feed/index.vipr"), &feed));
+    }
+
+    #[test]
+    fn a_locked_package_stands_for_an_index_entry_only_from_the_same_index() {
+        let locked = |source: &str| LockedPackage {
+            name: "pkg".into(),
+            version: "1.0".into(),
+            sha256: "ab".into(),
+            md5: None,
+            digest: None,
+            source: source.into(),
+            requires: Vec::new(),
+            groups: Vec::new(),
+            signer: None,
+            subject: None,
+        };
+        let mut listed = entry(
+            "pkg",
+            "1.0",
+            &[],
+            "http://web/o/r/releases/download/1/pkg.vip",
+        );
+        listed.source = "github-index:o/idx".into();
+
+        assert!(from_same_repo(&locked("github-index:o/idx"), &listed));
+        // Bytes locked from another source were never checked against the index.
+        assert!(!from_same_repo(&locked("http://feed/index.vipr"), &listed));
+        assert!(!from_same_repo(&locked("local"), &listed));
+        assert!(!from_same_repo(&locked("github-index:o/other"), &listed));
+        // GitHub spells repos in any case; so does a manifest's index line.
+        assert!(from_same_repo(&locked("github-index:O/IDX"), &listed));
+    }
+
+    /// `alpha` 1.0 as an OCI source lists it, by this manifest digest.
+    fn oci_entry(manifest: char) -> Entry {
+        let url = format!(
+            "oci://r:5000/org/alpha@sha256:{}",
+            manifest.to_string().repeat(64)
+        );
+        Entry {
+            source: "oci://r:5000/org".to_string(),
+            ..entry("alpha", "1.0", &[], &url)
+        }
+    }
+
+    #[test]
+    fn a_package_from_an_oci_source_is_locked_with_its_manifest_digest_and_the_sources_own_url() {
+        let text = "[project]\nlabview = \">=2023\"\n\n[sources]\nteam = \"oci://r:5000/org\"\n\
+                    defaults = false\n\n[dependencies]\nalpha = { version = \"*\", index = \"team\" }\n";
+        let project = manifest(text);
+        let resolved = resolution(vec![oci_entry('a')], Vec::new());
+        let hashes = hashes(&resolved);
+        let lock = build(&project, "2023", &resolved, &hashes, &HashMap::new(), &[]);
+        let alpha = &lock.packages[0];
+        assert_eq!(alpha.source, "oci://r:5000/org");
+        assert_eq!(alpha.digest, Some(format!("sha256:{}", "a".repeat(64))));
+        assert_eq!(alpha.md5, None);
+    }
+
+    #[test]
+    fn a_locked_oci_package_stands_for_an_entry_only_by_the_same_manifest_digest() {
+        let previous = |manifest: char| {
+            let mut lock = lock_of(&[("alpha", "1.0")]);
+            lock.packages[0].digest = Some(format!("sha256:{}", manifest.to_string().repeat(64)));
+            lock
+        };
+        let moved = oci_entry('b');
+        assert!(kept_of(Some(&previous('a')), "alpha", &moved).is_none());
+        assert!(kept_of(Some(&previous('b')), "alpha", &moved).is_some());
+    }
+
+    #[test]
+    fn a_locked_oci_package_does_not_stand_for_a_hosted_entry_and_the_reverse() {
+        let hosted = entry("alpha", "1.0", &[], "http://feed/alpha-1.0.vip");
+        let mut oci_row = lock_of(&[("alpha", "1.0")]);
+        oci_row.packages[0].digest = Some(format!("sha256:{}", "a".repeat(64)));
+        // The pin was removed: the hosted entry may not reuse the OCI row's hashes.
+        assert!(kept_of(Some(&oci_row), "alpha", &hosted).is_none());
+        let hosted_row = lock_of(&[("alpha", "1.0")]);
+        assert!(kept_of(Some(&hosted_row), "alpha", &hosted).is_some());
+        assert!(kept_of(Some(&hosted_row), "alpha", &oci_entry('a')).is_none());
+    }
+
+    #[test]
+    fn a_moved_tag_is_the_same_version_of_the_same_source_at_another_manifest() {
+        let previous = |source: &str, digest: char| {
+            let mut lock = lock_of(&[("alpha", "1.0")]);
+            lock.packages[0].source = source.to_string();
+            lock.packages[0].digest = Some(format!("sha256:{}", digest.to_string().repeat(64)));
+            lock
+        };
+        let moved = moved_tag(
+            Some(&previous("oci://r:5000/org", 'a')),
+            "alpha",
+            &oci_entry('b'),
+        );
+        let moved = moved.expect("a moved tag");
+        assert_eq!(moved.locked, format!("sha256:{}", "a".repeat(64)));
+        assert_eq!(moved.found, format!("sha256:{}", "b".repeat(64)));
+        let same = previous("oci://r:5000/org", 'b');
+        assert!(moved_tag(Some(&same), "alpha", &oci_entry('b')).is_none());
+        let other_source = previous("oci://r:5000/other", 'a');
+        assert!(moved_tag(Some(&other_source), "alpha", &oci_entry('b')).is_none());
+        assert!(moved_tag(None, "alpha", &oci_entry('b')).is_none());
+    }
+
+    fn resolution(entries: Vec<Entry>, unresolved: Vec<Unresolved>) -> Resolution {
+        Resolution {
+            packages: entries
+                .into_iter()
+                .map(|entry| (name_key(&entry.name), entry))
+                .collect(),
+            unresolved,
+            held_back: Vec::new(),
+        }
+    }
+
+    fn manifest(text: &str) -> Project {
+        crate::project::parse(text).unwrap()
+    }
+
+    fn hashes(resolution: &Resolution) -> HashMap<String, String> {
+        resolution
+            .packages
+            .keys()
+            .map(|key| (key.clone(), format!("sha-of-{key}")))
+            .collect()
+    }
+
+    #[test]
+    fn a_labview_year_is_the_index_unit_and_anything_else_is_refused() {
+        assert_eq!(lv_gate("2024").unwrap(), 24.0);
+        assert_eq!(lv_gate(" 2026 ").unwrap(), 26.0);
+        for not_a_year in ["", "soon", "20.5", "1999"] {
+            assert!(
+                matches!(
+                    lv_gate(not_a_year),
+                    Err(LockError::LabviewNotAYear { value }) if value == not_a_year
+                ),
+                "{not_a_year:?}"
+            );
+        }
+    }
+
+    /// Each locked package with the groups the lock gives it.
+    fn groups_of(lock: &Lockfile) -> Vec<(&str, Vec<&str>)> {
+        lock.packages
+            .iter()
+            .map(|package| {
+                let groups = package.groups.iter().map(String::as_str).collect();
+                (package.name.as_str(), groups)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_what_dev_dependencies_need_is_marked_dev() {
+        let project = manifest(
+            "[dependencies]\nBeta = \">=1.0\"\n\n[dev-dependencies]\ncaraya = \"*\"\nshared = \"*\"\n",
+        );
+        let resolution = resolution(
+            vec![
+                entry("alpha", "2.0", &[], "a"),
+                entry("beta", "1.0", &["alpha", "Shared"], "b"),
+                entry("caraya", "1.0", &["alpha", "helper"], "c"),
+                entry("helper", "1.0", &[], "h"),
+                entry("shared", "1.0", &[], "s"),
+            ],
+            Vec::new(),
+        );
+        let lock = build(
+            &project,
+            "2024",
+            &resolution,
+            &hashes(&resolution),
+            &HashMap::new(),
+            &[],
+        );
+        // alpha and shared are needed by `beta`, a direct dependency, even
+        // though dev dependencies need them too; helper only by caraya.
+        assert_eq!(
+            groups_of(&lock),
+            [
+                ("alpha", vec![]),
+                ("beta", vec![]),
+                ("caraya", vec!["dev"]),
+                ("helper", vec!["dev"]),
+                ("shared", vec![])
+            ]
+        );
+    }
+
+    /// `beta` and `ci_tools` need `alpha`; `caraya` needs `helper`.
+    fn grouped_resolution() -> Resolution {
+        resolution(
+            vec![
+                entry("alpha", "2.0", &[], "a"),
+                entry("beta", "1.0", &["alpha"], "b"),
+                entry("caraya", "1.0", &["helper"], "c"),
+                entry("ci_tools", "1.0", &["alpha"], "t"),
+                entry("docs_tools", "1.0", &[], "d"),
+                entry("helper", "1.0", &[], "h"),
+            ],
+            Vec::new(),
+        )
+    }
+
+    /// The groups the lock gives each package of `grouped_resolution` for `tables`.
+    fn locked_groups(tables: &str) -> Vec<(String, Vec<String>)> {
+        let resolution = grouped_resolution();
+        let lock = build(
+            &manifest(tables),
+            "2024",
+            &resolution,
+            &hashes(&resolution),
+            &HashMap::new(),
+            &[],
+        );
+        (lock.packages.into_iter())
+            .map(|package| (package.name, package.groups))
+            .collect()
+    }
+
+    #[test]
+    fn a_package_dev_and_a_group_both_need_has_both_groups_sorted_whatever_the_manifest_order() {
+        let dev_first = locked_groups(
+            "[dev-dependencies]
+caraya = \"*\"
+
+[dependency-groups.ci]
+ci_tools = \"*\"
+caraya = \"*\"
+",
+        );
+        let ci_first = locked_groups(
+            "[dependency-groups.ci]
+ci_tools = \"*\"
+caraya = \"*\"
+
+[dev-dependencies]
+caraya = \"*\"
+",
+        );
+        let both = |name: &str| (name.to_string(), vec!["ci".to_string(), "dev".to_string()]);
+        assert_eq!(dev_first, ci_first);
+        assert!(dev_first.contains(&both("caraya")), "{dev_first:?}");
+        assert!(dev_first.contains(&both("helper")), "{dev_first:?}");
+        assert!(
+            dev_first.contains(&("ci_tools".to_string(), vec!["ci".to_string()])),
+            "{dev_first:?}"
+        );
+    }
+
+    #[test]
+    fn what_dependencies_needs_has_no_groups_however_many_groups_need_it_too() {
+        let project = manifest(
+            "[dependencies]\nbeta = \"*\"\n\n[dev-dependencies]\nci_tools = \"*\"\n\n\
+             [dependency-groups.ci]\nci_tools = \"*\"\n\n[dependency-groups.docs]\ndocs_tools = \"*\"\n",
+        );
+        let resolution = grouped_resolution();
+        let lock = build(
+            &project,
+            "2024",
+            &resolution,
+            &hashes(&resolution),
+            &HashMap::new(),
+            &[],
+        );
+        let groups = groups_of(&lock);
+        assert!(groups.contains(&("alpha", vec![])), "{groups:?}");
+        assert!(groups.contains(&("beta", vec![])), "{groups:?}");
+        assert!(
+            groups.contains(&("ci_tools", vec!["ci", "dev"])),
+            "{groups:?}"
+        );
+        assert!(groups.contains(&("docs_tools", vec!["docs"])), "{groups:?}");
+        let text = lock.to_toml().unwrap();
+        assert!(!text.contains("dev = "), "{text}");
+        assert!(text.contains("version = 2"), "{text}");
+    }
+
+    #[test]
+    fn a_package_records_the_locked_packages_it_requires_and_the_unresolved_ones_apart() {
+        let project = manifest("[dependencies]\nbeta = \"*\"\n");
+        let resolution = resolution(
+            vec![
+                entry("alpha", "2.0", &[], "a"),
+                entry("beta", "1.0", &["Alpha", "ni_lib_missing"], "b"),
+            ],
+            vec![Unresolved {
+                name: "ni_lib_missing".into(),
+                required_by: "beta".into(),
+            }],
+        );
+        let lock = build(
+            &project,
+            "2024",
+            &resolution,
+            &hashes(&resolution),
+            &HashMap::new(),
+            &[],
+        );
+        assert_eq!(lock.packages[1].requires, ["alpha"], "by the locked name");
+        assert_eq!(
+            lock.unresolved,
+            [LockedUnresolved {
+                name: "ni_lib_missing".into(),
+                required_by: "beta".into()
+            }]
+        );
+        assert_eq!(lock.packages[0].sha256, "sha-of-alpha");
+        assert_eq!(lock.labview, "2024");
+        assert_eq!(lock.version, lockfile::FORMAT_VERSION);
+    }
+
+    #[test]
+    fn a_package_comes_from_its_feed_or_from_local() {
+        let project = manifest("[dependencies]\nhosted = \"*\"\nfolder = \"*\"\n");
+        let feeds = vec![(
+            "http://h/feed/index.vipr".to_string(),
+            "http://h/feed/".to_string(),
+        )];
+        let resolution = resolution(
+            vec![
+                entry(
+                    "hosted",
+                    "1.0",
+                    &[],
+                    "http://h/feed/packages/hosted-1.0.vip",
+                ),
+                entry("folder", "1.0", &[], "C:/packages/folder-1.0.vip"),
+            ],
+            Vec::new(),
+        );
+        let lock = build(
+            &project,
+            "2024",
+            &resolution,
+            &hashes(&resolution),
+            &HashMap::new(),
+            &feeds,
+        );
+        assert_eq!(lock.packages[0].source, LOCAL_SOURCE);
+        assert_eq!(lock.packages[1].source, "http://h/feed/index.vipr");
+    }
+
+    fn lock_of(packages: &[(&str, &str)]) -> Lockfile {
+        let mut lock = build(
+            &manifest(""),
+            "2024",
+            &resolution(Vec::new(), Vec::new()),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+        lock.packages = packages
+            .iter()
+            .map(|(name, version)| LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                sha256: String::new(),
+                md5: None,
+                digest: None,
+                source: LOCAL_SOURCE.to_string(),
+                requires: Vec::new(),
+                groups: Vec::new(),
+                signer: None,
+                subject: None,
+            })
+            .collect();
+        lock
+    }
+
+    fn added(name: &str, version: &str) -> LockChange {
+        LockChange::Added {
+            name: name.into(),
+            version: version.into(),
+        }
+    }
+
+    #[test]
+    fn every_package_is_added_when_there_was_no_lock() {
+        let new = lock_of(&[("beta", "1.0"), ("alpha", "2.0")]);
+        assert_eq!(
+            changes(None, &new),
+            [added("alpha", "2.0"), added("beta", "1.0")]
+        );
+    }
+
+    #[test]
+    fn a_new_lock_is_described_by_what_was_added_removed_and_moved() {
+        let old = lock_of(&[("alpha", "1.0"), ("beta", "1.0"), ("gone", "3.0")]);
+        let new = lock_of(&[("Alpha", "2.0"), ("beta", "1.0"), ("new", "0.1")]);
+        assert_eq!(
+            changes(Some(&old), &new),
+            [
+                LockChange::Changed {
+                    name: "Alpha".into(),
+                    from: "1.0".into(),
+                    to: "2.0".into()
+                },
+                LockChange::Removed {
+                    name: "gone".into(),
+                    version: "3.0".into()
+                },
+                added("new", "0.1"),
+            ]
+        );
+        assert_eq!(changes(Some(&new), &new), []);
+    }
+
+    // ---- the whole operation, on real files ----
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<Event>>);
+
+    impl EventSink for Recorder {
+        fn emit(&self, event: Event) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    impl Recorder {
+        fn events(&self) -> Vec<Event> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A project directory: a manifest, and a folder of local packages beside
+    /// it. Removed when it goes out of scope.
+    struct ProjectDir {
+        root: PathBuf,
+    }
+
+    /// `(name, version, LabVIEW it needs, requirements)`.
+    type Fixture<'a> = (&'a str, &'a str, &'a str, &'a str);
+
+    fn write_vip(path: &Path, (name, version, lv, requires): Fixture) {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("spec", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let mut spec = format!("[Package]\nName={name}\nVersion={version}\n");
+        if !requires.is_empty() {
+            spec.push_str(&format!("[Dependencies]\nRequires={requires}\n"));
+        }
+        spec.push_str(&format!(
+            "[Platform]\nExclusive_LabVIEW_Version=LabVIEW>={lv}\n"
+        ));
+        writer.write_all(spec.as_bytes()).unwrap();
+        std::fs::write(path, writer.finish().unwrap().into_inner()).unwrap();
+    }
+
+    impl ProjectDir {
+        fn new(tag: &str, manifest: &str, packages: &[Fixture]) -> ProjectDir {
+            let root =
+                std::env::temp_dir().join(format!("lvpm-lock-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("packages")).unwrap();
+            std::fs::write(root.join(crate::project::FILE_NAME), manifest).unwrap();
+            for package in packages {
+                let file = format!("{}-{}.vip", package.0, package.1);
+                write_vip(&root.join("packages").join(file), *package);
+            }
+            ProjectDir { root }
+        }
+
+        fn env<'a>(&self, sink: &'a dyn EventSink) -> OpEnv<'a> {
+            let config = Config {
+                log_dir: Default::default(),
+                venv_title: Default::default(),
+                cache: self.root.join("cache"),
+                hooks_run: Vec::new(),
+                local_sources: vec![self.root.join("packages")],
+                venv_dir: PathBuf::from(".lv-venv"),
+            };
+            OpEnv::new(sink, config, Vec::new(), self.root.clone())
+        }
+
+        fn lock_path(&self) -> PathBuf {
+            self.root.join(lockfile::FILE_NAME)
+        }
+    }
+
+    impl Drop for ProjectDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const MANIFEST: &str = "[project]\nlabview = \">=2023\"\n\n[sources]\ndefaults = false\n\n\
+                            [dependencies]\ngamma = \"*\"\n";
+
+    #[test]
+    fn a_package_that_needs_a_newer_labview_than_the_projects_is_not_locked() {
+        let project = ProjectDir::new(
+            "gate",
+            MANIFEST,
+            &[("gamma", "1.0", "23.0", ""), ("gamma", "1.5", "24.0", "")],
+        );
+        let sink = Recorder::default();
+        let lock = lock(&project.env(&sink)).unwrap();
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.packages[0].version, "1.0");
+        assert_eq!(lock.labview, "2023");
+        let written = std::fs::read_to_string(project.lock_path()).unwrap();
+        assert_eq!(written, lock.to_toml().unwrap());
+        assert_eq!(staged_files(&project.root), Vec::<String>::new());
+        let events = sink.events();
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    Event::LockHashing {
+                        position: 1,
+                        total: 1,
+                        ..
+                    },
+                    Event::LockChanged { .. },
+                    Event::LockWritten { packages: 1, .. },
+                ]
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// `project`'s manifest and index, with each of `dates` (name, version,
+    /// days ago) released then and every other version undated.
+    fn dated_index(
+        project: &ProjectDir,
+        sink: &Recorder,
+        dates: &[(&str, &str, i64)],
+    ) -> (Project, Index) {
+        let env = project.env(sink);
+        let found = find_manifest(&env).unwrap();
+        let mut index = load_index(&env, Some(&found), None, &Moving::Nothing).unwrap();
+        for entry in &mut index.entries {
+            entry.released = dates
+                .iter()
+                .find(|(name, version, _)| {
+                    entry.name == *name && entry.version == Version::parse(version)
+                })
+                .map(|(_, _, days_ago)| now() - days_ago * released::SECS_PER_DAY);
+        }
+        (found.1, index)
+    }
+
+    /// `MANIFEST` with `min-age-days = 14` under `[sources]`; fails if the key
+    /// did not go in, which would make the tests below vacuous.
+    fn with_min_age_14() -> String {
+        let manifest = MANIFEST.replace("false\n", "false\nmin-age-days = 14\n");
+        assert!(manifest.contains("min-age-days = 14"), "{manifest}");
+        manifest
+    }
+
+    #[test]
+    fn a_newer_version_the_age_limit_kept_out_is_an_event_with_its_dates() {
+        let manifest = with_min_age_14();
+        let project = ProjectDir::new(
+            "held-back",
+            &manifest,
+            &[("gamma", "1.0", "23.0", ""), ("gamma", "1.5", "23.0", "")],
+        );
+        let sink = Recorder::default();
+        let (manifest, index) = dated_index(
+            &project,
+            &sink,
+            &[("gamma", "1.0", 30), ("gamma", "1.5", 3)],
+        );
+        let released = index
+            .entries
+            .iter()
+            .find(|entry| entry.version == Version::parse("1.5"))
+            .and_then(|entry| entry.released)
+            .unwrap();
+        relock_with(&project.env(&sink), &manifest, &index, None).unwrap();
+        let held_back: Vec<Event> = sink
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, Event::HeldBack { .. }))
+            .collect();
+        assert_eq!(
+            held_back,
+            [Event::HeldBack {
+                name: "gamma".into(),
+                version: "1.5".into(),
+                chosen: "1.0".into(),
+                released,
+                eligible: released + 14 * released::SECS_PER_DAY,
+                min_age_days: 14,
+            }]
+        );
+    }
+
+    #[test]
+    fn no_event_says_anything_was_held_back_when_nothing_was() {
+        let manifest = with_min_age_14();
+        let project = ProjectDir::new(
+            "held-back-none",
+            &manifest,
+            &[("gamma", "1.0", "23.0", ""), ("gamma", "1.5", "23.0", "")],
+        );
+        let sink = Recorder::default();
+        // 1.5 is newer than 1.0 but old enough, so it is chosen, not held back.
+        let (manifest, index) = dated_index(
+            &project,
+            &sink,
+            &[("gamma", "1.0", 30), ("gamma", "1.5", 20)],
+        );
+        let (lock, _, _) = relock_with(&project.env(&sink), &manifest, &index, None).unwrap();
+        assert_eq!(lock.packages[0].version, "1.5");
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::HeldBack { .. })),
+            "{:?}",
+            sink.events()
+        );
+    }
+
+    #[test]
+    fn a_failed_lock_leaves_the_old_one_as_it_was() {
+        let project = ProjectDir::new("keep", MANIFEST, &[("gamma", "1.0", "23.0", "")]);
+        let sink = Recorder::default();
+        lock(&project.env(&sink)).unwrap();
+        let before = std::fs::read(project.lock_path()).unwrap();
+
+        std::fs::write(
+            project.root.join(crate::project::FILE_NAME),
+            MANIFEST.replace("gamma", "zeta"),
+        )
+        .unwrap();
+        let why = lock(&project.env(&sink)).unwrap_err();
+        assert!(matches!(why, LockError::Conflict(_)), "{why:?}");
+        assert_eq!(std::fs::read(project.lock_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn locking_needs_a_project_and_a_labview_that_is_a_year() {
+        let sink = Recorder::default();
+        let bare = std::env::temp_dir().join(format!("lvpm-lock-test-bare-{}", std::process::id()));
+        std::fs::create_dir_all(&bare).unwrap();
+        let env = OpEnv::new(
+            &sink,
+            Config {
+                log_dir: Default::default(),
+                venv_title: Default::default(),
+                cache: bare.join("cache"),
+                hooks_run: Vec::new(),
+                local_sources: Vec::new(),
+                venv_dir: PathBuf::from(".lv-venv"),
+            },
+            Vec::new(),
+            bare.clone(),
+        );
+        assert!(
+            matches!(lock(&env), Err(LockError::NoManifest { searched_from }) if searched_from == bare)
+        );
+        std::fs::remove_dir_all(&bare).ok();
+
+        for (text, expected) in [
+            ("[project]\nname = \"x\"\n", "no labview"),
+            (
+                "[project]\nlabview = \"soon\"\n",
+                "not a minimum LabVIEW year",
+            ),
+        ] {
+            let project = ProjectDir::new("manifest", text, &[]);
+            let why = format!(
+                "{:#}",
+                anyhow::Error::from(lock(&project.env(&sink)).unwrap_err())
+            );
+            assert!(why.contains(expected), "{why}");
+            assert!(!project.lock_path().exists());
+        }
+    }
+
+    const BOTH_TABLES: &str = "[project]\nlabview = \">=2023\"\n\n[sources]\ndefaults = false\n\n\
+                               [dependencies]\ngamma = \">=1.0\"\n\n\
+                               [dev-dependencies]\ncaraya = \"*\"\ngamma = \"1.5\"\n";
+    const GAMMAS: &[Fixture<'static>] = &[
+        ("gamma", "1.0", "23.0", ""),
+        ("gamma", "1.5", "23.0", "helper>=1.0"),
+        ("gamma", "2.0", "23.0", "helper>=1.0"),
+        ("helper", "1.0", "23.0", ""),
+        ("caraya", "1.0", "23.0", "helper>=1.0"),
+    ];
+
+    #[test]
+    fn a_package_in_both_tables_is_locked_once_at_a_version_both_admit() {
+        let project = ProjectDir::new("both", BOTH_TABLES, GAMMAS);
+        let lock = lock(&project.env(&Recorder::default())).unwrap();
+        let locked: Vec<(&str, &str)> = lock
+            .packages
+            .iter()
+            .map(|package| (package.name.as_str(), package.version.as_str()))
+            .collect();
+        // `>=1.0` alone would take 2.0, and the dev line alone allows 1.5 only.
+        assert_eq!(
+            locked,
+            [("caraya", "1.0"), ("gamma", "1.5"), ("helper", "1.0")]
+        );
+        // Both lines are recorded as the manifest has them.
+        assert_eq!(lock.inputs.dependencies["gamma"], ">=1.0");
+        assert_eq!(lock.inputs.dev_dependencies["gamma"], "1.5");
+    }
+
+    #[test]
+    fn a_package_in_both_tables_and_what_only_it_needs_are_not_dev() {
+        let project = ProjectDir::new("both-dev", BOTH_TABLES, GAMMAS);
+        let lock = lock(&project.env(&Recorder::default())).unwrap();
+        // helper is needed by gamma (normal) as well as by caraya (dev).
+        assert_eq!(
+            groups_of(&lock),
+            [
+                ("caraya", vec!["dev"]),
+                ("gamma", vec![]),
+                ("helper", vec![])
+            ]
+        );
+        let text = lock.to_toml().unwrap();
+        assert_eq!(text.matches("groups = [\"dev\"]").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_package_in_both_tables_with_lines_that_cannot_both_hold_is_a_conflict_naming_both() {
+        let project = ProjectDir::new(
+            "both-conflict",
+            &BOTH_TABLES.replace(">=1.0", "1.0"),
+            GAMMAS,
+        );
+        let why = lock(&project.env(&Recorder::default())).unwrap_err();
+        let LockError::Conflict(conflict) = why else {
+            panic!("expected a conflict, got {why:?}");
+        };
+        for wanted in ["= 1.0", "= 1.5"] {
+            assert!(
+                conflict.facts.contains(&crate::solve::Fact::Manifest {
+                    package: "gamma".into(),
+                    wanted: wanted.into()
+                }),
+                "{wanted} is not in:\n{conflict}"
+            );
+        }
+        assert_eq!(conflict.facts.len(), 2, "{conflict}");
+        assert!(!project.lock_path().exists());
+    }
+
+    #[test]
+    fn a_lock_that_still_represents_the_manifest_is_left_alone_and_needs_no_source() {
+        let project = ProjectDir::new("current", MANIFEST, &[("gamma", "1.0", "23.0", "")]);
+        let first = lock(&project.env(&Recorder::default())).unwrap();
+        let modified = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+        let (bytes, stamp) = (
+            std::fs::read(project.lock_path()).unwrap(),
+            modified(&project.lock_path()),
+        );
+        // With the packages and the cache gone, anything that tried to
+        // resolve or hash would fail.
+        std::fs::remove_dir_all(project.root.join("packages")).unwrap();
+        std::fs::remove_dir_all(project.root.join("cache")).unwrap();
+
+        let sink = Recorder::default();
+        let again = lock(&project.env(&sink)).unwrap();
+        assert_eq!(again, first);
+        assert!(
+            matches!(&sink.events()[..], [Event::LockUpToDate { path }] if *path == project.lock_path()),
+            "{:?}",
+            sink.events()
+        );
+        assert_eq!(std::fs::read(project.lock_path()).unwrap(), bytes);
+        assert_eq!(modified(&project.lock_path()), stamp);
+    }
+
+    #[test]
+    fn a_stale_lock_is_resolved_again_and_keeps_the_versions_that_still_fit() {
+        let gammas = [("gamma", "1.0", "23.0", ""), ("helper", "1.0", "23.0", "")];
+        let project = ProjectDir::new("stale", MANIFEST, &gammas);
+        lock(&project.env(&Recorder::default())).unwrap();
+        write_vip(
+            &project.root.join("packages/gamma-1.5.vip"),
+            ("gamma", "1.5", "23.0", ""),
+        );
+
+        let manifest = MANIFEST.replace("gamma = \"*\"", "gamma = \"*\"\nhelper = \"*\"");
+        std::fs::write(project.root.join(crate::project::FILE_NAME), manifest).unwrap();
+        let sink = Recorder::default();
+        let lock = lock(&project.env(&sink)).unwrap();
+        let locked: Vec<(&str, &str)> = lock
+            .packages
+            .iter()
+            .map(|package| (package.name.as_str(), package.version.as_str()))
+            .collect();
+        assert_eq!(locked, [("gamma", "1.0"), ("helper", "1.0")]);
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, Event::LockWritten { packages: 2, .. })),
+            "{:?}",
+            sink.events()
+        );
+    }
+
+    #[test]
+    fn a_lock_in_an_older_format_is_written_again() {
+        let project = ProjectDir::new("older", MANIFEST, &[("gamma", "1.0", "23.0", "")]);
+        lock(&project.env(&Recorder::default())).unwrap();
+        let older = std::fs::read_to_string(project.lock_path())
+            .unwrap()
+            .replace("version = 1\n", "version = 0\n");
+        std::fs::write(project.lock_path(), &older).unwrap();
+
+        let lock = lock(&project.env(&Recorder::default())).unwrap();
+        assert_eq!(lock.version, lockfile::FORMAT_VERSION);
+        assert_eq!(
+            std::fs::read_to_string(project.lock_path()).unwrap(),
+            older.replace("version = 0\n", "version = 1\n")
+        );
+    }
+
+    // ---- writing the lock ----
+
+    /// The staging files left in `dir`.
+    fn staged_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn every_write_stages_to_a_file_of_its_own_beside_the_lock() {
+        let lock = Path::new("project").join(lockfile::FILE_NAME);
+        let (first, second) = (
+            crate::paths::staging_path(&lock),
+            crate::paths::staging_path(&lock),
+        );
+        assert_ne!(first, second);
+        for staged in [first, second] {
+            assert_eq!(staged.parent(), lock.parent());
+            let name = staged.file_name().unwrap().to_string_lossy();
+            assert!(
+                name.starts_with("lvpm.lock.") && name.ends_with(".tmp"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_put_in_place_leaves_no_staged_file() {
+        let project = ProjectDir::new("write-fails", MANIFEST, &[]);
+        // A folder where the lock goes: the staged file is written, and cannot
+        // replace it.
+        std::fs::create_dir(project.lock_path()).unwrap();
+        let why = write_atomically(&project.lock_path(), "lock").unwrap_err();
+        assert!(format!("{why:#}").contains("replacing"), "{why:#}");
+        assert_eq!(staged_files(&project.root), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_lock_replaces_the_old_one_whole_and_leaves_no_staged_file() {
+        let project = ProjectDir::new("write-replaces", MANIFEST, &[]);
+        std::fs::write(project.lock_path(), "the old lock").unwrap();
+        write_atomically(&project.lock_path(), "the new lock").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.lock_path()).unwrap(),
+            "the new lock"
+        );
+        assert_eq!(staged_files(&project.root), Vec::<String>::new());
+    }
+
+    // ---- upgrade ----
+
+    #[test]
+    fn an_upgrade_prefers_every_locked_version_except_those_it_lets_move() {
+        let previous = lock_of(&[("alpha", "1.0"), ("Beta", "1.0"), ("gamma", "1.0")]);
+        let preferred = |moving: &Moving| -> Vec<(String, String)> {
+            preferences(Some(&previous), moving)
+                .into_iter()
+                .map(|(name, version)| (name, version.raw))
+                .collect()
+        };
+        let pair = |name: &str| (name.to_string(), "1.0".to_string());
+        assert_eq!(
+            preferred(&Moving::Nothing),
+            [pair("alpha"), pair("Beta"), pair("gamma")]
+        );
+        let beta = [target("beta")];
+        assert_eq!(
+            preferred(&Moving::Only(&beta)),
+            [pair("alpha"), pair("gamma")],
+            "a name matches in any case"
+        );
+        assert_eq!(preferred(&Moving::Everything), []);
+        assert_eq!(preferences(None, &Moving::Nothing), []);
+    }
+
+    #[test]
+    fn an_upgrade_moves_to_the_newest_version_and_then_finds_nothing_newer() {
+        let project = ProjectDir::new("upgrade", MANIFEST, &[("gamma", "1.0", "23.0", "")]);
+        lock(&project.env(&Recorder::default())).unwrap();
+        write_vip(
+            &project.root.join("packages/gamma-1.5.vip"),
+            ("gamma", "1.5", "23.0", ""),
+        );
+
+        // A plain lock keeps what it holds; an upgrade moves.
+        let sink = Recorder::default();
+        let kept = lock(&project.env(&sink)).unwrap();
+        assert_eq!(kept.packages[0].version, "1.0");
+        let sink = Recorder::default();
+        let moved = upgrade(&project.env(&sink), &Upgrade::Everything).unwrap();
+        assert_eq!(moved.packages[0].version, "1.5");
+        assert!(
+            sink.events().iter().any(|event| matches!(event,
+                Event::LockChanged { changes } if *changes == [LockChange::Changed {
+                    name: "gamma".into(), from: "1.0".into(), to: "1.5".into() }])),
+            "{:?}",
+            sink.events()
+        );
+        let written = std::fs::read(project.lock_path()).unwrap();
+        assert_eq!(written, moved.to_toml().unwrap().into_bytes());
+
+        let sink = Recorder::default();
+        let again = upgrade(
+            &project.env(&sink),
+            &Upgrade::Packages(vec![target("Gamma")]),
+        )
+        .unwrap();
+        assert_eq!(again, moved);
+        assert!(
+            matches!(&sink.events()[..], [
+                Event::LockHashing { .. },
+                Event::LockNothingNewer { path },
+            ] if *path == project.lock_path()),
+            "{:?}",
+            sink.events()
+        );
+        assert_eq!(std::fs::read(project.lock_path()).unwrap(), written);
+    }
+
+    #[test]
+    fn upgrading_a_package_moves_what_its_newer_release_needs_whatever_the_manifest_order() {
+        for (tag, lines) in [
+            ("first", "alpha = \">=1.0\"\nbeta = \"*\"\n"),
+            ("second", "beta = \"*\"\nalpha = \">=1.0\"\n"),
+        ] {
+            let manifest = format!(
+                "[project]\nlabview = \">=2023\"\n\n[sources]\ndefaults = false\n\n\
+                 [dependencies]\n{lines}"
+            );
+            let project = ProjectDir::new(
+                &format!("upgrade-order-{tag}"),
+                &manifest,
+                &[
+                    ("alpha", "1.0", "23.0", ""),
+                    ("beta", "1.0", "23.0", "alpha>=1.0"),
+                ],
+            );
+            lock(&project.env(&Recorder::default())).unwrap();
+            let packages = project.root.join("packages");
+            write_vip(
+                &packages.join("alpha-2.0.vip"),
+                ("alpha", "2.0", "23.0", ""),
+            );
+            write_vip(
+                &packages.join("beta-2.0.vip"),
+                ("beta", "2.0", "23.0", "alpha>=2.0"),
+            );
+
+            let moved = upgrade(
+                &project.env(&Recorder::default()),
+                &Upgrade::Packages(vec![target("beta")]),
+            )
+            .unwrap();
+            let locked: Vec<(&str, &str)> = moved
+                .packages
+                .iter()
+                .map(|package| (package.name.as_str(), package.version.as_str()))
+                .collect();
+            assert_eq!(locked, [("alpha", "2.0"), ("beta", "2.0")], "{lines}");
+        }
+    }
+
+    fn target(text: &str) -> UpgradeTarget {
+        UpgradeTarget::parse(text).unwrap()
+    }
+
+    #[test]
+    fn an_upgrade_target_is_a_name_with_or_without_a_version() {
+        assert_eq!(
+            target("beta"),
+            UpgradeTarget {
+                name: "beta".into(),
+                version: None
+            }
+        );
+        assert_eq!(
+            target(" beta @ 1.5 "),
+            UpgradeTarget {
+                name: "beta".into(),
+                version: Some("1.5".into())
+            }
+        );
+        for not_a_target in ["", "@1.5", "beta@", " @ "] {
+            assert!(
+                UpgradeTarget::parse(not_a_target).is_err(),
+                "{not_a_target:?}"
+            );
+        }
+    }
+
+    fn updates(manifest_text: &str, name: &str, version: &str) -> Vec<(String, String, String)> {
+        constraint_updates(
+            &manifest(manifest_text),
+            name,
+            version,
+            &Version::parse(version),
+        )
+        .into_iter()
+        .map(|update| (update.name, update.from, update.to))
+        .collect()
+    }
+
+    #[test]
+    fn a_constraint_is_rewritten_only_when_it_excludes_the_version_and_keeps_its_kind() {
+        let text = "[dependencies]\nBeta = \">=1.0\"\ngamma = \"1.0\"\nany = \"*\"\n\n\
+                    [dev-dependencies]\nbeta = \"1.2\"\n";
+        // A floor above the version moves down to it; an exact pin moves to it.
+        assert_eq!(
+            updates(text, "beta", "0.9"),
+            [
+                ("Beta".into(), ">=1.0".into(), ">=0.9".into()),
+                ("beta".into(), "1.2".into(), "0.9".into())
+            ],
+            "every table, the name as the manifest spells it"
+        );
+        assert_eq!(
+            updates(text, "gamma", "2.0"),
+            [("gamma".into(), "1.0".into(), "2.0".into())]
+        );
+        // What the constraint admits stays: a floor at or below, the same
+        // exact version (however it is written), and `*`.
+        assert_eq!(updates(text, "gamma", "1.0.0"), []);
+        assert_eq!(
+            updates(text, "beta", "1.2"),
+            [],
+            "a floor admits it and the exact pin is it"
+        );
+        assert_eq!(updates(text, "any", "0.1"), []);
+        assert_eq!(updates(text, "transitive", "2.0"), []);
+    }
+
+    #[test]
+    fn a_conflict_names_the_version_an_upgrade_asked_for_as_a_pin_and_manifest_lines_as_lines() {
+        let manifest = "[project]\nlabview = \">=2023\"\n\n[sources]\ndefaults = false\n\n\
+                        [dependencies]\nalpha = \"1.0\"\nbeta = \">=1.0\"\n";
+        let project = ProjectDir::new(
+            "upgrade-conflict",
+            manifest,
+            &[
+                ("alpha", "1.0", "23.0", ""),
+                ("beta", "1.0", "23.0", "alpha>=1.0"),
+            ],
+        );
+        lock(&project.env(&Recorder::default())).unwrap();
+        write_vip(
+            &project.root.join("packages/beta-2.0.vip"),
+            ("beta", "2.0", "23.0", "alpha>=2.0"),
+        );
+        write_vip(
+            &project.root.join("packages/alpha-2.0.vip"),
+            ("alpha", "2.0", "23.0", ""),
+        );
+
+        let why = upgrade(
+            &project.env(&Recorder::default()),
+            &Upgrade::Packages(vec![target("beta@2.0")]),
+        )
+        .unwrap_err();
+        let LockError::Conflict(conflict) = why else {
+            panic!("expected a conflict, got {why:?}");
+        };
+        assert!(
+            conflict.facts.contains(&Fact::Pinned {
+                package: "beta".into(),
+                version: "2.0".into()
+            }),
+            "{conflict}"
+        );
+        assert!(
+            conflict.facts.contains(&Fact::Manifest {
+                package: "alpha".into(),
+                wanted: "= 1.0".into()
+            }),
+            "{conflict}"
+        );
+        assert!(
+            conflict
+                .facts
+                .iter()
+                .all(|fact| !matches!(fact, Fact::Manifest { package, .. } if package == "beta")),
+            "beta's manifest line `>=1.0` does not conflict: {conflict}"
+        );
+    }
+
+    const PINNED_GAMMA: &str = "[project]\nlabview = \">=2023\"\n\n[sources]\ndefaults = false\n\n\
+                                [dependencies]\ngamma = \"1.0\"\n";
+
+    #[test]
+    fn a_failed_lock_write_after_the_manifest_was_written_puts_the_manifest_back() {
+        let project = ProjectDir::new("write-restore", PINNED_GAMMA, &[]);
+        let manifest_path = project.root.join(crate::project::FILE_NAME);
+        let manifest_before = std::fs::read(&manifest_path).unwrap();
+        // The lock goes in a folder that is not there, so its write fails after
+        // the manifest has been written.
+        let lock_path = project.root.join("gone").join(lockfile::FILE_NAME);
+
+        let failure = restoring_on_failure(&[&manifest_path, &lock_path], || {
+            write_manifest_and_lock(Some((&manifest_path, "[project]\n")), &lock_path, "lock")
+        })
+        .unwrap_err();
+        assert!(format!("{failure:#}").contains("writing"), "{failure:#}");
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_before);
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn an_upgrade_whose_lock_write_fails_after_the_manifest_was_rewritten_puts_both_back() {
+        let project = ProjectDir::new(
+            "upgrade-restore",
+            PINNED_GAMMA,
+            &[("gamma", "1.0", "23.0", ""), ("gamma", "1.5", "23.0", "")],
+        );
+        lock(&project.env(&Recorder::default())).unwrap();
+        let manifest_path = project.root.join(crate::project::FILE_NAME);
+        let (manifest_before, lock_before) = (
+            std::fs::read(&manifest_path).unwrap(),
+            std::fs::read(project.lock_path()).unwrap(),
+        );
+        let upgrade_gamma = Upgrade::Packages(vec![target("gamma@1.5")]);
+
+        UNWRITABLE.with(|file| *file.borrow_mut() = Some(project.lock_path()));
+        let sink = Recorder::default();
+        let why = upgrade(&project.env(&sink), &upgrade_gamma).unwrap_err();
+        UNWRITABLE.with(|file| *file.borrow_mut() = None);
+
+        assert!(matches!(why, LockError::Other(_)), "{why:?}");
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(std::fs::read(project.lock_path()).unwrap(), lock_before);
+        assert!(
+            sink.events()
+                .iter()
+                .all(|event| matches!(event, Event::LockHashing { .. })),
+            "nothing is reported as done: {:?}",
+            sink.events()
+        );
+
+        // The same upgrade, with the write able to succeed, does what the
+        // failed one would have.
+        upgrade(&project.env(&Recorder::default()), &upgrade_gamma).unwrap();
+        assert_ne!(std::fs::read(&manifest_path).unwrap(), manifest_before);
+    }
+
+    #[test]
+    fn an_upgrade_rewrites_the_manifest_to_admit_the_version_it_moves_to() {
+        let project = ProjectDir::new(
+            "upgrade-rewrite",
+            PINNED_GAMMA,
+            &[("gamma", "1.0", "23.0", ""), ("gamma", "1.5", "23.0", "")],
+        );
+        lock(&project.env(&Recorder::default())).unwrap();
+        let manifest_path = project.root.join(crate::project::FILE_NAME);
+        let manifest_before = std::fs::read(&manifest_path).unwrap();
+        let sink = Recorder::default();
+        upgrade(
+            &project.env(&sink),
+            &Upgrade::Packages(vec![target("gamma@1.5")]),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            std::str::from_utf8(&manifest_before)
+                .unwrap()
+                .replace("gamma = \"1.0\"", "gamma = \"1.5\"")
+        );
+        assert!(
+            sink.events().iter().any(|event| matches!(event,
+                Event::ManifestUpdated { name, from, to }
+                    if name == "gamma" && from == "1.0" && to == "1.5")),
+            "{:?}",
+            sink.events()
+        );
+    }
+
+    // ---- check ----
+
+    #[test]
+    fn check_passes_a_current_lock_without_any_source_and_says_nothing() {
+        let project = ProjectDir::new("check-ok", MANIFEST, &[("gamma", "1.0", "23.0", "")]);
+        lock(&project.env(&Recorder::default())).unwrap();
+        std::fs::remove_dir_all(project.root.join("packages")).unwrap();
+        std::fs::remove_dir_all(project.root.join("cache")).unwrap();
+
+        let sink = Recorder::default();
+        check(&project.env(&sink)).unwrap();
+        assert!(sink.events().is_empty(), "{:?}", sink.events());
+    }
+
+    #[test]
+    fn check_names_why_a_stale_lock_is_stale_and_changes_nothing() {
+        let project = ProjectDir::new("check-stale", MANIFEST, &[("gamma", "1.0", "23.0", "")]);
+        lock(&project.env(&Recorder::default())).unwrap();
+        let before = std::fs::read(project.lock_path()).unwrap();
+        std::fs::write(
+            project.root.join(crate::project::FILE_NAME),
+            MANIFEST.replace("gamma = \"*\"", "gamma = \"2.0\""),
+        )
+        .unwrap();
+
+        let sink = Recorder::default();
+        let why = check(&project.env(&sink)).unwrap_err();
+        assert!(
+            matches!(
+                &why,
+                LockError::Stale(StaleReason::ConstraintExcludesLocked { name, locked, .. })
+                    if name == "gamma" && locked == "1.0"
+            ),
+            "{why:?}"
+        );
+        assert!(sink.events().is_empty(), "{:?}", sink.events());
+        assert_eq!(std::fs::read(project.lock_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn check_tells_a_missing_lock_from_one_that_is_not_a_lock() {
+        let project = ProjectDir::new("check-lock", MANIFEST, &[]);
+        let sink = Recorder::default();
+        let why = check(&project.env(&sink)).unwrap_err();
+        assert!(
+            matches!(&why, LockError::NoLock { path } if *path == project.lock_path()),
+            "{why:?}"
+        );
+
+        std::fs::write(project.lock_path(), "this = is [not a lock").unwrap();
+        let why = check(&project.env(&sink)).unwrap_err();
+        assert!(
+            matches!(&why, LockError::UnreadableLock { path, reason }
+                if *path == project.lock_path() && reason.contains("lvpm.lock")),
+            "{why:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.lock_path()).unwrap(),
+            "this = is [not a lock",
+            "an unreadable lock is reported, not replaced"
+        );
+    }
+
+    #[test]
+    fn check_needs_a_project() {
+        let bare =
+            std::env::temp_dir().join(format!("lvpm-check-test-bare-{}", std::process::id()));
+        std::fs::create_dir_all(&bare).unwrap();
+        let sink = Recorder::default();
+        let env = OpEnv::new(
+            &sink,
+            Config {
+                log_dir: Default::default(),
+                venv_title: Default::default(),
+                cache: bare.join("cache"),
+                hooks_run: Vec::new(),
+                local_sources: Vec::new(),
+                venv_dir: PathBuf::from(".lv-venv"),
+            },
+            Vec::new(),
+            bare.clone(),
+        );
+        assert!(
+            matches!(check(&env), Err(LockError::NoManifest { searched_from }) if searched_from == bare)
+        );
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn a_cancelled_token_stops_locking_before_anything_is_written() {
+        let project = ProjectDir::new("cancel", MANIFEST, &[("gamma", "1.0", "23.0", "")]);
+        let sink = Recorder::default();
+        let env = project.env(&sink);
+        env.cancel.cancel();
+        assert!(matches!(lock(&env), Err(LockError::Cancelled)));
+        assert!(!project.lock_path().exists());
+    }
+
+    #[test]
+    fn a_cancel_before_a_feed_is_asked_is_a_cancelled_lock_and_asks_no_feed() {
+        let manifest = "[project]\nlabview = \">=2023\"\n\n[sources]\ndefaults = false\n\
+                        dead = \"http://127.0.0.1:1/feed\"\n\n[dependencies]\ngamma = \"*\"\n";
+        let project = ProjectDir::new("cancel-feed", manifest, &[]);
+        let sink = Recorder::default();
+        let env = project.env(&sink);
+        env.cancel.cancel();
+        assert!(matches!(lock(&env), Err(LockError::Cancelled)));
+        assert!(sink.events().is_empty(), "{:?}", sink.events());
+        assert!(!project.lock_path().exists());
+    }
+
+    /// What the solver and the archives are done with: the last event before
+    /// the files are written, when an operation reports a requirement no
+    /// source lists.
+    const NEEDS_A_MISSING_LIBRARY: &str = "ni_lib_missing>=1.0";
+
+    fn cancelled_when_the_lock_is_made(
+        project: &ProjectDir,
+        run: impl FnOnce(&OpEnv) -> Result<Lockfile, LockError>,
+    ) -> Result<Lockfile, LockError> {
+        let token = crate::cancel::CancelToken::new();
+        let sink = CancelOn::new(&token, |event| {
+            matches!(event, Event::RequirementUnresolved { .. })
+        });
+        let mut env = project.env(&sink);
+        env.cancel = token;
+        let result = run(&env);
+        assert_eq!(sink.answered(), Some(true), "the cancel was not accepted");
+        result
+    }
+
+    #[test]
+    fn a_cancel_accepted_once_the_lock_is_made_stops_locking_before_it_is_written() {
+        let project = ProjectDir::new(
+            "cancel-late",
+            MANIFEST,
+            &[("gamma", "1.0", "23.0", NEEDS_A_MISSING_LIBRARY)],
+        );
+        let result = cancelled_when_the_lock_is_made(&project, lock);
+        assert!(matches!(result, Err(LockError::Cancelled)), "{result:?}");
+        assert!(!project.lock_path().exists());
+    }
+
+    #[test]
+    fn a_cancel_accepted_once_the_lock_is_made_stops_an_upgrade_before_anything_is_written() {
+        let project = ProjectDir::new(
+            "upgrade-cancel-late",
+            MANIFEST,
+            &[("gamma", "1.0", "23.0", NEEDS_A_MISSING_LIBRARY)],
+        );
+        lock(&project.env(&Recorder::default())).unwrap();
+        write_vip(
+            &project.root.join("packages/gamma-1.5.vip"),
+            ("gamma", "1.5", "23.0", NEEDS_A_MISSING_LIBRARY),
+        );
+        let before = std::fs::read(project.lock_path()).unwrap();
+
+        let result =
+            cancelled_when_the_lock_is_made(&project, |env| upgrade(env, &Upgrade::Everything));
+        assert!(matches!(result, Err(LockError::Cancelled)), "{result:?}");
+        assert_eq!(std::fs::read(project.lock_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn a_manifest_with_no_dependencies_locks_to_an_empty_lock() {
+        let project = ProjectDir::new(
+            "empty",
+            "[project]\nlabview = \">=2023\"\n\n[sources]\ndefaults = false\n",
+            &[],
+        );
+        let sink = Recorder::default();
+        let lock = lock(&project.env(&sink)).unwrap();
+        assert!(lock.packages.is_empty());
+        assert!(project.lock_path().is_file());
+        assert!(
+            !project.root.join("cache/content").exists(),
+            "nothing was fetched"
+        );
+    }
+
+    // ---- attestations: a GitHub release is asked, nothing else is ----
+
+    /// The attestation pass, with a fake of GitHub's attestations API (a socket
+    /// on this machine) and a fake gh, over archives that are local files:
+    /// every package `x` is of the repo `o/x`.
+    mod attestations {
+        use super::*;
+        use crate::errors::AttestationRefusal;
+        use crate::events::PackageRef;
+        use crate::github::gh::{GhRun, Runner};
+        use crate::github::{GitHub, GitHubAuth};
+        use crate::verify::{Invalid, NotChecked, Refusal};
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        /// What the attestations API answers: a status line and a body.
+        type Answer = (&'static str, &'static str);
+        const NONE: Answer = ("404 Not Found", "{}");
+        const ONE: Answer = ("200 OK", r#"{"attestations":[{"bundle":{}}]}"#);
+
+        /// What gh says of the archive of a repo.
+        #[derive(Clone)]
+        enum Gh {
+            /// It verifies, built by this repository.
+            Attests(&'static str),
+            /// It exits 1 and says this.
+            Fails(&'static str),
+            /// It cannot be run, for this reason.
+            Absent(NotChecked),
+        }
+
+        const HEAD: &str = "[project]\nlabview = \">=2023\"\n\n[sources]\ndefaults = false\n\n";
+        const REQUIRE: &str = "[policy]\nrequire-signature = true\n";
+        const TRUST_A: &str = "[policy]\ntrusted-publishers = [\"https://github.com/a/*\"]\n";
+
+        /// The bytes of package `name`'s archive.
+        fn archive(name: &str) -> Vec<u8> {
+            format!("{name} archive").into_bytes()
+        }
+
+        /// A fake attestations API answering by `owner/repo` and logging the
+        /// paths asked; a repo it is not told about gets `NONE`.
+        fn serve(answers: Vec<(&'static str, Answer)>) -> (String, Arc<Mutex<Vec<String>>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let api = format!("http://{}", listener.local_addr().unwrap());
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let log = asked.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut head = Vec::new();
+                    let mut byte = [0];
+                    while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head);
+                    let path = head.split_whitespace().nth(1).unwrap_or_default();
+                    let (status, body) = answers
+                        .iter()
+                        .find(|(repo, _)| path.starts_with(&format!("/repos/{repo}/")))
+                        .map_or(NONE, |(_, answer)| *answer);
+                    log.lock().unwrap().push(path.to_string());
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(reply.as_bytes()).ok();
+                }
+            });
+            (api, asked)
+        }
+
+        /// What gh prints for the archive of package `name` when `by` built it.
+        fn verified(name: &str, by: &str) -> GhRun {
+            let subject = format!("https://github.com/{by}");
+            GhRun::Spawned {
+                status: Some(0),
+                stdout: serde_json::json!([{"verificationResult": {
+                    "signature": {"certificate": {
+                        "subjectAlternativeName": signer_of_repo(by),
+                        "sourceRepositoryURI": subject,
+                    }},
+                    "statement": {"subject": [{"digest": {"sha256": sha256_hex(&archive(name))}}]},
+                }}])
+                .to_string()
+                .into_bytes(),
+                stderr: Vec::new(),
+            }
+        }
+
+        /// The workflow of `repo` that signs its releases.
+        fn signer_of_repo(repo: &str) -> String {
+            format!("https://github.com/{repo}/.github/workflows/release.yml@refs/tags/v1.0.0")
+        }
+
+        /// A fake gh answering by `owner/repo` and logging the repos it ran for.
+        fn gh(says: Vec<(&'static str, Gh)>) -> (Runner, Arc<Mutex<Vec<String>>>) {
+            let ran = Arc::new(Mutex::new(Vec::new()));
+            let log = ran.clone();
+            let runner: Runner = Arc::new(move |ask| {
+                let repo = ask.repo;
+                log.lock().unwrap().push(repo.to_string());
+                let name = repo.strip_prefix("o/").unwrap_or(repo);
+                match says
+                    .iter()
+                    .find(|(of, _)| *of == repo)
+                    .map(|(_, says)| says)
+                {
+                    Some(Gh::Attests(by)) => verified(name, by),
+                    Some(Gh::Fails(stderr)) => GhRun::Spawned {
+                        status: Some(1),
+                        stdout: Vec::new(),
+                        stderr: stderr.as_bytes().to_vec(),
+                    },
+                    Some(Gh::Absent(reason)) => GhRun::NotRunnable(reason.clone()),
+                    None => panic!("gh was not expected to run for {repo}"),
+                }
+            });
+            (runner, ran)
+        }
+
+        /// The environment of `project` with the fakes: a GitHub token is held.
+        fn env_of<'a>(
+            project: &ProjectDir,
+            sink: &'a dyn EventSink,
+            api: String,
+            runner: Runner,
+        ) -> OpEnv<'a> {
+            let mut env = project.env(sink);
+            env.github = GitHub {
+                api,
+                auth: GitHubAuth::new(|name| (name == "GH_TOKEN").then(|| "tok".into()), || None),
+                runner,
+            };
+            env
+        }
+
+        /// A GitHub package `name` 1.0.0 whose archive is a local file.
+        fn github_entry(project: &ProjectDir, name: &str) -> Entry {
+            let file = project.root.join(format!("{name}.lvpkg"));
+            std::fs::write(&file, archive(name)).unwrap();
+            let mut github = entry(name, "1.0.0", &[], &file.to_string_lossy());
+            github.source = index::github_source(&format!("o/{name}"));
+            github
+        }
+
+        /// One locking of `names` under `policy` (the manifest's `[policy]`
+        /// table, or none), the packages being `entries`.
+        struct Locking<'a> {
+            names: &'a [&'a str],
+            policy: &'a str,
+            previous: Option<&'a Lockfile>,
+            api: Vec<(&'static str, Answer)>,
+            gh: Vec<(&'static str, Gh)>,
+        }
+
+        /// What a locking did.
+        struct Done {
+            result: Result<Relocked, LockError>,
+            /// The paths the attestations API was asked.
+            asked: Vec<String>,
+            /// The repos gh was run for.
+            ran: Vec<String>,
+            events: Vec<Event>,
+        }
+
+        impl Locking<'_> {
+            fn run(self, project: &ProjectDir) -> Done {
+                let deps: String = (self.names.iter())
+                    .map(|name| format!("{name} = \"*\"\n"))
+                    .collect();
+                let manifest = format!("{HEAD}[dependencies]\n{deps}\n{}", self.policy);
+                std::fs::write(project.root.join(crate::project::FILE_NAME), manifest).unwrap();
+                let entries = (self.names.iter())
+                    .map(|name| github_entry(project, name))
+                    .collect();
+                let (api, asked) = serve(self.api);
+                let (runner, ran) = gh(self.gh);
+                let sink = Recorder::default();
+                let env = env_of(project, &sink, api, runner);
+                let found = find_manifest(&env).unwrap();
+                let result = relock_with(&env, &found.1, &Index { entries }, self.previous);
+                let (asked, ran) = (asked.lock().unwrap().clone(), ran.lock().unwrap().clone());
+                Done {
+                    result,
+                    asked,
+                    ran,
+                    events: sink.events(),
+                }
+            }
+        }
+
+        impl Done {
+            fn lock(&self) -> &Lockfile {
+                &self.result.as_ref().expect("the lock was made").0
+            }
+
+            /// The refusals, as (package, kind).
+            fn refused(&self) -> Vec<(String, Refusal)> {
+                match &self.result {
+                    Err(LockError::Refused { refusals, .. }) => refusals
+                        .iter()
+                        .map(|refusal| (refusal.name.clone(), refusal.kind.clone()))
+                        .collect(),
+                    other => panic!("not refused: {:?}", other.as_ref().map(|_| ())),
+                }
+            }
+
+            /// What the lock has as the signer and the subject of `name`.
+            fn signer_of(&self, name: &str) -> Option<(String, String)> {
+                let package = (self.lock().packages.iter())
+                    .find(|package| package.name == name)
+                    .unwrap();
+                package.signer.clone().zip(package.subject.clone())
+            }
+
+            fn checked(&self) -> bool {
+                (self.events.iter()).any(|event| matches!(event, Event::AttestationChecking { .. }))
+            }
+        }
+
+        fn project(tag: &str) -> ProjectDir {
+            ProjectDir::new(&format!("attest-{tag}"), MANIFEST, &[])
+        }
+
+        /// The signer and the subject the lock has for a release built by `repo`.
+        fn signed_by(repo: &str) -> Option<(String, String)> {
+            Some((signer_of_repo(repo), format!("https://github.com/{repo}")))
+        }
+
+        #[test]
+        fn an_attested_releases_signer_reaches_the_lock() {
+            let project = project("signed");
+            let done = Locking {
+                names: &["p"],
+                policy: "",
+                previous: None,
+                api: vec![("o/p", ONE)],
+                gh: vec![("o/p", Gh::Attests("a/x"))],
+            }
+            .run(&project);
+            assert_eq!(done.signer_of("p"), signed_by("a/x"));
+            assert_eq!(done.ran, ["o/p"]);
+            assert!(
+                done.events.contains(&Event::AttestationChecking {
+                    name: "p".into(),
+                    version: "1.0.0".into()
+                }),
+                "{:?}",
+                done.events
+            );
+            assert!(
+                done.result.unwrap().2.is_empty(),
+                "nothing is left unchecked"
+            );
+        }
+
+        #[test]
+        fn every_refused_package_is_reported_and_nothing_is_written() {
+            let project = project("refused");
+            let done = Locking {
+                names: &["p", "q"],
+                policy: REQUIRE,
+                previous: None,
+                api: vec![],
+                gh: vec![],
+            }
+            .run(&project);
+            assert_eq!(
+                done.refused(),
+                [
+                    ("p".to_string(), Refusal::NoAttestation),
+                    ("q".to_string(), Refusal::NoAttestation)
+                ]
+            );
+            assert!(done.ran.is_empty(), "gh runs only for what the API found");
+            assert!(!project.lock_path().exists(), "relocking writes no lock");
+        }
+
+        #[test]
+        fn a_forged_attestation_is_refused_with_no_policy() {
+            let project = project("forged");
+            let done = Locking {
+                names: &["p"],
+                policy: "",
+                previous: None,
+                api: vec![("o/p", ONE)],
+                gh: vec![("o/p", Gh::Fails("verification failed"))],
+            }
+            .run(&project);
+            assert_eq!(
+                done.refused(),
+                [(
+                    "p".to_string(),
+                    Refusal::DoesNotVerify {
+                        cause: Invalid::Rejected {
+                            stderr: "verification failed".into()
+                        }
+                    }
+                )]
+            );
+            assert!(!project.lock_path().exists());
+        }
+
+        #[test]
+        fn an_untrusted_publisher_is_refused_and_a_trusted_one_locks() {
+            let project = project("trust");
+            let api = vec![("o/p", ONE), ("o/q", ONE)];
+            let says = vec![("o/p", Gh::Attests("b/x")), ("o/q", Gh::Attests("a/q"))];
+            let both = Locking {
+                names: &["p", "q"],
+                policy: TRUST_A,
+                previous: None,
+                api: api.clone(),
+                gh: says.clone(),
+            }
+            .run(&project);
+            let Err(LockError::Refused {
+                refusals,
+                trusted_publishers,
+            }) = &both.result
+            else {
+                panic!("p is refused");
+            };
+            assert_eq!(trusted_publishers, &["https://github.com/a/*"]);
+            assert_eq!(
+                *refusals,
+                [AttestationRefusal {
+                    name: "p".into(),
+                    version: "1.0.0".into(),
+                    origin: crate::errors::Origin::GitHub { repo: "o/p".into() },
+                    kind: Refusal::UntrustedPublisher {
+                        subject: "https://github.com/b/x".into(),
+                        signer: signer_of_repo("b/x"),
+                    }
+                }]
+            );
+
+            let only_q = Locking {
+                names: &["q"],
+                policy: TRUST_A,
+                previous: None,
+                api,
+                gh: says,
+            }
+            .run(&project);
+            assert_eq!(only_q.signer_of("q"), signed_by("a/q"));
+        }
+
+        #[test]
+        fn without_gh_and_without_a_policy_the_lock_is_made_and_the_warning_follows_it_being_written()
+         {
+            let project = project("no-gh");
+            let done = Locking {
+                names: &["p"],
+                policy: "",
+                previous: None,
+                api: vec![("o/p", ONE)],
+                gh: vec![("o/p", Gh::Absent(NotChecked::GhMissing))],
+            }
+            .run(&project);
+            assert_eq!(done.signer_of("p"), None);
+            let (lock, changes, after) = done.result.unwrap();
+            assert_eq!(
+                after,
+                [Event::AttestationsNotChecked {
+                    packages: vec![PackageRef {
+                        name: "p".into(),
+                        version: "1.0.0".into()
+                    }],
+                    reason: NotChecked::GhMissing
+                }]
+            );
+
+            let sink = Recorder::default();
+            let env = project.env(&sink);
+            announce_written(&env, project.lock_path(), &lock, changes, after);
+            let events = sink.events();
+            assert!(
+                matches!(
+                    &events[..],
+                    [
+                        Event::LockChanged { .. },
+                        Event::LockWritten { .. },
+                        Event::AttestationsNotChecked { .. }
+                    ]
+                ),
+                "{events:?}"
+            );
+        }
+
+        #[test]
+        fn unchecked_packages_are_grouped_by_reason_in_the_order_met() {
+            let project = project("grouped");
+            let done = Locking {
+                names: &["p", "q", "r"],
+                policy: "",
+                previous: None,
+                api: vec![("o/p", ONE), ("o/q", ONE), ("o/r", ONE)],
+                gh: vec![
+                    ("o/p", Gh::Absent(NotChecked::GhMissing)),
+                    ("o/q", Gh::Absent(NotChecked::GhTimedOut)),
+                    ("o/r", Gh::Absent(NotChecked::GhMissing)),
+                ],
+            }
+            .run(&project);
+            let named = |names: &[&str], reason| Event::AttestationsNotChecked {
+                packages: (names.iter())
+                    .map(|name| PackageRef {
+                        name: name.to_string(),
+                        version: "1.0.0".to_string(),
+                    })
+                    .collect(),
+                reason,
+            };
+            assert_eq!(
+                done.result.unwrap().2,
+                [
+                    named(&["p", "r"], NotChecked::GhMissing),
+                    named(&["q"], NotChecked::GhTimedOut)
+                ]
+            );
+        }
+
+        #[test]
+        fn packages_that_are_not_from_github_are_never_checked() {
+            for (kind, source) in [
+                ("feed", "http://127.0.0.1:1/index.vipr"),
+                ("local", "C:/packages"),
+                ("vipm", "https://vipm.io/index.json"),
+            ] {
+                let project = project(&format!("not-github-{kind}"));
+                let file = project.root.join("p.vip");
+                std::fs::write(&file, archive("p")).unwrap();
+                let mut elsewhere = entry("p", "1.0.0", &[], &file.to_string_lossy());
+                elsewhere.source = source.to_string();
+                let manifest = format!("{HEAD}[dependencies]\np = \"*\"\n\n{REQUIRE}");
+                std::fs::write(project.root.join(crate::project::FILE_NAME), manifest).unwrap();
+
+                let (api, asked) = serve(vec![]);
+                let (runner, ran) = gh(vec![]);
+                let sink = Recorder::default();
+                let env = env_of(&project, &sink, api, runner);
+                let found = find_manifest(&env).unwrap();
+                let index = Index {
+                    entries: vec![elsewhere],
+                };
+                let (lock, _, after) = relock_with(&env, &found.1, &index, None).unwrap();
+
+                assert_eq!(lock.packages.len(), 1, "{kind}");
+                assert_eq!(lock.packages[0].signer, None, "{kind}");
+                assert!(after.is_empty(), "{kind}");
+                assert!(
+                    asked.lock().unwrap().is_empty(),
+                    "{kind}: the API was asked"
+                );
+                assert!(ran.lock().unwrap().is_empty(), "{kind}: gh was run");
+                let events = sink.events();
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, Event::AttestationChecking { .. })),
+                    "{kind}: {events:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_kept_package_keeps_its_signer_and_is_decided_again_with_no_new_call() {
+            let project = project("kept");
+            let first = Locking {
+                names: &["p"],
+                policy: "",
+                previous: None,
+                api: vec![("o/p", ONE)],
+                gh: vec![("o/p", Gh::Attests("b/x"))],
+            }
+            .run(&project);
+            let held = first.lock().clone();
+            assert_eq!(first.signer_of("p"), signed_by("b/x"));
+
+            let same_policy = Locking {
+                names: &["p"],
+                policy: "",
+                previous: Some(&held),
+                api: vec![],
+                gh: vec![],
+            }
+            .run(&project);
+            assert_eq!(same_policy.signer_of("p"), signed_by("b/x"));
+
+            let stricter = Locking {
+                names: &["p"],
+                policy: TRUST_A,
+                previous: Some(&held),
+                api: vec![],
+                gh: vec![],
+            }
+            .run(&project);
+            assert_eq!(
+                stricter.refused(),
+                [(
+                    "p".to_string(),
+                    Refusal::UntrustedPublisher {
+                        subject: "https://github.com/b/x".into(),
+                        signer: signer_of_repo("b/x"),
+                    }
+                )]
+            );
+            for done in [&same_policy, &stricter] {
+                assert!(done.asked.is_empty(), "{:?}", done.asked);
+                assert!(done.ran.is_empty(), "{:?}", done.ran);
+                assert!(!done.checked(), "{:?}", done.events);
+            }
+        }
+
+        #[test]
+        fn a_kept_package_without_a_signer_is_checked_again_only_when_the_policy_requires_it() {
+            for (tag, answer, policy, locked, asked) in [
+                ("none", NONE, REQUIRE, Err(Refusal::NoAttestation), 1),
+                ("one", ONE, REQUIRE, Ok(signed_by("a/x")), 1),
+                ("off", NONE, "", Ok(None), 0),
+            ] {
+                let project = project(&format!("kept-unsigned-{tag}"));
+                let unsigned = Locking {
+                    names: &["p"],
+                    policy: "",
+                    previous: None,
+                    api: vec![],
+                    gh: vec![],
+                }
+                .run(&project);
+                let held = unsigned.lock().clone();
+                assert_eq!(unsigned.signer_of("p"), None);
+
+                let again = Locking {
+                    names: &["p"],
+                    policy,
+                    previous: Some(&held),
+                    api: vec![("o/p", answer)],
+                    gh: vec![("o/p", Gh::Attests("a/x"))],
+                }
+                .run(&project);
+                match locked {
+                    Err(refusal) => assert_eq!(again.refused(), [("p".to_string(), refusal)]),
+                    Ok(signer) => assert_eq!(again.signer_of("p"), signer, "{tag}"),
+                }
+                assert_eq!(again.asked.len(), asked, "{tag}: {:?}", again.asked);
+            }
+        }
+    }
+
+    // ---- source pins ----
+
+    const FIRST_FEED: &str = "http://first.example/index.vipr";
+    const SECOND_FEED: &str = "http://second.example/index.vipr";
+
+    /// A manifest with sources `first` and `second` and `deps` under
+    /// `[dependencies]`.
+    fn with_sources(deps: &str) -> String {
+        format!(
+            "[project]\nlabview = \">=2023\"\n\n[sources]\nfirst = \"http://first.example/\"\n\
+             second = \"http://second.example\"\ndefaults = false\n\n[dependencies]\n{deps}\n"
+        )
+    }
+
+    /// What the loader leaves of the feeds after a source pin: each of
+    /// `listed` is (name, version, feed URL).
+    fn resolve_listed(
+        tag: &str,
+        deps: &str,
+        listed: &[(&str, &str, &str)],
+    ) -> Result<Resolution, LockError> {
+        let entries = listed
+            .iter()
+            .map(|(name, version, feed)| Entry {
+                source: feed.to_string(),
+                ..entry(name, version, &[], "x.vip")
+            })
+            .collect();
+        resolve_entries(tag, &with_sources(deps), entries)
+    }
+
+    /// `entries` as the index of the project `text` is.
+    fn resolve_entries(
+        tag: &str,
+        text: &str,
+        entries: Vec<Entry>,
+    ) -> Result<Resolution, LockError> {
+        let dir = ProjectDir::new(tag, text, &[]);
+        let sink = Recorder::default();
+        let env = dir.env(&sink);
+        let (project, index) = (manifest(text), Index { entries });
+        resolve(&env, &project, &index, &[], &[], &Moving::Nothing, 24.0)
+    }
+
+    #[test]
+    fn a_pinned_package_its_source_does_not_list_is_named_with_the_source_and_the_feed() {
+        let why = resolve_listed(
+            "pin-unlisted",
+            "Alpha = { version = \"*\", index = \"second\" }",
+            &[("gamma", "1.0", SECOND_FEED)],
+        )
+        .unwrap_err();
+        let LockError::PinnedNotListed {
+            package,
+            source_name,
+            feed,
+        } = &why
+        else {
+            panic!("expected PinnedNotListed, got {why:?}");
+        };
+        assert_eq!(
+            (package.as_str(), source_name.as_str()),
+            ("Alpha", "second")
+        );
+        assert_eq!(feed, SECOND_FEED);
+        assert_eq!(
+            why.to_string(),
+            format!(
+                "Alpha is pinned to \"second\" ({SECOND_FEED}), which does not list it; \
+                 other sources are ignored for a pinned package"
+            )
+        );
+    }
+
+    /// The `NoVersion` lines of the conflict `deps` run into.
+    fn no_version_lines(tag: &str, deps: &str, listed: &[(&str, &str, &str)]) -> Vec<String> {
+        let LockError::Conflict(conflict) = resolve_listed(tag, deps, listed).unwrap_err() else {
+            panic!("expected a conflict");
+        };
+        let no_version = |fact: &&Fact| matches!(fact, Fact::NoVersion { .. });
+        let facts = conflict.facts.iter().filter(no_version);
+        facts.map(Fact::to_string).collect()
+    }
+
+    #[test]
+    fn a_pinned_package_with_no_fitting_version_names_its_source_and_says_no_other_was_asked() {
+        let lines = no_version_lines(
+            "pin-no-fit",
+            "alpha = { version = \">=2.0\", index = \"second\" }",
+            &[("alpha", "1.0", SECOND_FEED)],
+        );
+        assert_eq!(
+            lines,
+            [format!(
+                "no version of alpha >= 2.0 is available from \"second\" ({SECOND_FEED}), its \
+                 pinned source; other sources are ignored for a pinned package"
+            )]
+        );
+    }
+
+    /// The lines of the conflict `entries` run into under the project `text`.
+    fn pinned_failure(tag: &str, text: &str, entries: Vec<Entry>) -> Vec<String> {
+        let LockError::Conflict(conflict) = resolve_entries(tag, text, entries).unwrap_err() else {
+            panic!("expected a conflict");
+        };
+        conflict.facts.iter().map(Fact::to_string).collect()
+    }
+
+    /// An entry of `alpha`, listed by the `second` source.
+    fn alpha(version: &str) -> Entry {
+        Entry {
+            source: SECOND_FEED.to_string(),
+            ..entry("alpha", version, &[], "x.vip")
+        }
+    }
+
+    /// `entry` released `days` days ago.
+    fn released_days_ago(entry: Entry, days: i64) -> Entry {
+        Entry {
+            released: Some(now() - days * released::SECS_PER_DAY),
+            ..entry
+        }
+    }
+
+    const ALPHA_PINNED: &str = "alpha = { version = \"*\", index = \"second\" }";
+    const ALPHA_IS_PINNED: &str = concat!(
+        "alpha is pinned to \"second\" (http://second.example/index.vipr); ",
+        "other sources are ignored for a pinned package"
+    );
+
+    fn with_min_age(deps: &str) -> String {
+        with_sources(deps).replace(
+            "false
+",
+            "false
+min-age-days = 14
+",
+        )
+    }
+
+    #[test]
+    fn a_pinned_package_a_newer_labview_gates_names_its_source_and_says_no_other_was_asked() {
+        let gated = Entry {
+            lv_min: Some(26.0),
+            ..alpha("2.0")
+        };
+        let lines = pinned_failure("pin-gate", &with_sources(ALPHA_PINNED), vec![gated]);
+        assert!(lines.iter().any(|line| line.contains("needs LabVIEW 2026")));
+        assert_eq!(lines.last().unwrap(), ALPHA_IS_PINNED, "{lines:#?}");
+    }
+
+    #[test]
+    fn a_pinned_package_the_age_limit_holds_back_names_its_source_and_says_no_other_was_asked() {
+        let young = released_days_ago(alpha("1.0"), 3);
+        let lines = pinned_failure("pin-all-held", &with_min_age(ALPHA_PINNED), vec![young]);
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(
+            lines[0].contains("held back by min-age-days = 14"),
+            "{lines:#?}"
+        );
+        assert_eq!(lines[1], ALPHA_IS_PINNED);
+    }
+
+    #[test]
+    fn a_pinned_package_one_version_of_which_is_held_back_names_its_source_once() {
+        // alpha 1.1 is too new; alpha 1.0 needs gamma >= 2.0, which the manifest rules out.
+        let text = with_min_age(&format!(
+            "{ALPHA_PINNED}
+gamma = \"1.0\""
+        ));
+        let mut old = alpha("1.0");
+        old.requires.push(Requirement {
+            name: "gamma".into(),
+            min: Some(Version::parse("2.0")),
+            min_exclusive: false,
+        });
+        let gamma = entry("gamma", "1.0", &[], "x.vip");
+        let entries = vec![
+            released_days_ago(alpha("1.1"), 3),
+            released_days_ago(old, 30),
+            released_days_ago(gamma, 30),
+        ];
+        let lines = pinned_failure("pin-one-held", &text, entries);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("alpha 1.1 is held back")),
+            "{lines:#?}"
+        );
+        assert_eq!(lines.iter().filter(|l| *l == ALPHA_IS_PINNED).count(), 1);
+        assert_eq!(lines.last().unwrap(), ALPHA_IS_PINNED);
+    }
+
+    #[test]
+    fn a_package_that_is_not_pinned_keeps_the_plain_no_version_text() {
+        let lines = no_version_lines(
+            "pin-other",
+            "alpha = { version = \"*\", index = \"second\" }\nbeta = \">=2.0\"",
+            &[("alpha", "1.0", SECOND_FEED), ("beta", "1.0", FIRST_FEED)],
+        );
+        assert_eq!(
+            lines,
+            [format!(
+                "no version of beta >= 2.0 is available from {FIRST_FEED}"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_pinned_package_its_source_lists_resolves() {
+        let resolution = resolve_listed(
+            "pin-listed",
+            "alpha = { version = \"*\", index = \"second\" }",
+            &[("alpha", "1.0", SECOND_FEED)],
+        )
+        .unwrap();
+        assert_eq!(resolution.packages["alpha"].version, Version::parse("1.0"));
+    }
+
+    #[test]
+    fn a_package_in_no_source_gets_a_note_for_each_oci_source_and_nothing_else_does() {
+        let text = concat!(
+            "[project]\nlabview = \">=2023\"\n\n",
+            "[sources]\nteam = \"oci://r:5000/org\"\nmirror = \"http://m.example/\"\n",
+            "defaults = false\n\n[dependencies]\nalpha = \"*\"\n"
+        );
+        let project = manifest(text);
+        let unlisted = Conflict {
+            facts: vec![Fact::NotListed {
+                package: "alpha".into(),
+            }],
+        };
+        let noted = note_oci_sources(unlisted.clone(), &project);
+        assert_eq!(
+            noted.facts[1..],
+            [Fact::OciExplicit {
+                source: "team".into()
+            }]
+        );
+        let other = Conflict {
+            facts: vec![Fact::Manifest {
+                package: "alpha".into(),
+                wanted: "*".into(),
+            }],
+        };
+        assert_eq!(note_oci_sources(other.clone(), &project), other);
+    }
+
+    #[test]
+    fn a_package_in_no_source_gets_a_note_for_each_community_index_and_nothing_else_does() {
+        let text = concat!(
+            "[project]\nlabview = \">=2023\"\n\n",
+            "[sources]\ncommunity = \"github:o/idx\"\nteam = \"oci://r:5000/org\"\n",
+            "mirror = \"http://m.example/\"\ndefaults = false\n\n",
+            "[dependencies]\nalpha = \"*\"\n"
+        );
+        let project = manifest(text);
+        let unlisted = Conflict {
+            facts: vec![Fact::NotListed {
+                package: "alpha".into(),
+            }],
+        };
+        let noted = note_index_sources(unlisted.clone(), &project);
+        assert_eq!(
+            noted.facts[1..],
+            [Fact::IndexSearched {
+                repo: "o/idx".into()
+            }]
+        );
+        let other = Conflict {
+            facts: vec![Fact::Manifest {
+                package: "alpha".into(),
+                wanted: "*".into(),
+            }],
+        };
+        assert_eq!(note_index_sources(other.clone(), &project), other);
+    }
+
+    #[test]
+    fn a_source_pin_naming_no_source_is_an_error_not_a_pin_left_out() {
+        let text = with_sources("alpha = \"*\"");
+        let mut project = manifest(&text);
+        project
+            .source_pins
+            .insert("alpha".to_string(), "nope".to_string());
+        let why = source_pins(&project).err().unwrap();
+        assert_eq!(
+            why.to_string(),
+            "alpha: index = \"nope\" is not a [sources] name"
+        );
+    }
+
+    /// `alpha` 1.0 as the pinned feed `second` lists it, in a file of its own,
+    /// and `previous` locking another copy of it, from `locked_from` with
+    /// `locked_md5`, whose bytes the cache holds. The listed entry is a local
+    /// file, so this run records it as [`LOCAL_SOURCE`] with no MD5. The
+    /// SHA-256 the lock keeps for it, and the SHA-256 of each copy: (kept,
+    /// the pinned feed's, the other one's).
+    fn hash_alpha_pinned_to_second(
+        tag: &str,
+        locked_from: &str,
+        locked_md5: Option<&str>,
+    ) -> (String, String, String) {
+        let text = with_sources(ALPHA_PINNED);
+        let dir = ProjectDir::new(tag, &text, &[]);
+        let (decoy, listed) = (dir.root.join("decoy.vip"), dir.root.join("listed.vip"));
+        write_vip(&decoy, ("alpha", "1.0", "20.0", ""));
+        write_vip(&listed, ("alpha", "1.0", "21.0", ""));
+        let (decoy_bytes, listed_bytes) = (
+            std::fs::read(&decoy).unwrap(),
+            std::fs::read(&listed).unwrap(),
+        );
+        let sink = Recorder::default();
+        let env = dir.env(&sink);
+        let decoy_sha = Downloads::open(&env).unwrap().keep(&decoy_bytes).unwrap();
+        let previous = Lockfile {
+            packages: vec![LockedPackage {
+                sha256: decoy_sha.clone(),
+                source: locked_from.to_string(),
+                md5: locked_md5.map(str::to_string),
+                ..lock_of(&[("alpha", "1.0")]).packages.remove(0)
+            }],
+            ..lock_of(&[])
+        };
+        let pinned = Entry {
+            source: SECOND_FEED.to_string(),
+            ..entry("alpha", "1.0", &[], listed.to_str().unwrap())
+        };
+        let resolution = resolution(vec![pinned], Vec::new());
+        let project = manifest(&text);
+        let kept = hash_archives(
+            &env,
+            &Index {
+                entries: Vec::new(),
+            },
+            &resolution,
+            Some(&previous),
+            &Moving::Nothing,
+            &source_pins(&project).unwrap(),
+            &[],
+        )
+        .unwrap()
+        .remove("alpha")
+        .unwrap();
+        (kept, sha256_hex(&listed_bytes), decoy_sha)
+    }
+
+    #[test]
+    fn a_package_locked_from_another_feed_is_fetched_again_once_pinned_to_this_one() {
+        let (kept, listed, decoy) = hash_alpha_pinned_to_second("pin-decoy", FIRST_FEED, None);
+        assert_ne!(listed, decoy);
+        assert_eq!(
+            kept, listed,
+            "the pinned feed's bytes, not the cached decoy"
+        );
+    }
+
+    #[test]
+    fn a_package_locked_from_the_feed_it_is_pinned_to_keeps_its_sha256() {
+        let (kept, listed, decoy) = hash_alpha_pinned_to_second("pin-kept", LOCAL_SOURCE, None);
+        assert_ne!(kept, listed);
+        assert_eq!(kept, decoy);
+    }
+
+    #[test]
+    fn a_pinned_package_its_feed_relisted_with_another_md5_keeps_its_sha256() {
+        let (kept, listed, decoy) =
+            hash_alpha_pinned_to_second("pin-md5", LOCAL_SOURCE, Some("0123abcd"));
+        assert_ne!(
+            kept, listed,
+            "other bytes under a locked version are never a new pin"
+        );
+        assert_eq!(kept, decoy);
+    }
+
+    #[test]
+    fn a_pinned_failure_carries_the_feed_and_the_source_name_as_data() {
+        let conflict = |entries: Vec<Entry>| {
+            let why = resolve_entries("pin-typed", &with_sources(ALPHA_PINNED), entries);
+            let Err(LockError::Conflict(conflict)) = why else {
+                panic!("expected a conflict");
+            };
+            conflict
+        };
+        let no_fit = conflict(vec![Entry {
+            lv_min: Some(26.0),
+            ..alpha("2.0")
+        }]);
+        assert!(
+            no_fit.facts.contains(&Fact::SourcePinned {
+                package: "alpha".into(),
+                source: "second".into(),
+                feed: SECOND_FEED.into(),
+            }),
+            "{:?}",
+            no_fit.facts
+        );
+        let text = with_sources("alpha = { version = \">=2.0\", index = \"second\" }");
+        let Err(LockError::Conflict(no_version)) =
+            resolve_entries("pin-typed-2", &text, vec![alpha("1.0")])
+        else {
+            panic!("expected a conflict");
+        };
+        assert!(
+            no_version.facts.contains(&Fact::NoVersion {
+                package: "alpha".into(),
+                wanted: ">= 2.0".into(),
+                from: SECOND_FEED.into(),
+                pinned: Some("second".into()),
+            }),
+            "{:?}",
+            no_version.facts
+        );
+    }
+}

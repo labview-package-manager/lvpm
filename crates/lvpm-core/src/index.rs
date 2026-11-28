@@ -1,0 +1,2545 @@
+//! Package directories.
+//!
+//! OGPM's "Package Directory" (`.ogpd`, see docs/ogpm-model.md): a plain-HTTP
+//! INI file with one `[Package <id>]` section per package/version carrying a
+//! `Package.URL` relative to the directory itself. `.vipr` is the same format
+//! plus `Package.MD5`, a LabVIEW gate and dependency ranges — everything a
+//! resolver needs. A local directory of named packages is a "local repository"
+//! and indexes itself from each package's own spec.
+
+use crate::cache::{Cache, LocalEntry, SourceState};
+use crate::cancel::CancelToken;
+use crate::errors::{Cancelled, ListingFailure, ListingFailures, ListingFault};
+use crate::events::{Event, EventSink, FeedOutcome};
+use crate::oci::{self, Access, Oci, Package, Reference, Repo, Target};
+use crate::project::{Feed, feed_url, folder_base, same_name};
+use crate::version::{Version, split_id};
+use anyhow::{Context, Result};
+use md5::{Digest, Md5};
+use reqwest::StatusCode;
+use reqwest::blocking::Client;
+use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+
+/// (index url, base url that `Package.URL` is relative to)
+pub(crate) const SOURCES: &[(&str, &str)] = &[
+    (
+        "http://download.ni.com/evaluation/labview/lvtn/vipm/index.vipr",
+        "http://download.ni.com/evaluation/labview/lvtn/vipm/",
+    ),
+    (
+        "http://www.jkisoft.com/packages/jkisoft.ogpd",
+        "http://www.jkisoft.com/packages/",
+    ),
+];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Requirement {
+    pub name: String,
+    pub min: Option<Version>,
+    /// `min` is a strict bound (`>`), not an inclusive one (`>=`, `=`).
+    /// Meaningless without `min`.
+    pub min_exclusive: bool,
+}
+
+impl Requirement {
+    pub fn floor(&self) -> Option<Floor> {
+        self.min.clone().map(|version| Floor {
+            version,
+            exclusive: self.min_exclusive,
+        })
+    }
+}
+
+/// A lower bound on a package's version: at least `version`, or strictly
+/// above it.
+#[derive(Debug, Clone)]
+pub struct Floor {
+    pub version: Version,
+    pub exclusive: bool,
+}
+
+impl Floor {
+    pub fn at_least(version: Version) -> Self {
+        Floor {
+            version,
+            exclusive: false,
+        }
+    }
+
+    /// Whether `self` asks for more than `other`: a higher version, or the
+    /// same one exclusive where `other` is inclusive.
+    pub fn exceeds(&self, other: &Floor) -> bool {
+        self.version > other.version
+            || (self.version == other.version && self.exclusive && !other.exclusive)
+    }
+
+    pub fn admits(&self, candidate: &Version) -> bool {
+        if self.exclusive {
+            candidate > &self.version
+        } else {
+            candidate >= &self.version
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Entry {
+    pub name: String,
+    pub version: Version,
+    pub url: String,
+    pub md5: Option<String>,
+    pub display_name: Option<String>,
+    pub requires: Vec<Requirement>,
+    /// Minimum LabVIEW version, parsed out of e.g. `LabVIEW>=20.0`.
+    pub lv_min: Option<f64>,
+    /// Where the entry was listed: a feed's index URL, a local folder, or
+    /// [`CACHE_SOURCE`] for an imported archive, which is not in
+    /// [`Loaded::sources`].
+    pub source: String,
+    /// When the feed says it was released, in Unix seconds; `None` for a local,
+    /// cached or `.lvpkg` entry and for a date that is missing or unreadable.
+    #[serde(skip)]
+    pub released: Option<i64>,
+    /// What a community index pins for this entry; `None` for every other
+    /// source.
+    #[serde(skip)]
+    pub index_pin: Option<IndexPin>,
+}
+
+/// What a community index entry file says about one version, beyond what a
+/// hosted listing carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexPin {
+    /// The SHA-256 the download must have, lower-case hex.
+    pub sha256: String,
+    /// The `owner/repo` the entry file names as the package's owner; the repo
+    /// whose attestation is checked.
+    pub publisher: String,
+}
+
+/// The [`Entry::source`] of an archive imported with `lvpm cache add`.
+pub const CACHE_SOURCE: &str = "cache";
+
+/// What an [`Entry::source`] starts with when GitHub's releases listed it:
+/// `github:owner/repo`, which no feed URL does.
+///
+/// shortcut: the repo rides in a string scheme, not an `Origin` enum; upgrade
+/// when a source needs more than a repo in its string. The community index is
+/// the third kind, and it does not: the sha256 and the publisher of each of its
+/// entries ride in [`Entry::index_pin`], and the string carries only the
+/// index repo (see [`INDEX_SCHEME`]).
+pub const GITHUB_SCHEME: &str = "github:";
+
+/// What an [`Entry::source`] starts with when a community index repo listed
+/// it: `github-index:owner/repo`. Never [`GITHUB_SCHEME`], so [`github_repo`]
+/// keeps meaning "a GitHub dependency".
+pub const INDEX_SCHEME: &str = "github-index:";
+
+/// The [`Entry::source`] of a file in `repo`'s (`owner/repo`) releases.
+pub fn github_source(repo: &str) -> String {
+    format!("{GITHUB_SCHEME}{repo}")
+}
+
+/// The repo (`owner/repo`) a GitHub entry comes from; `None` for any other.
+pub fn github_repo(entry: &Entry) -> Option<&str> {
+    entry.source.strip_prefix(GITHUB_SCHEME)
+}
+
+/// The index repo (`owner/repo`) a source string names, when it is that of an
+/// entry a community index listed (see [`INDEX_SCHEME`]); `None` for any other.
+/// The one place that reads the scheme: an entry's is [`Entry::source`], a locked
+/// package's is `source` in `lvpm.lock`.
+pub fn index_repo(source: &str) -> Option<&str> {
+    source.strip_prefix(INDEX_SCHEME)
+}
+
+/// The repo (`owner/repo`) whose attestation `entry` is checked against: the
+/// repo of a GitHub dependency, or the publisher a community index entry names.
+/// `None` for an entry nobody attests.
+pub fn attesting_repo(entry: &Entry) -> Option<&str> {
+    let publisher = entry.index_pin.as_ref().map(|pin| pin.publisher.as_str());
+    github_repo(entry).or(publisher)
+}
+
+impl Entry {
+    /// Whether the name or display name contains `query`, in any case.
+    pub fn matches(&self, query: &str) -> bool {
+        let query = query.to_lowercase();
+        self.name.to_lowercase().contains(&query)
+            || self
+                .display_name
+                .as_deref()
+                .is_some_and(|d| d.to_lowercase().contains(&query))
+    }
+
+    /// Whether a LabVIEW of internal version `lv` (25.0 is 2025) can take it.
+    pub fn fits_labview(&self, lv: f64) -> bool {
+        self.lv_min.is_none_or(|need| lv + 1e-9 >= need)
+    }
+}
+
+impl From<&Entry> for LocalEntry {
+    fn from(entry: &Entry) -> Self {
+        Self {
+            name: entry.name.clone(),
+            version: entry.version.to_string(),
+            display_name: entry.display_name.clone(),
+            requires: entry
+                .requires
+                .iter()
+                .map(|requirement| {
+                    // A strict floor is stored as `>1.2`, an inclusive one as `1.2`.
+                    let strict = if requirement.min_exclusive { ">" } else { "" };
+                    (
+                        requirement.name.clone(),
+                        requirement.min.as_ref().map(|min| format!("{strict}{min}")),
+                    )
+                })
+                .collect(),
+            lv_min: entry.lv_min,
+        }
+    }
+}
+
+fn local_entry(entry: LocalEntry, url: String, md5: Option<String>) -> Entry {
+    Entry {
+        name: entry.name,
+        version: Version::parse(&entry.version),
+        url,
+        md5,
+        display_name: entry.display_name,
+        requires: entry
+            .requires
+            .into_iter()
+            .map(|(name, min)| {
+                let min_exclusive = min.as_deref().is_some_and(|m| m.starts_with('>'));
+                Requirement {
+                    name,
+                    min: min.map(|m| Version::parse(m.trim_start_matches('>'))),
+                    min_exclusive,
+                }
+            })
+            .collect(),
+        lv_min: entry.lv_min,
+        source: String::new(),
+        released: None,
+        index_pin: None,
+    }
+}
+
+pub struct Index {
+    pub entries: Vec<Entry>,
+}
+
+impl Index {
+    /// All entries for a package name, newest first.
+    pub fn versions_of(&self, name: &str) -> Vec<&Entry> {
+        let mut v: Vec<&Entry> = self
+            .entries
+            .iter()
+            .filter(|e| same_name(&e.name, name))
+            .collect();
+        v.sort_by(|a, b| b.version.cmp(&a.version));
+        v
+    }
+
+    /// Best entry for a requirement, honouring an optional LabVIEW gate.
+    pub fn best(&self, name: &str, floor: Option<&Floor>, lv: Option<f64>) -> Option<&Entry> {
+        self.versions_of(name).into_iter().find(|e| {
+            floor.is_none_or(|f| f.admits(&e.version)) && lv.is_none_or(|lv| e.fits_labview(lv))
+        })
+    }
+
+    /// Every entry whose name or display name contains `query`, in any case.
+    pub fn matching<'i>(&'i self, query: &str) -> impl Iterator<Item = &'i Entry> {
+        self.entries.iter().filter(move |e| e.matches(query))
+    }
+
+    pub fn search(&self, query: &str) -> Vec<&Entry> {
+        let mut seen: HashMap<&str, &Entry> = HashMap::new();
+        for e in self.matching(query) {
+            seen.entry(&e.name)
+                .and_modify(|cur| {
+                    if e.version > cur.version {
+                        *cur = e
+                    }
+                })
+                .or_insert(e);
+        }
+        let mut v: Vec<&Entry> = seen.into_values().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+}
+
+/// Lowercase hex MD5. `md-5` 0.11 returns a `hybrid_array::Array`, which has
+/// no `LowerHex`, so format the bytes ourselves.
+pub(crate) fn md5_hex(bytes: &[u8]) -> String {
+    let mut h = Md5::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An entry's download location, once resolved: a URL to fetch or a file to
+/// read. An `oci://` reference is neither: it is fetched through the registry
+/// client.
+pub(crate) fn is_local_url(url: &str) -> bool {
+    !["http://", "https://", oci::SCHEME]
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
+}
+
+/// Index every `.vip` and `.lvpkg` in a local package directory from each package's spec.
+fn scan_local_repo(
+    cache: &Cache,
+    dir: &Path,
+    refresh: bool,
+    out: &mut Vec<Entry>,
+    sink: &dyn EventSink,
+) -> Result<()> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading repo directory {}", dir.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("vip") || x.eq_ignore_ascii_case("lvpkg"))
+        })
+        .collect();
+    files.sort();
+
+    for path in files {
+        let metadata = std::fs::metadata(&path)?;
+        if !refresh && let Some(entry) = cache.local_entry(&path, &metadata)? {
+            out.push(local_entry(
+                entry,
+                path.to_string_lossy().into_owned(),
+                None,
+            ));
+            continue;
+        }
+        match entry_from_file(&path) {
+            Ok(entry) => {
+                let after = std::fs::metadata(&path)?;
+                if metadata.len() == after.len()
+                    && metadata.modified().ok() == after.modified().ok()
+                {
+                    cache.record_local(&path, &metadata, &LocalEntry::from(&entry))?;
+                } else {
+                    cache.forget_local(&path)?;
+                }
+                out.push(entry);
+            }
+            Err(error) => {
+                cache.forget_local(&path)?;
+                sink.emit(Event::LocalPackageIgnored {
+                    path,
+                    error: format!("{error:#}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn entry_from_file(path: &Path) -> Result<Entry> {
+    let bytes = std::fs::read(path)?;
+    entry_from_bytes(path, &bytes)
+}
+
+pub(crate) fn entry_from_bytes(path: &Path, bytes: &[u8]) -> Result<Entry> {
+    let mut zip = crate::install::open_archive(bytes.to_vec())?;
+    let spec = crate::install::read_spec(&mut zip)?;
+
+    Ok(Entry {
+        name: spec.name,
+        version: Version::parse(&spec.version),
+        url: path.to_string_lossy().into_owned(),
+        md5: None,
+        display_name: spec.display_name,
+        requires: spec
+            .requires
+            .as_deref()
+            .map(parse_requires)
+            .unwrap_or_default(),
+        lv_min: spec.lv_gate.as_deref().and_then(parse_lv_gate),
+        source: String::new(),
+        released: None,
+        index_pin: None,
+    })
+}
+
+/// One file processed by cache add, including its content address and reuse status.
+#[derive(Serialize)]
+pub struct Import {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub reused: bool,
+}
+
+/// Import one .vip/.ogp/.lvpkg archive or all immediate package files in a directory.
+/// Matching file stats and an existing import blob skip archive reads unless
+/// `refresh` is set. New imports store bytes before recording metadata and hashes.
+/// Files changed during reading and invalid archives fail the command; imports
+/// completed earlier in the same call remain committed. Originals are never moved.
+/// `source` is recorded as given: the caller makes it absolute.
+pub fn cache_add(cache_dir: &Path, source: &Path, refresh: bool) -> Result<Vec<Import>> {
+    let is_package = |path: &Path| {
+        path.extension().is_some_and(|extension| {
+            ["vip", "ogp", "lvpkg"]
+                .iter()
+                .any(|ext| extension.eq_ignore_ascii_case(ext))
+        })
+    };
+    let mut files = if source.is_dir() {
+        std::fs::read_dir(source)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|path| path.is_file() && is_package(path))
+            .collect::<Vec<_>>()
+    } else {
+        anyhow::ensure!(
+            source.is_file() && is_package(source),
+            "cache add expects a .vip, .ogp or .lvpkg file or package directory: {}",
+            source.display()
+        );
+        vec![source.to_path_buf()]
+    };
+    files.sort();
+    let cache = Cache::open(cache_dir)?;
+    let mut imports = Vec::new();
+    for path in files {
+        let metadata = std::fs::metadata(&path)?;
+        if !refresh && let Some(sha256) = cache.imported_local(&path, &metadata)? {
+            imports.push(Import {
+                path,
+                sha256,
+                reused: true,
+            });
+            continue;
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let after = std::fs::metadata(&path)?;
+        anyhow::ensure!(
+            metadata.len() == after.len() && metadata.modified().ok() == after.modified().ok(),
+            "package changed during import; retry cache add: {}",
+            path.display()
+        );
+        imports.push(import_bytes(&cache, path, Some(&metadata), &bytes)?);
+    }
+    Ok(imports)
+}
+
+/// Import an archive that is not a file of its own, e.g. one inside a `.vipc`.
+/// `label` is recorded as the import's path, so it says where the bytes came
+/// from; nothing backs it, so a second import of it is read again, never skipped.
+pub fn cache_add_bytes(cache_dir: &Path, label: &str, bytes: &[u8]) -> Result<Import> {
+    import_bytes(&Cache::open(cache_dir)?, PathBuf::from(label), None, bytes)
+}
+
+/// Parse `bytes`, store them and record them as imported from `path`: a file
+/// whose `metadata` links later imports to the stored copy, or a label.
+fn import_bytes(
+    cache: &Cache,
+    path: PathBuf,
+    metadata: Option<&std::fs::Metadata>,
+    bytes: &[u8],
+) -> Result<Import> {
+    let entry =
+        entry_from_bytes(&path, bytes).with_context(|| format!("importing {}", path.display()))?;
+    let sha256 = cache.store(bytes)?;
+    cache.record_import(
+        &path,
+        metadata,
+        &LocalEntry::from(&entry),
+        &sha256,
+        &md5_hex(bytes),
+    )?;
+    Ok(Import {
+        path,
+        sha256,
+        reused: false,
+    })
+}
+
+/// The feeds `load` reads, in the order a name is looked for: each hosted
+/// index folder in `extra`, then the public ones unless `defaults` is off, as
+/// (index URL, base URL that `Package.URL` is relative to).
+pub(crate) fn feeds(extra: &[String], defaults: bool) -> Vec<(String, String)> {
+    let mut feeds: Vec<(String, String)> = extra
+        .iter()
+        .map(|repo| (feed_url(repo), folder_base(repo)))
+        .collect();
+    if defaults {
+        feeds.extend(SOURCES.iter().map(|(a, b)| (a.to_string(), b.to_string())));
+    }
+    feeds
+}
+
+/// The feed that owns each source-pinned package: `name_key` to the owner's
+/// index URL, or `None` when the pin names no source (see [`owners`]).
+pub(crate) type Owners = HashMap<String, Option<String>>;
+
+/// The [`Owners`] of `pinned`, which is package name to source name, with
+/// `sources` as (name, feed) pairs. A pin naming no source in `sources`
+/// has no owner, so no entry matches it and its name is listed nowhere: it
+/// fails closed. The manifest reader already refuses such a pin.
+pub(crate) fn owners(sources: &[(String, Feed)], pinned: &BTreeMap<String, String>) -> Owners {
+    pinned
+        .iter()
+        .map(|(package, source)| {
+            let owner = (sources.iter())
+                .find(|(name, _)| name == source)
+                .map(|(_, feed)| feed.owner());
+            (crate::project::name_key(package), owner)
+        })
+        .collect()
+}
+
+/// An OCI source and the packages pinned to it: a registry lists nothing, so
+/// these are the only names it is asked for.
+#[derive(Debug, Clone)]
+pub struct OciFeed {
+    /// The `[sources]` name.
+    pub name: String,
+    pub url: oci::FeedUrl,
+    /// The pinned packages, as the manifest writes them.
+    pub pinned: Vec<String>,
+}
+
+/// A community index repo, `github:owner/repo`, from `[sources]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexFeed {
+    pub owner: String,
+    pub repo: String,
+}
+
+impl IndexFeed {
+    /// The [`Entry::source`] of what this index lists, with the repo spelled as
+    /// the manifest spells it: `github-index:owner/repo`.
+    pub fn source(&self) -> String {
+        format!("{INDEX_SCHEME}{}/{}", self.owner, self.repo)
+    }
+}
+
+/// A remote source that [`SourceSet::extra`] lists: where it sits in the list
+/// is how it ranks against the others.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remote {
+    /// A hosted index folder, as its `[sources]` line writes it.
+    Hosted(String),
+    /// A community index repo.
+    Index(IndexFeed),
+}
+
+impl Remote {
+    /// The folder of a hosted source.
+    pub fn folder(&self) -> Option<&str> {
+        match self {
+            Remote::Hosted(folder) => Some(folder),
+            Remote::Index(_) => None,
+        }
+    }
+}
+
+/// The folders of the hosted sources in `remotes`, in order.
+pub fn folders(remotes: &[Remote]) -> Vec<String> {
+    let hosted = remotes.iter().filter_map(Remote::folder);
+    hosted.map(str::to_string).collect()
+}
+
+/// `sources` cut into the hosted folders and community index repos, in
+/// `[sources]` order, and what the OCI reader takes (each OCI feed with its
+/// pinned packages).
+pub fn split_sources(
+    sources: Vec<(String, Feed)>,
+    pins: &BTreeMap<String, String>,
+) -> (Vec<Remote>, Vec<OciFeed>) {
+    let (mut remotes, mut registries) = (Vec::new(), Vec::new());
+    for (name, feed) in sources {
+        match feed {
+            Feed::Hosted(folder) => remotes.push(Remote::Hosted(folder)),
+            Feed::Index { owner, repo } => remotes.push(Remote::Index(IndexFeed { owner, repo })),
+            Feed::Oci(url) => {
+                let pinned = (pins.iter())
+                    .filter(|(_, source)| **source == name)
+                    .map(|(package, _)| package.clone())
+                    .collect();
+                registries.push(OciFeed { name, url, pinned });
+            }
+        }
+    }
+    (remotes, registries)
+}
+
+/// The OCI manifest an entry from an OCI source is fetched by, which is its
+/// `url`. `None` for an entry from any other source.
+pub fn oci_reference(entry: &Entry) -> Option<Reference> {
+    let reference = Reference::parse(&entry.url).ok()?;
+    matches!(reference.target, Target::Digest(_)).then_some(reference)
+}
+
+/// [`oci_reference`] for a caller that has an OCI entry and no other kind: an
+/// error naming the entry's `url` when it is not one.
+pub fn manifest_reference(entry: &Entry) -> Result<Reference> {
+    oci_reference(entry).with_context(|| format!("{} is not an OCI manifest digest", entry.url))
+}
+
+/// Where an entry with this `url` came from: the index URL of the feed whose
+/// folder it sits in (the longest match when folders nest), or `local` for a
+/// package folder or an imported archive.
+pub(crate) fn source_of(url: &str, feeds: &[(String, String)]) -> String {
+    if is_local_url(url) {
+        return crate::lockfile::LOCAL_SOURCE.to_string();
+    }
+    // Parsed as the download parses it, so `team/x/../../y` is not credited to `team/`.
+    let parsed = |s: &str| reqwest::Url::parse(s).map_or_else(|_| s.to_string(), String::from);
+    let target = parsed(url);
+    feeds
+        .iter()
+        .map(|(index_url, base)| (index_url, parsed(base)))
+        .filter(|(_, base)| target.starts_with(base.as_str()))
+        // `rev`: of equal matches, the first feed read wins, as it did before parsing.
+        .rev()
+        .max_by_key(|(_, base)| base.len())
+        .map_or_else(|| url.to_string(), |(index_url, _)| index_url.clone())
+}
+
+/// Load public indexes, global local package folders, and hosted manifest sources.
+///
+/// Every source's entries are kept, so a locked archive is found wherever it
+/// is listed; resolving reads [`load_each`], where the first source wins.
+///
+/// A cancelled `cancel` ends the load with [`Cancelled`] before the next feed is
+/// asked for; a request already sent runs to its end.
+pub fn load(
+    cache_dir: &Path,
+    refresh: bool,
+    sources: &SourceSet,
+    oci: &Oci,
+    sink: &dyn EventSink,
+    cancel: &CancelToken,
+) -> Result<Index> {
+    let loaded = read_each(
+        cache_dir,
+        refresh,
+        sources,
+        oci,
+        sink,
+        cancel,
+        |_, error| Err(error),
+    )?;
+    Ok(loaded.index)
+}
+
+/// Where [`load`] looks, besides the cache's imported archives.
+pub struct SourceSet<'a> {
+    /// Hosted index folders and community index repos, in the order of their
+    /// `[sources]` lines: an earlier one wins a name, and all of them before
+    /// the public indexes.
+    pub extra: &'a [Remote],
+    /// Local package folders.
+    pub local: &'a [PathBuf],
+    /// Whether the public indexes are read too.
+    pub defaults: bool,
+    /// OCI sources, each asked only for the packages pinned to it, after
+    /// every hosted feed.
+    pub oci: &'a [OciFeed],
+    /// The names the community indexes in `extra` are asked for, each one
+    /// `packages/<key>.toml`, and per name those entries, or any other
+    /// source's, require. None: no request.
+    pub wanted: &'a [String],
+    /// The text of an index repo's `packages/<key>.toml`; `None` when it has no
+    /// such file. Which request that is, and how it is cached, is the caller's.
+    pub index_fetch: &'a dyn Fn(&IndexFeed, &str) -> Result<Option<String>>,
+    /// The entries of the text of `packages/<key>.toml`, given the key and the
+    /// text, with no source set. This module knows nothing of the file's format.
+    pub index_parse: fn(&str, &str) -> Result<Vec<Entry>>,
+}
+
+/// What a [`SourceSet`] with no community index fetches: nothing.
+fn nothing_listed(_: &IndexFeed, _: &str) -> Result<Option<String>> {
+    Ok(None)
+}
+
+fn no_entries(_: &str, _: &str) -> Result<Vec<Entry>> {
+    Ok(Vec::new())
+}
+
+impl Default for SourceSet<'_> {
+    /// No source at all: every list empty, the public indexes off.
+    fn default() -> Self {
+        SourceSet {
+            extra: &[],
+            local: &[],
+            defaults: false,
+            oci: &[],
+            wanted: &[],
+            index_fetch: &nothing_listed,
+            index_parse: no_entries,
+        }
+    }
+}
+
+/// What [`load_each`] read, and the name of every source it was asked to.
+pub struct Loaded {
+    pub index: Index,
+    /// Each local folder, then each feed's index URL.
+    pub sources: Vec<String>,
+}
+
+/// [`load`], handing a source that cannot be read to `on_fail` with its name:
+/// an `Err` back ends the load, an `Ok` skips that source. A cache error while
+/// reading a source counts as that source failing. `owners` is what [`owners`]
+/// builds; [`first_source_wins`] says what it does to the entries.
+#[allow(clippy::too_many_arguments)]
+pub fn load_each(
+    cache_dir: &Path,
+    refresh: bool,
+    sources: &SourceSet,
+    owners: &Owners,
+    oci: &Oci,
+    sink: &dyn EventSink,
+    cancel: &CancelToken,
+    on_fail: impl FnMut(&str, anyhow::Error) -> Result<()>,
+) -> Result<Loaded> {
+    let read = read_each(cache_dir, refresh, sources, oci, sink, cancel, on_fail)?;
+    let index = Index {
+        entries: first_source_wins(read.index.entries, owners),
+    };
+    Ok(Loaded {
+        index,
+        sources: read.sources,
+    })
+}
+
+/// [`load_each`] with every source's entries.
+fn read_each(
+    cache_dir: &Path,
+    refresh: bool,
+    source_set: &SourceSet,
+    oci: &Oci,
+    sink: &dyn EventSink,
+    cancel: &CancelToken,
+    mut on_fail: impl FnMut(&str, anyhow::Error) -> Result<()>,
+) -> Result<Loaded> {
+    let SourceSet {
+        extra,
+        local,
+        defaults,
+        oci: oci_feeds,
+        wanted,
+        index_fetch,
+        index_parse,
+    } = source_set;
+    // The rank of what a source lists: the cache and the local folders first,
+    // then each `extra` by its line, then the public indexes, then OCI. The
+    // entries are sorted by it (stably) once every source is read.
+    let (defaults_rank, oci_rank) = (extra.len() + 1, extra.len() + 2);
+    let mut entries: Vec<(usize, Entry)> = Vec::new();
+    let mut sources = Vec::new();
+    let cache = Cache::open(cache_dir)?;
+    for package in cache.imported_packages()? {
+        let entry = Entry {
+            source: CACHE_SOURCE.to_string(),
+            ..local_entry(
+                package.entry,
+                format!("cache:{}", package.sha256),
+                Some(package.md5),
+            )
+        };
+        entries.push((LOCAL_RANK, entry));
+    }
+
+    for dir in *local {
+        let name = dir.to_string_lossy().into_owned();
+        let mut found = Vec::new();
+        let scanned = match dir.is_dir() {
+            false => Err(anyhow::anyhow!(
+                "local source {} is not a directory",
+                dir.display()
+            )),
+            true => scan_local_repo(&cache, dir, refresh, &mut found, sink),
+        };
+        match scanned {
+            Ok(()) => {
+                label(&mut found, &name);
+                entries.extend(at_rank(LOCAL_RANK, found));
+            }
+            Err(error) => on_fail(&name, error)?,
+        }
+        sources.push(name);
+    }
+
+    let hosted: Vec<(usize, String)> = (extra.iter().enumerate())
+        .filter_map(|(line, remote)| Some((line + 1, remote.folder()?.to_string())))
+        .collect();
+    let folders: Vec<String> = hosted.iter().map(|(_, folder)| folder.clone()).collect();
+    let feed_ranks = (hosted.iter().map(|(rank, _)| *rank)).chain(std::iter::repeat(defaults_rank));
+    let feeds = feeds(&folders, *defaults);
+    if !feeds.is_empty() {
+        let client = Client::builder()
+            .user_agent(concat!("lvpm/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        for ((url, base), rank) in feeds.iter().zip(feed_ranks) {
+            if cancel.is_cancelled() {
+                return Err(Cancelled.into());
+            }
+            sources.push(url.clone());
+            match feed_body(&cache, &client, url, base, refresh, sink) {
+                Ok(body) => {
+                    let mut found = Vec::new();
+                    parse_into(&body, base, &mut found);
+                    label(&mut found, url);
+                    entries.extend(at_rank(rank, found));
+                }
+                Err(error) => on_fail(url, error)?,
+            }
+        }
+    }
+
+    let index_feeds: Vec<(usize, &IndexFeed)> = (extra.iter().enumerate())
+        .filter_map(|(line, remote)| match remote {
+            Remote::Index(feed) => Some((line + 1, feed)),
+            Remote::Hosted(_) => None,
+        })
+        .collect();
+    // An index asked no names is not a source this read used, so it never counts
+    // toward "every source failed".
+    if !wanted.is_empty() {
+        sources.extend(index_feeds.iter().map(|(_, feed)| feed.source()));
+    }
+    let mut failures = Vec::new();
+    for feed in *oci_feeds {
+        sources.push(feed.url.to_string());
+        let mut found = Vec::new();
+        read_oci(oci, feed, cancel, &mut found, &mut failures)?;
+        entries.extend(at_rank(oci_rank, found));
+    }
+    // After every other source is read, so the names their entries require are
+    // asked of the indexes too.
+    let ask = IndexAsk {
+        feeds: index_feeds,
+        fetch: *index_fetch,
+        parse: *index_parse,
+    };
+    ask.read(wanted, cancel, &mut entries, &mut on_fail)?;
+
+    // Every pin that failed is reported at once, and none is left to a source
+    // asked after it: they are one error, not a skipped source.
+    if let Some(first) = failures.first().map(|failure| failure.feed.to_string()) {
+        on_fail(&first, ListingFailures::new(failures).into())?;
+    }
+
+    entries.sort_by_key(|(rank, _)| *rank);
+    let index = Index {
+        entries: entries.into_iter().map(|(_, entry)| entry).collect(),
+    };
+    Ok(Loaded { index, sources })
+}
+
+/// The rank of the cache and the local folders: before every remote source.
+const LOCAL_RANK: usize = 0;
+
+fn at_rank(rank: usize, found: Vec<Entry>) -> impl Iterator<Item = (usize, Entry)> {
+    found.into_iter().map(move |entry| (rank, entry))
+}
+
+/// The community index repos of [`SourceSet::extra`] and how to read them:
+/// [`SourceSet::index_fetch`] and [`SourceSet::index_parse`].
+struct IndexAsk<'a> {
+    /// Each index repo with the rank of its `[sources]` line.
+    feeds: Vec<(usize, &'a IndexFeed)>,
+    fetch: &'a dyn Fn(&IndexFeed, &str) -> Result<Option<String>>,
+    parse: fn(&str, &str) -> Result<Vec<Entry>>,
+}
+
+impl IndexAsk<'_> {
+    /// Asks every index for each of `wanted`, then for each name that the
+    /// entries of a name already asked for (from any source, the indexes' own
+    /// as they come) require, until no new name turns up. A name is asked once,
+    /// so a cycle ends, and what a name nobody asked for requires is never
+    /// read. An index that failed, to answer or to parse, is told once, is not
+    /// asked again, and gives none of its entries.
+    fn read(
+        &self,
+        wanted: &[String],
+        cancel: &CancelToken,
+        entries: &mut Vec<(usize, Entry)>,
+        on_fail: &mut impl FnMut(&str, anyhow::Error) -> Result<()>,
+    ) -> Result<()> {
+        if self.feeds.is_empty() {
+            return Ok(());
+        }
+        let mut seen = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut enqueue = |name: &str, queue: &mut VecDeque<String>| {
+            let key = crate::project::name_key(name);
+            if is_file_key(&key) && seen.insert(key.clone()) {
+                queue.push_back(key);
+            }
+        };
+        for name in wanted {
+            enqueue(name, &mut queue);
+        }
+        let mut down = vec![false; self.feeds.len()];
+        while let Some(key) = queue.pop_front() {
+            for (&(rank, feed), down) in self.feeds.iter().zip(&mut down) {
+                if *down {
+                    continue;
+                }
+                if cancel.is_cancelled() {
+                    return Err(Cancelled.into());
+                }
+                let source = feed.source();
+                match self.entries_of(feed, &key, &source) {
+                    Ok(found) => entries.extend(at_rank(rank, found)),
+                    Err(error) => {
+                        // A source that failed gives nothing, as a local folder does.
+                        *down = true;
+                        entries.retain(|(_, entry)| entry.source != source);
+                        on_fail(&source, error)?;
+                    }
+                }
+            }
+            let of_key = |(_, e): &&(usize, Entry)| crate::project::name_key(&e.name) == key;
+            let required: Vec<String> = (entries.iter().filter(of_key))
+                .map(|(_, entry)| entry)
+                .flat_map(|entry| entry.requires.iter().map(|r| r.name.clone()))
+                .collect();
+            for name in required {
+                enqueue(&name, &mut queue);
+            }
+        }
+        Ok(())
+    }
+
+    /// What `feed` lists under `key`: nothing when it has no such file.
+    fn entries_of(&self, feed: &IndexFeed, key: &str, source: &str) -> Result<Vec<Entry>> {
+        let Some(text) = (self.fetch)(feed, key)? else {
+            return Ok(Vec::new());
+        };
+        let mut found = (self.parse)(key, &text).map_err(|error| {
+            anyhow::anyhow!(
+                "packages/{key}.toml in {GITHUB_SCHEME}{}/{} does not parse: {error:#}",
+                feed.owner,
+                feed.repo
+            )
+        })?;
+        label(&mut found, source);
+        Ok(found)
+    }
+}
+
+/// Whether `key` (a [`name_key`](crate::project::name_key)) can be the file name
+/// in `packages/<key>.toml`: `[a-z0-9_.-]+`. A name that cannot is listed in no
+/// index, and is never put in a URL.
+pub(crate) fn is_file_key(key: &str) -> bool {
+    let allowed = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b);
+    !key.is_empty() && key.bytes().all(allowed)
+}
+
+/// What an OCI source lists of the packages pinned to it: for each, the tags
+/// of its repository, and of each tag the OCI manifest, which is an entry when
+/// it is an lvpm package and nothing when it is any other artifact. A package
+/// the registry could not list is added to `failures`, with why.
+fn read_oci(
+    oci: &Oci,
+    feed: &OciFeed,
+    cancel: &CancelToken,
+    entries: &mut Vec<Entry>,
+    failures: &mut Vec<ListingFailure>,
+) -> Result<()> {
+    for package in &feed.pinned {
+        if cancel.is_cancelled() {
+            return Err(Cancelled.into());
+        }
+        match read_pinned(oci, feed, package) {
+            Ok(found) => entries.extend(found),
+            Err(fault) => failures.push(ListingFailure {
+                package: package.clone(),
+                source: feed.name.clone(),
+                feed: feed.url.clone(),
+                fault,
+            }),
+        }
+    }
+    Ok(())
+}
+
+/// The versions of `package` the OCI source lists.
+///
+/// shortcut: the manifests of the tags are read one after the other; read
+/// them together when a package has so many tags that a lock waits on them.
+fn read_pinned(oci: &Oci, feed: &OciFeed, package: &str) -> Result<Vec<Entry>, ListingFault> {
+    let Some(repository) = feed.url.repository(package) else {
+        // Not a name a registry can hold, so it holds none.
+        return Err(ListingFault::NotListed);
+    };
+    let repo = Repo {
+        registry: feed.url.registry(),
+        name: &repository,
+        access: Access::Pull,
+    };
+    let mut found = Vec::new();
+    for tag in oci.list_tags(&repo).map_err(|e| fault_of(&e))? {
+        // The registry names the tags: one that is no tag is never put in a URL.
+        // `sha256-<hex>` is where a registry without the referrers API keeps an
+        // index of referrers, never a package.
+        if !oci::valid_tag(&tag) || tag.starts_with("sha256-") {
+            continue;
+        }
+        let manifest = match oci.get_manifest(&repo, &tag) {
+            Ok(manifest) => manifest,
+            // A tag the registry does not serve is not a package of ours.
+            Err(error) if error.status_code() == Some(404) => continue,
+            Err(error) => return Err(fault_of(&error)),
+        };
+        let entry = (manifest.package())
+            .and_then(|package| oci_entry(feed, &repository, &package))
+            // A manifest in this repository speaks for this package only: a
+            // lock finds it again by the name, and the source is asked for no other.
+            .filter(|entry| same_name(&entry.name, package));
+        found.extend(entry);
+    }
+    // Tags, and none of them this package: the source does not list it.
+    match found.is_empty() {
+        true => Err(ListingFault::NotListed),
+        false => Ok(found),
+    }
+}
+
+/// What a failed tags list or manifest read comes to.
+fn fault_of(error: &oci::Error) -> ListingFault {
+    match error {
+        _ if error.status_code() == Some(404) => ListingFault::NotListed,
+        _ if error.is_refused() => ListingFault::Refused,
+        _ if error.is_host_level() => ListingFault::Host(error.to_string()),
+        oci::Error::Unreachable { cause, .. } => ListingFault::Unreachable(cause.clone()),
+        other => ListingFault::Unreachable(other.to_string()),
+    }
+}
+
+/// The entry an lvpm package's OCI manifest makes: what its annotations say,
+/// and the OCI manifest's own digest as the address, which is what a lock
+/// records and a fetch asks for. `None` for a manifest that does not say what
+/// package and version it is.
+fn oci_entry(feed: &OciFeed, repository: &str, package: &Package) -> Option<Entry> {
+    let note = |key: &str| package.annotations.get(key).map(String::as_str);
+    let reference = Reference::by_digest(feed.url.registry(), repository, &package.manifest);
+    Some(Entry {
+        name: note(oci::ANNOTATION_TITLE)?.to_string(),
+        version: Version::parse(note(oci::ANNOTATION_VERSION)?),
+        url: reference.to_string(),
+        md5: None,
+        display_name: None,
+        requires: note(oci::ANNOTATION_REQUIRES)
+            .map(parse_requires)
+            .unwrap_or_default(),
+        lv_min: note(oci::ANNOTATION_LABVIEW).and_then(parse_lv_gate),
+        source: feed.url.to_string(),
+        released: note(oci::ANNOTATION_CREATED).and_then(crate::released::parse_rfc3339),
+        index_pin: None,
+    })
+}
+
+/// `entries` in source order, cut down to one source per name. A name in
+/// `owners` is source-pinned: it keeps only the entries whose `source` is its
+/// owner, so the cache, a local folder and every other feed lose it even when
+/// they list it first. Any other name keeps the entries of the first source
+/// that lists it, and a later source never adds versions (ADR 4). The two
+/// public defaults count as one source (ADR 9): a name both list keeps the
+/// versions of both, and a version both list is kept once, from NI's.
+fn first_source_wins(entries: Vec<Entry>, owners: &Owners) -> Vec<Entry> {
+    let mut first_listed: HashMap<String, String> = HashMap::new();
+    // Compared as versions, so NI's `1.0` and JKI's `1.0.0` are one version.
+    let mut public_versions: HashMap<String, Vec<Version>> = HashMap::new();
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let key = crate::project::name_key(&entry.name);
+            if let Some(owner) = owners.get(&key) {
+                return owner.as_deref() == Some(entry.source.as_str());
+            }
+            let group = source_group(&entry.source);
+            let first = first_listed
+                .entry(key.clone())
+                .or_insert_with(|| group.to_string());
+            if first != group {
+                return false;
+            }
+            if group != PUBLIC {
+                return true;
+            }
+            let seen = public_versions.entry(key).or_default();
+            let new = !seen.contains(&entry.version);
+            if new {
+                seen.push(entry.version.clone());
+            }
+            new
+        })
+        .collect()
+}
+
+/// The group [`first_source_wins`] ranks `source` in: [`PUBLIC`] for either
+/// public default, else the source itself.
+fn source_group(source: &str) -> &str {
+    match SOURCES.iter().any(|(index, _)| *index == source) {
+        true => PUBLIC,
+        false => source,
+    }
+}
+
+/// The one source the public NI and JKI indexes count as (ADR 9).
+const PUBLIC: &str = "public defaults";
+
+fn label(entries: &mut [Entry], source: &str) {
+    for entry in entries {
+        entry.source = source.to_string();
+    }
+}
+
+/// A feed's body, from the cache when the server says it has not changed.
+///
+/// Without `refresh` the cached body is used outright, no network at all.
+/// With it, the stored `ETag`/`Last-Modified` go out as a conditional `GET`:
+/// a `304` means the cached bytes are still current and none crossed the wire.
+fn feed_body(
+    cache: &Cache,
+    client: &Client,
+    url: &str,
+    base: &str,
+    refresh: bool,
+    sink: &dyn EventSink,
+) -> Result<String> {
+    let st = cache.state(url)?.unwrap_or_default();
+    let cached = match &st.sha256 {
+        Some(sha) => cache.load(sha)?,
+        None => None,
+    };
+    if let Some(bytes) = &cached
+        && !refresh
+    {
+        return Ok(String::from_utf8_lossy(bytes).into_owned());
+    }
+
+    // The validators belong to wherever the body actually came from: JKI's
+    // `.ogpd` is a 301 to S3, and asking the redirect saves following it.
+    let target = st.resolved_url.clone().unwrap_or_else(|| url.to_string());
+    let mut req = client.get(&target);
+    if cached.is_some() {
+        if let Some(etag) = &st.etag {
+            req = req.header(IF_NONE_MATCH, etag);
+        }
+        if let Some(lm) = &st.last_modified {
+            req = req.header(IF_MODIFIED_SINCE, lm);
+        }
+    }
+    // A cold feed is a few seconds of silence otherwise, so the start is
+    // reported before the wait, not after it.
+    let started = std::time::Instant::now();
+    sink.emit(Event::FeedCheckStart {
+        url: url.to_string(),
+        first_run: cached.is_none(),
+    });
+    let mut resp = req.send().with_context(|| format!("fetching {url}"))?;
+
+    if resp.status() == StatusCode::NOT_MODIFIED {
+        match cached {
+            Some(bytes) => {
+                sink.emit(Event::FeedChecked {
+                    url: url.to_string(),
+                    outcome: FeedOutcome::Unchanged,
+                    bytes: 0,
+                    elapsed: started.elapsed(),
+                });
+                return Ok(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            // A 304 carries no body, so one we have nothing cached for (a
+            // server answering it unasked) leaves us with nothing to parse.
+            None => {
+                resp = client
+                    .get(&target)
+                    .send()
+                    .with_context(|| format!("fetching {url} unconditionally"))?
+            }
+        }
+    }
+
+    let resp = resp.error_for_status()?;
+    let header = |name: reqwest::header::HeaderName| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let fresh = SourceState {
+        resolved_url: Some(resp.url().to_string()),
+        etag: header(ETAG),
+        last_modified: header(LAST_MODIFIED),
+        sha256: None,
+    };
+    let bytes = resp.bytes()?;
+    sink.emit(Event::FeedChecked {
+        url: url.to_string(),
+        outcome: FeedOutcome::Downloaded,
+        bytes: bytes.len() as u64,
+        elapsed: started.elapsed(),
+    });
+    let sha = cache.store(&bytes)?;
+    cache.record(
+        url,
+        "remote",
+        base,
+        &SourceState {
+            sha256: Some(sha),
+            ..fresh
+        },
+    )?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Whether `{base}{rel}`, parsed the way the download parses it, is still in
+/// the feed's folder. `source_of` names a feed by that folder, so an entry
+/// that leaves it would be credited to a feed it does not come from.
+fn stays_in_folder(base: &str, rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    // Some servers decode these (twice, for `%25`), or drop `;` path parameters, and resolve what the client kept literal.
+    if ["%2f", "%5c", "%25", ";", "%3b"]
+        .iter()
+        .any(|bad| lower.contains(bad))
+    {
+        return false;
+    }
+    match (
+        reqwest::Url::parse(base),
+        reqwest::Url::parse(&format!("{base}{rel}")),
+    ) {
+        (Ok(base), Ok(url)) => url.as_str().starts_with(base.as_str()),
+        _ => false,
+    }
+}
+
+fn parse_into(body: &str, base_url: &str, out: &mut Vec<Entry>) {
+    let mut cur: Option<(String, HashMap<String, String>)> = None;
+
+    let flush = |cur: Option<(String, HashMap<String, String>)>, out: &mut Vec<Entry>| {
+        let Some((id, kv)) = cur else { return };
+        let Some((name, version)) = split_id(&id) else {
+            return;
+        };
+        let Some(rel) = kv.get("Package.URL") else {
+            return;
+        };
+        if !stays_in_folder(base_url, rel) {
+            return;
+        }
+        out.push(Entry {
+            name,
+            version,
+            url: format!("{base_url}{rel}"),
+            md5: kv.get("Package.MD5").map(|s| s.to_lowercase()),
+            display_name: kv.get("Package.Display Name").cloned(),
+            requires: kv
+                .get("Dependencies.Requires")
+                .map(|s| parse_requires(s))
+                .unwrap_or_default(),
+            lv_min: kv
+                .get("Platform.Exclusive_LabVIEW_Version")
+                .and_then(|s| parse_lv_gate(s)),
+            source: String::new(),
+            released: kv
+                .get("Package.Release Date")
+                .and_then(|s| crate::released::parse(s)),
+            index_pin: None,
+        });
+    };
+
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("[Package ") {
+            flush(cur.take(), out);
+            cur = rest
+                .strip_suffix(']')
+                .map(|id| (id.to_string(), HashMap::new()));
+        } else if line.starts_with('[') {
+            flush(cur.take(), out);
+        } else if let Some((k, v)) = line.split_once('=')
+            && let Some((_, kv)) = cur.as_mut()
+        {
+            kv.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
+        }
+    }
+    flush(cur.take(), out);
+}
+
+/// `jki_lib_state_machine>=2.0.0,oglib_error>=4.2.0.23`
+pub(crate) fn parse_requires(s: &str) -> Vec<Requirement> {
+    s.split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            for op in [">=", "<=", "==", ">", "<", "="] {
+                if let Some((n, v)) = part.split_once(op) {
+                    let min = if op.starts_with('>') || op == "=" || op == "==" {
+                        Some(Version::parse(v))
+                    } else {
+                        None
+                    };
+                    return Some(Requirement {
+                        name: n.trim().to_string(),
+                        min,
+                        min_exclusive: op == ">",
+                    });
+                }
+            }
+            Some(Requirement {
+                name: part.to_string(),
+                min: None,
+                min_exclusive: false,
+            })
+        })
+        .collect()
+}
+
+/// `LabVIEW>=20.0` -> 20.0
+pub(crate) fn parse_lv_gate(s: &str) -> Option<f64> {
+    // The version follows the first operator: "LabVIEW x64>=20.0" must not read
+    // the 64. Of ">=16.0,<=20.0" (either order) the floor is 16; "<=20.0" has none.
+    let s = s
+        .split(',')
+        .find_map(|clause| match clause.find(['=', '>', '<']) {
+            Some(i) if clause[i..].starts_with('<') => None,
+            Some(i) => Some(&clause[i..]),
+            None => Some(clause),
+        })?;
+    let idx = s.find(|c: char| c.is_ascii_digit())?;
+    let num: String = s[idx..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    num.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::NullSink;
+    use crate::ops::testing::CancelOn;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn an_exclusive_floor_exceeds_an_inclusive_one_at_the_same_version() {
+        let at = |v: &str, exclusive| Floor {
+            version: Version::parse(v),
+            exclusive,
+        };
+        assert!(at("1", true).exceeds(&at("1", false)));
+        assert!(!at("1", false).exceeds(&at("1", true)));
+        assert!(!at("1", false).exceeds(&at("1", false)));
+        assert!(at("2", false).exceeds(&at("1", true)));
+        assert!(!at("1", true).exceeds(&at("2", false)));
+    }
+
+    #[test]
+    fn a_github_entry_names_its_repo_and_no_other_entry_does() {
+        let mut entry = Entry {
+            name: "pkg".into(),
+            version: Version::parse("1.0"),
+            url: "https://api.github.com/repos/o/r/releases/assets/1".into(),
+            md5: None,
+            display_name: None,
+            requires: Vec::new(),
+            lv_min: None,
+            released: None,
+            source: github_source("o/r"),
+            index_pin: None,
+        };
+        assert_eq!(entry.source, "github:o/r");
+        assert_eq!(github_repo(&entry), Some("o/r"));
+        for other in ["https://github.com/o/r/index.json", CACHE_SOURCE, ""] {
+            entry.source = other.into();
+            assert_eq!(github_repo(&entry), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_github_entry_is_attested_by_its_repo_and_an_index_entry_by_its_publisher() {
+        let mut entry = Entry {
+            source: github_source("o/r"),
+            ..Entry::default()
+        };
+        assert_eq!(attesting_repo(&entry), Some("o/r"));
+        assert_eq!(index_repo(&entry.source), None);
+
+        entry.source = "github-index:o/idx".into();
+        assert_eq!(index_repo(&entry.source), Some("o/idx"));
+        assert_eq!(index_repo("github:o/idx"), None);
+        assert_eq!(attesting_repo(&entry), None);
+        entry.index_pin = Some(IndexPin {
+            sha256: "ab".repeat(32),
+            publisher: "someone/Serializer".into(),
+        });
+        assert_eq!(attesting_repo(&entry), Some("someone/Serializer"));
+        // A hosted feed's entry has nobody to ask.
+        assert_eq!(attesting_repo(&Entry::default()), None);
+    }
+
+    /// A server that answers each connection with the next canned response and
+    /// keeps the request it got, so a test can assert what went out.
+    struct Stub {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn stub(responses: &'static [&'static str]) -> Stub {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/index.vipr", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let log = requests.clone();
+        std::thread::spawn(move || {
+            for (conn, response) in listener.incoming().zip(responses) {
+                let mut conn = conn.unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if conn.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&head).into_owned());
+                conn.write_all(response.as_bytes()).ok();
+            }
+        });
+        Stub { url, requests }
+    }
+
+    /// [`super::load`] for a token nobody cancels, which most tests are about.
+    fn load(
+        cache_dir: &Path,
+        refresh: bool,
+        extra: &[String],
+        local_sources: &[PathBuf],
+        defaults: bool,
+        sink: &dyn EventSink,
+    ) -> Result<Index> {
+        let extra: Vec<Remote> = extra.iter().cloned().map(Remote::Hosted).collect();
+        super::load(
+            cache_dir,
+            refresh,
+            &SourceSet {
+                extra: &extra,
+                local: local_sources,
+                defaults,
+                ..SourceSet::default()
+            },
+            &Oci::default(),
+            sink,
+            &CancelToken::new(),
+        )
+    }
+
+    fn test_cache(name: &str) -> (std::path::PathBuf, Cache) {
+        let root =
+            std::env::temp_dir().join(format!("lvpm-index-test-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let cache = Cache::open(&root).unwrap();
+        (root, cache)
+    }
+
+    #[test]
+    fn local_package_directories_cache_metadata_without_cache_blobs() {
+        let root =
+            std::env::temp_dir().join(format!("lvpm-local-source-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let packages = root.join("packages");
+        std::fs::create_dir_all(&packages).unwrap();
+
+        let archive = packages.join("local_thing-1.0.0.vip");
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("spec", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(
+                b"[Package]\nName=local_thing\nVersion=1.0.0\nDisplay Name=Local Thing\n[Dependencies]\nRequires=foo>=1.2\n",
+            )
+            .unwrap();
+        std::fs::write(&archive, writer.finish().unwrap().into_inner()).unwrap();
+
+        let idx = load(
+            &root.join("cache"),
+            false,
+            &[],
+            std::slice::from_ref(&packages),
+            false,
+            &NullSink,
+        )
+        .unwrap();
+        assert_eq!(idx.entries.len(), 1);
+        let entry = &idx.entries[0];
+        assert_eq!(entry.name, "local_thing");
+        assert_eq!(entry.display_name.as_deref(), Some("Local Thing"));
+        assert_eq!(entry.requires[0].name, "foo");
+        assert!(is_local_url(&entry.url));
+        assert_eq!(
+            std::fs::read(&entry.url).unwrap(),
+            std::fs::read(&archive).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("cache/content/sha256"))
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(root.join("cache/lvpm-cache.db").exists());
+
+        let valid_bytes = std::fs::read(&archive).unwrap();
+        std::fs::write(&archive, b"not a zip").unwrap();
+        assert!(
+            load(
+                &root.join("cache"),
+                false,
+                &[],
+                std::slice::from_ref(&packages),
+                false,
+                &NullSink,
+            )
+            .unwrap()
+            .entries
+            .is_empty()
+        );
+        std::fs::write(&archive, &valid_bytes).unwrap();
+        let restored = load(
+            &root.join("cache"),
+            false,
+            &[],
+            std::slice::from_ref(&packages),
+            false,
+            &NullSink,
+        )
+        .unwrap();
+        assert_eq!(
+            restored.entries[0].requires[0].min.as_ref().unwrap().raw,
+            "1.2"
+        );
+
+        let original = std::fs::metadata(&archive).unwrap();
+        std::fs::write(&archive, vec![0; original.len() as usize]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_modified(original.modified().unwrap())
+            .unwrap();
+        let cached = load(
+            &root.join("cache"),
+            false,
+            &[],
+            std::slice::from_ref(&packages),
+            false,
+            &NullSink,
+        )
+        .unwrap();
+        assert_eq!(cached.entries[0].name, "local_thing");
+        let refreshed = load(
+            &root.join("cache"),
+            true,
+            &[],
+            std::slice::from_ref(&packages),
+            false,
+            &NullSink,
+        )
+        .unwrap();
+        assert!(refreshed.entries.is_empty());
+        let invalidated = load(
+            &root.join("cache"),
+            false,
+            &[],
+            std::slice::from_ref(&packages),
+            false,
+            &NullSink,
+        )
+        .unwrap();
+        assert!(invalidated.entries.is_empty());
+
+        std::fs::remove_file(&archive).unwrap();
+        assert!(
+            load(
+                &root.join("cache"),
+                false,
+                &[],
+                std::slice::from_ref(&packages),
+                false,
+                &NullSink,
+            )
+            .unwrap()
+            .entries
+            .is_empty()
+        );
+        std::fs::write(packages.join("new.vip"), &valid_bytes).unwrap();
+        assert_eq!(
+            load(
+                &root.join("cache"),
+                false,
+                &[],
+                &[packages],
+                false,
+                &NullSink,
+            )
+            .unwrap()
+            .entries
+            .len(),
+            1
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn write_import_fixture(path: &Path, version: &str) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("spec", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(format!("[Package]\nName=imported_library\nVersion={version}\nDisplay Name=Imported Library\n[Dependencies]\nRequires=foo>=1.2\n").as_bytes()).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn imported_packages_survive_original_deletion_and_deduplicate_bytes() {
+        let (root, cache) = test_cache("import-directory");
+        let packages = root.join("packages");
+        std::fs::create_dir(&packages).unwrap();
+        let source = packages.join("first.vip");
+        let bytes = write_import_fixture(&source, "1.0.0");
+        std::fs::write(packages.join("second.ogp"), &bytes).unwrap();
+        std::fs::write(packages.join("ignored.txt"), b"not a package").unwrap();
+        let imports = cache_add(&root, &packages, false).unwrap();
+        assert_eq!(imports.len(), 2);
+        assert!(imports.iter().all(|import| !import.reused));
+        assert_eq!(imports[0].sha256, imports[1].sha256);
+        assert!(
+            cache_add(&root, &packages, false)
+                .unwrap()
+                .iter()
+                .all(|import| import.reused)
+        );
+        let records = cache.imported_packages().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].md5, md5_hex(&bytes));
+        assert_eq!(records[0].entry.requires[0].1.as_deref(), Some("1.2"));
+        assert_eq!(
+            std::fs::read_dir(root.join("content/sha256").join(&imports[0].sha256[..2]))
+                .unwrap()
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&packages).unwrap();
+        let index = load(&root, false, &[], &[], false, &NullSink).unwrap();
+        let entry = index.best("imported_library", None, None).unwrap();
+        assert_eq!(entry.url, format!("cache:{}", imports[0].sha256));
+        assert_eq!(
+            cache
+                .load(entry.url.strip_prefix("cache:").unwrap())
+                .unwrap()
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(index.search("Imported Library").len(), 1);
+        drop(cache);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn import_refresh_missing_blobs_and_changed_files_are_handled() {
+        let (root, cache) = test_cache("import-refresh");
+        let source = root.join("package.vip");
+        let original = write_import_fixture(&source, "1.0.0");
+        let first = cache_add(&root, &source, false).unwrap();
+        let sha = &first[0].sha256;
+        let blob = root.join("content/sha256").join(&sha[..2]).join(sha);
+        std::fs::remove_file(&blob).unwrap();
+        assert!(!cache_add(&root, &source, false).unwrap()[0].reused);
+        std::fs::write(&blob, b"corrupt").unwrap();
+        assert!(!cache_add(&root, &source, true).unwrap()[0].reused);
+        assert_eq!(cache.load(sha).unwrap().unwrap(), original);
+        let newer = write_import_fixture(&source, "2.0.0.1");
+        let changed = cache_add(&root, &source, false).unwrap();
+        assert!(!changed[0].reused);
+        assert_ne!(changed[0].sha256, *sha);
+        let index = load(&root, false, &[], &[], false, &NullSink).unwrap();
+        assert_eq!(
+            index
+                .best("imported_library", None, None)
+                .unwrap()
+                .version
+                .raw,
+            "2.0.0.1"
+        );
+        assert_eq!(cache.load(&changed[0].sha256).unwrap().unwrap(), newer);
+        drop(cache);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn invalid_imports_do_not_create_package_records() {
+        let (root, cache) = test_cache("invalid-import");
+        let source = root.join("invalid.vip");
+        std::fs::write(&source, b"not a zip").unwrap();
+        assert!(cache_add(&root, &source, false).is_err());
+        assert!(cache_add(&root, &root.join("missing.vip"), false).is_err());
+        assert!(cache.imported_packages().unwrap().is_empty());
+        drop(cache);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bytes_are_imported_under_their_label_as_the_path_and_resolve_from_the_cache() {
+        let (root, cache) = test_cache("import-bytes");
+        let bytes = write_import_fixture(&root.join("unused.vip"), "1.0.0");
+        let label = "p.vipc!/Packages/imported_library-1.0.0.vip";
+
+        let import = cache_add_bytes(&root, label, &bytes).unwrap();
+
+        assert_eq!(
+            (import.path.as_path(), import.reused),
+            (Path::new(label), false)
+        );
+        assert_eq!(cache.load(&import.sha256).unwrap().unwrap(), bytes);
+        let index = load(&root, false, &[], &[], false, &NullSink).unwrap();
+        let entry = index.best("imported_library", None, None).unwrap();
+        assert_eq!(entry.url, format!("cache:{}", import.sha256));
+        // The label is the row's identity: the same one is one import, another is a second.
+        cache_add_bytes(&root, label, &bytes).unwrap();
+        assert_eq!(cache.imported_packages().unwrap().len(), 1);
+        cache_add_bytes(&root, "q.vipc!/imported_library-1.0.0.vip", &bytes).unwrap();
+        assert_eq!(cache.imported_packages().unwrap().len(), 2);
+        drop(cache);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_package_are_refused_naming_the_label_and_record_nothing() {
+        let (root, cache) = test_cache("import-bad-bytes");
+
+        let why = cache_add_bytes(&root, "p.vipc!/x-1.vip", b"not a zip")
+            .err()
+            .expect("a refusal");
+
+        assert!(
+            format!("{why:#}").starts_with("importing p.vipc!/x-1.vip"),
+            "{why:#}"
+        );
+        assert!(cache.imported_packages().unwrap().is_empty());
+        assert!(!root.join("content").exists());
+        drop(cache);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    const BODY: &str = "[Self]\nSelf.Name=Test\n";
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 22\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n[Self]\nSelf.Name=Test\n";
+    const NOT_MODIFIED: &str =
+        "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n";
+
+    #[test]
+    fn a_304_on_a_cached_feed_serves_the_stored_body() {
+        let s = stub(&[OK, NOT_MODIFIED]);
+        let (root, cache) = test_cache("revalidate");
+        let client = Client::new();
+
+        assert_eq!(
+            feed_body(&cache, &client, &s.url, "http://b/", false, &NullSink).unwrap(),
+            BODY
+        );
+        assert_eq!(
+            feed_body(&cache, &client, &s.url, "http://b/", true, &NullSink).unwrap(),
+            BODY
+        );
+
+        let reqs = s.requests.lock().unwrap();
+        assert!(
+            !reqs[0].contains("if-none-match"),
+            "nothing was cached to revalidate against"
+        );
+        assert!(
+            reqs[1].to_lowercase().contains("if-none-match: \"v1\""),
+            "the stored ETag goes back out: {}",
+            reqs[1]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_304_with_nothing_cached_falls_back_to_a_plain_get() {
+        // A 304 carries no body; answering one unasked would otherwise leave
+        // the feed empty.
+        let s = stub(&[NOT_MODIFIED, OK]);
+        let (root, cache) = test_cache("unsolicited-304");
+
+        let body = feed_body(
+            &cache,
+            &Client::new(),
+            &s.url,
+            "http://b/",
+            false,
+            &NullSink,
+        )
+        .unwrap();
+
+        assert_eq!(body, BODY);
+        assert_eq!(
+            s.requests.lock().unwrap().len(),
+            2,
+            "the 304 was retried unconditionally"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_cancel_ends_the_load_before_the_next_feed_is_asked() {
+        let (first, second) = (stub(&[OK]), stub(&[OK]));
+        let feeds = [first.url.clone(), second.url.clone()].map(Remote::Hosted);
+        let (root, _cache) = test_cache("cancel-between-feeds");
+        let load_with = |token: &CancelToken, sink: &dyn EventSink| {
+            let sources = SourceSet {
+                extra: &feeds,
+                local: &[],
+                defaults: false,
+                ..SourceSet::default()
+            };
+            super::load(&root, false, &sources, &Oci::default(), sink, token)
+        };
+
+        // Cancelled before the first request: no feed is asked.
+        let before = CancelToken::new();
+        before.cancel();
+        let why = load_with(&before, &NullSink)
+            .err()
+            .expect("it was cancelled");
+        assert!(why.is::<Cancelled>(), "{why:#}");
+        assert!(first.requests.lock().unwrap().is_empty());
+
+        // Cancelled as the first feed has answered: the second is not asked.
+        let token = CancelToken::new();
+        let sink = CancelOn::new(&token, |event| matches!(event, Event::FeedChecked { .. }));
+        let why = load_with(&token, &sink).err().expect("it was cancelled");
+        assert!(why.is::<Cancelled>(), "{why:#}");
+        assert_eq!(sink.answered(), Some(true));
+        assert_eq!(first.requests.lock().unwrap().len(), 1);
+        assert!(second.requests.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    const SAMPLE: &str = "\
+[Self]
+Self.Name=Test
+
+[Package abcdef_thing-1.0.16.17]
+Package.URL=packages/abcdef_thing/abcdef_thing-1.0.16.17.vip
+Package.MD5=D3B17D5964E33B4DC2BDB905E2200074
+Platform.Exclusive_LabVIEW_Version=LabVIEW>=11.0
+Dependencies.Requires=oglib_error>=4.2.0.23,jki_lib_state_machine>=2.0.0
+Package.Display Name=A Thing
+";
+
+    #[test]
+    fn parses_a_package_section() {
+        let mut out = Vec::new();
+        parse_into(SAMPLE, "http://example.test/", &mut out);
+        assert_eq!(out.len(), 1);
+        let e = &out[0];
+        assert_eq!(e.name, "abcdef_thing");
+        assert_eq!(
+            e.url,
+            "http://example.test/packages/abcdef_thing/abcdef_thing-1.0.16.17.vip"
+        );
+        assert_eq!(e.md5.as_deref(), Some("d3b17d5964e33b4dc2bdb905e2200074"));
+        assert_eq!(e.lv_min, Some(11.0));
+        assert_eq!(e.requires.len(), 2);
+        assert_eq!(e.requires[0].name, "oglib_error");
+        assert_eq!(e.requires[0].min.as_ref().unwrap().raw, "4.2.0.23");
+    }
+
+    #[test]
+    fn a_feed_entry_whose_url_leaves_the_feeds_folder_is_dropped() {
+        let feed = "[Package up-1.0]\nPackage.URL=../x.vip\n\n\
+                    [Package encoded-1.0]\nPackage.URL=%2E%2e/x.vip\n\n\
+                    [Package backslash-1.0]\nPackage.URL=..\\x.vip\n\n\
+                    [Package tab-1.0]\nPackage.URL=.\t./x.vip\n\n\
+                    [Package cr-1.0]\nPackage.URL=.\r./x.vip\n\n\
+                    [Package slash-1.0]\nPackage.URL=..%2Fx.vip\n\n\
+                    [Package semicolon-1.0]\nPackage.URL=..;/x.vip\n\n\
+                    [Package encoded-semicolon-1.0]\nPackage.URL=team/.%2e;/x.vip\n\n\
+                    [Package escaped-semicolon-1.0]\nPackage.URL=team/..%3B/x.vip\n\n\
+                    [Package twice-1.0]\nPackage.URL=%252e%252e/x.vip\n\n\
+                    [Package inside-1.0]\nPackage.URL=team/../x.vip\n\n\
+                    [Package dots-1.0]\nPackage.URL=team/x..y.vip\n";
+        let mut out = Vec::new();
+        parse_into(feed, "http://example.test/feed/", &mut out);
+        let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["inside", "dots"]);
+    }
+
+    #[test]
+    fn an_entry_whose_url_resolves_out_of_a_nested_feed_is_credited_to_the_outer_one() {
+        let feeds = [
+            ("outer-index".to_string(), "http://h/vipm/".to_string()),
+            ("team-index".to_string(), "http://h/vipm/team/".to_string()),
+        ];
+        assert_eq!(
+            source_of("http://h/vipm/team/x/../../y.vip", &feeds),
+            "outer-index"
+        );
+        assert_eq!(source_of("http://h/vipm/team/y.vip", &feeds), "team-index");
+    }
+
+    #[test]
+    fn of_two_feeds_whose_folders_parse_alike_the_first_read_is_credited() {
+        let feeds = [
+            ("first".to_string(), "http://H/feed/".to_string()),
+            ("second".to_string(), "http://h/feed/".to_string()),
+        ];
+        assert_eq!(source_of("http://h/feed/y.vip", &feeds), "first");
+    }
+
+    #[test]
+    fn a_feed_entry_carries_its_release_date_and_none_when_it_has_none() {
+        let feed = format!(
+            "{SAMPLE}Package.Release Date=Thu, 19 May 2016 15:46:24 -0500\n\n\
+             [Package undated-1.0]\nPackage.URL=u.vip\n\n\
+             [Package garbled-1.0]\nPackage.URL=g.vip\n\
+             Package.Release Date=???, 19 ??? 2016 15:46:24 -0500\n"
+        );
+        let mut out = Vec::new();
+        parse_into(&feed, "http://example.test/", &mut out);
+        let released: Vec<Option<i64>> = out.iter().map(|e| e.released).collect();
+        // 2016-05-19T20:46:24Z, the feed's `15:46:24 -0500`.
+        assert_eq!(released, [Some(1_463_690_784), None, None]);
+    }
+
+    #[test]
+    fn a_cache_imported_entry_and_a_lvpkg_read_entry_have_no_release_date() {
+        let (root, cache) = test_cache("released-none");
+        let source = root.join("package.vip");
+        write_import_fixture(&source, "1.0.0");
+        cache_add(&root, &source, false).unwrap();
+        let index = load(&root, false, &[], &[], false, &NullSink).unwrap();
+        assert_eq!(index.entries[0].source, CACHE_SOURCE);
+        assert_eq!(index.entries[0].released, None);
+
+        let meta = crate::lvpkg::Meta {
+            name: "alpha".into(),
+            version: "1.0.0".into(),
+            labview: ">=2016".into(),
+            vendor: "Vendor".into(),
+            display_name: "Alpha".into(),
+            install_dir: "vi.lib/Vendor/Alpha".into(),
+            dependencies: Vec::new(),
+        };
+        let built = crate::lvpkg::write(&meta, &[("a.vi".into(), b"vi".to_vec())], None).unwrap();
+        let entry = entry_from_bytes(Path::new("alpha-1.0.0.lvpkg"), &built).unwrap();
+        assert_eq!(entry.name, "alpha");
+        assert_eq!(entry.released, None);
+        drop(cache);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn lv_gate_filters_candidates() {
+        let mut out = Vec::new();
+        parse_into(SAMPLE, "http://example.test/", &mut out);
+        let idx = Index { entries: out };
+        assert!(idx.best("abcdef_thing", None, Some(20.0)).is_some());
+        assert!(idx.best("abcdef_thing", None, Some(10.0)).is_none());
+    }
+
+    #[test]
+    fn a_bitness_in_the_lv_gate_is_not_read_as_the_version() {
+        assert_eq!(parse_lv_gate("LabVIEW x64>=20.0"), Some(20.0));
+        assert_eq!(parse_lv_gate("LabVIEW x86>=16.0"), Some(16.0));
+        assert_eq!(parse_lv_gate("LabVIEW x64=26.3"), Some(26.3));
+        assert_eq!(parse_lv_gate("LabVIEW>=8.6"), Some(8.6));
+        assert_eq!(parse_lv_gate("LabVIEW>=16.0,<=20.0"), Some(16.0));
+        assert_eq!(parse_lv_gate("LabVIEW>="), None);
+        assert_eq!(parse_lv_gate("LabVIEW<=20.0"), None);
+        assert_eq!(parse_lv_gate("LabVIEW<=20.0,>=16.0"), Some(16.0));
+    }
+
+    fn entry_requiring(requires: &str) -> Entry {
+        Entry {
+            name: "dependent".into(),
+            version: Version::parse("1.0"),
+            url: String::new(),
+            md5: None,
+            display_name: None,
+            requires: parse_requires(requires),
+            lv_min: None,
+            source: String::new(),
+            released: None,
+            index_pin: None,
+        }
+    }
+
+    fn listed(versions: &[&str]) -> Index {
+        Index {
+            entries: versions
+                .iter()
+                .map(|v| Entry {
+                    name: "foo".into(),
+                    version: Version::parse(v),
+                    ..entry_requiring("")
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_strict_requirement_excludes_its_own_version() {
+        let requirements = parse_requires("a>1.2,b>=1.2,c=1.2,d==1.2,e<1.2,f");
+        let strict: Vec<bool> = requirements.iter().map(|r| r.min_exclusive).collect();
+        assert_eq!(strict, [true, false, false, false, false, false]);
+
+        let index = listed(&["1.1", "1.2"]);
+        let above = requirements[0].floor();
+        let at_least = requirements[1].floor();
+        assert!(index.best("foo", above.as_ref(), None).is_none());
+        assert_eq!(
+            index
+                .best("foo", at_least.as_ref(), None)
+                .map(|e| e.version.raw.as_str()),
+            Some("1.2")
+        );
+        let newer = listed(&["1.2", "1.2.1"]);
+        assert_eq!(
+            newer
+                .best("foo", above.as_ref(), None)
+                .map(|e| e.version.raw.as_str()),
+            Some("1.2.1")
+        );
+    }
+
+    #[test]
+    fn a_strict_requirement_stays_strict_through_the_cache() {
+        let entry = entry_requiring("a>1.2,b>=1.2");
+        let stored = LocalEntry::from(&entry);
+        assert_eq!(stored.requires[0].1.as_deref(), Some(">1.2"));
+        assert_eq!(stored.requires[1].1.as_deref(), Some("1.2"));
+
+        let restored = local_entry(stored, String::new(), None);
+        assert!(restored.requires[0].min_exclusive);
+        assert_eq!(restored.requires[0].min.as_ref().unwrap().raw, "1.2");
+        assert!(!restored.requires[1].min_exclusive);
+    }
+
+    #[test]
+    fn a_hosted_package_comes_from_the_feed_whose_folder_holds_it() {
+        let feeds = feeds(
+            &[
+                "http://h/feed".to_string(),
+                "http://h/feed/nested/".to_string(),
+            ],
+            false,
+        );
+        assert_eq!(feeds[0].0, "http://h/feed/index.vipr");
+        assert_eq!(
+            source_of("http://h/feed/packages/a-1.0.vip", &feeds),
+            "http://h/feed/index.vipr"
+        );
+        // The deeper folder is the source of what sits in it.
+        assert_eq!(
+            source_of("http://h/feed/nested/packages/a-1.0.vip", &feeds),
+            "http://h/feed/nested/index.vipr"
+        );
+    }
+
+    #[test]
+    fn a_package_folder_and_an_imported_archive_are_both_local() {
+        let feeds = feeds(&[], true);
+        assert_eq!(feeds.len(), SOURCES.len());
+        for url in [
+            r"C:\packages\a-1.0.vip",
+            "/packages/a-1.0.vip",
+            "cache:abcd",
+        ] {
+            assert_eq!(source_of(url, &feeds), "local", "{url}");
+        }
+    }
+
+    #[test]
+    fn a_hosted_source_is_read_before_the_public_defaults() {
+        let feeds = feeds(&["http://h/feed".to_string()], true);
+        assert_eq!(feeds[0].0, "http://h/feed/index.vipr");
+        let defaults: Vec<&str> = feeds[1..].iter().map(|(url, _)| url.as_str()).collect();
+        let sources: Vec<&str> = SOURCES.iter().map(|(url, _)| *url).collect();
+        assert_eq!(defaults, sources);
+    }
+
+    /// The entries of an index file that is `<name> <version>`.
+    fn parse_listed(_key: &str, text: &str) -> Result<Vec<Entry>> {
+        let (name, version) = text.split_once(' ').unwrap();
+        let listed = LocalEntry {
+            name: name.to_string(),
+            version: version.to_string(),
+            display_name: None,
+            requires: Vec::new(),
+            lv_min: None,
+        };
+        Ok(vec![local_entry(listed, String::new(), None)])
+    }
+
+    /// Makes the next read of `url` answer `body` from the cache, with no request.
+    fn seed_feed(cache: &Cache, url: &str, body: &str) {
+        let sha256 = Some(cache.store(body.as_bytes()).unwrap());
+        let state = SourceState {
+            sha256,
+            ..SourceState::default()
+        };
+        cache.record(url, "remote", url, &state).unwrap();
+    }
+
+    #[test]
+    fn an_earlier_sources_line_wins_a_name_over_the_index_and_the_index_over_the_public_indexes() {
+        let (root, cache) = test_cache("rank-sources-lines");
+        seed_feed(
+            &cache,
+            "http://h/first/index.vipr",
+            "[Package foo-1.0]
+Package.URL=foo-1.0.vip
+",
+        );
+        seed_feed(
+            &cache,
+            SOURCES[0].0,
+            "[Package bar-3.0]
+Package.URL=bar-3.0.vip
+",
+        );
+        seed_feed(&cache, SOURCES[1].0, "");
+        let listed = IndexFeed {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+        };
+        let fetch = |_: &IndexFeed, key: &str| {
+            Ok(match key {
+                "foo" => Some("foo 2.0".to_string()),
+                "bar" => Some("bar 1.0".to_string()),
+                _ => None,
+            })
+        };
+        let extra = [
+            Remote::Hosted("http://h/first".to_string()),
+            Remote::Index(listed),
+        ];
+        let wanted = ["foo".to_string(), "bar".to_string()];
+        let sources = SourceSet {
+            extra: &extra,
+            defaults: true,
+            wanted: &wanted,
+            index_fetch: &fetch,
+            index_parse: parse_listed,
+            ..SourceSet::default()
+        };
+        let loaded = load_each(
+            &root,
+            false,
+            &sources,
+            &HashMap::new(),
+            &Oci::default(),
+            &NullSink,
+            &CancelToken::new(),
+            |_, error| Err(error),
+        )
+        .unwrap();
+        let from: Vec<(&str, &str)> = (loaded.index.entries.iter())
+            .map(|e| (e.name.as_str(), e.source.as_str()))
+            .collect();
+        assert_eq!(
+            from,
+            [
+                ("foo", "http://h/first/index.vipr"),
+                ("bar", "github-index:o/r")
+            ]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn with_no_community_index_nothing_is_asked_and_nothing_is_added() {
+        let fetch = |_: &IndexFeed, key: &str| -> Result<Option<String>> {
+            panic!("asked for {key}");
+        };
+        let ask = IndexAsk {
+            feeds: Vec::new(),
+            fetch: &fetch,
+            parse: parse_listed,
+        };
+        let mut entries = Vec::new();
+        let mut failed = Vec::new();
+        let wanted = ["foo".to_string()];
+        let mut on_fail = |source: &str, _| {
+            failed.push(source.to_string());
+            Ok(())
+        };
+        ask.read(&wanted, &CancelToken::new(), &mut entries, &mut on_fail)
+            .unwrap();
+        assert!(entries.is_empty() && failed.is_empty());
+    }
+
+    #[test]
+    fn a_name_comes_only_from_the_first_source_that_lists_it() {
+        let listed = |name: &str, version: &str, source: &str| Entry {
+            source: source.to_string(),
+            ..local_entry(
+                LocalEntry {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    display_name: None,
+                    requires: Vec::new(),
+                    lv_min: None,
+                },
+                String::new(),
+                None,
+            )
+        };
+        let kept = first_source_wins(
+            vec![
+                listed("Alpha", "1.0", "hosted"),
+                listed("alpha", "1.1", "hosted"),
+                listed("ALPHA", "9.0", "ni"),
+                listed("beta", "2.0", "ni"),
+            ],
+            &HashMap::new(),
+        );
+        let kept: Vec<(&str, String, &str)> = kept
+            .iter()
+            .map(|e| (e.name.as_str(), e.version.to_string(), e.source.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("Alpha", "1.0".to_string(), "hosted"),
+                ("alpha", "1.1".to_string(), "hosted"),
+                ("beta", "2.0".to_string(), "ni"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_public_defaults_merge_their_versions_as_one_source() {
+        let (ni, jki) = (SOURCES[0].0, SOURCES[1].0);
+        let listed = |version: &str, source: &str| Entry {
+            source: source.to_string(),
+            ..local_entry(
+                LocalEntry {
+                    name: "dqmh".to_string(),
+                    version: version.to_string(),
+                    display_name: None,
+                    requires: Vec::new(),
+                    lv_min: None,
+                },
+                String::new(),
+                None,
+            )
+        };
+        let kept = first_source_wins(
+            vec![listed("6.0", ni), listed("6.0.0", jki), listed("7.1", jki)],
+            &HashMap::new(),
+        );
+        let kept: Vec<(String, &str)> = kept
+            .iter()
+            .map(|e| (e.version.to_string(), e.source.as_str()))
+            .collect();
+        assert_eq!(kept, [("6.0".to_string(), ni), ("7.1".to_string(), jki)]);
+        // A source ahead of the defaults still shadows both.
+        let shadowed = first_source_wins(
+            vec![listed("1.0", "hosted"), listed("7.1", jki)],
+            &HashMap::new(),
+        );
+        assert_eq!(shadowed[0].source, "hosted");
+        assert_eq!(shadowed.len(), 1);
+    }
+
+    #[test]
+    fn a_source_pin_is_owned_by_the_feed_url_of_its_folder_with_or_without_a_slash() {
+        let hosted = |folder: &str| Feed::Hosted(folder.to_string());
+        let sources = [
+            ("first".to_string(), hosted("http://h/one")),
+            ("second".to_string(), hosted("http://h/two/")),
+            (
+                "team".to_string(),
+                Feed::Oci(oci::FeedUrl::parse("oci://r:5000/org").unwrap()),
+            ),
+        ];
+        let pinned = BTreeMap::from([
+            ("Alpha".to_string(), "first".to_string()),
+            ("beta".to_string(), "second".to_string()),
+            ("delta".to_string(), "team".to_string()),
+            // Names no entry of `sources`: nothing owns it.
+            ("gamma".to_string(), "nope".to_string()),
+        ]);
+        assert_eq!(
+            owners(&sources, &pinned),
+            HashMap::from([
+                (
+                    "alpha".to_string(),
+                    Some("http://h/one/index.vipr".to_string())
+                ),
+                (
+                    "beta".to_string(),
+                    Some("http://h/two/index.vipr".to_string())
+                ),
+                ("delta".to_string(), Some("oci://r:5000/org".to_string())),
+                ("gamma".to_string(), None),
+            ])
+        );
+        assert!(owners(&sources, &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_dependency_can_pin_the_index_source() {
+        let project = crate::project::parse(
+            "[sources]\ncommunity = \"github:o/r\"\n\n\
+             [dependencies]\nx = { version = \"*\", index = \"community\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            owners(&project.resolved_sources().unwrap(), &project.source_pins),
+            HashMap::from([("x".to_string(), Some("github-index:o/r".to_string()))])
+        );
+    }
+
+    #[test]
+    fn an_index_source_is_split_out_in_sources_order_and_is_no_hosted_folder() {
+        let index = |owner: &str, repo: &str| Feed::Index {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        };
+        let sources = vec![
+            ("one".to_string(), index("o", "r")),
+            ("net".to_string(), Feed::Hosted("http://h/x".to_string())),
+            ("two".to_string(), index("o", "s")),
+        ];
+        let (remotes, registries) = split_sources(sources, &BTreeMap::new());
+        assert!(registries.is_empty());
+        let feed = |owner: &str, repo: &str| {
+            Remote::Index(IndexFeed {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+            })
+        };
+        assert_eq!(
+            remotes,
+            [
+                feed("o", "r"),
+                Remote::Hosted("http://h/x".to_string()),
+                feed("o", "s")
+            ]
+        );
+        assert_eq!(folders(&remotes), ["http://h/x"]);
+    }
+
+    #[test]
+    fn an_oci_reference_is_neither_a_local_file_nor_a_hosted_download() {
+        let reference = format!("oci://r:5000/team/alpha@sha256:{}", "ab".repeat(32));
+        assert!(!is_local_url(&reference));
+        assert!(!is_local_url("http://h/a.vip") && !is_local_url("https://h/a.vip"));
+        assert!(is_local_url("C:/packages/a.vip") && is_local_url("cache:ab"));
+        // Not credited to a hosted feed, whatever folder it is compared with.
+        let feeds = [("http://h/index.vipr".to_string(), "http://h/".to_string())];
+        assert_eq!(source_of(&reference, &feeds), reference);
+    }
+
+    #[test]
+    fn the_sources_split_into_hosted_folders_and_oci_feeds_with_their_pins() {
+        let oci = |url: &str| Feed::Oci(oci::FeedUrl::parse(url).unwrap());
+        let sources = vec![
+            ("net".to_string(), Feed::Hosted("http://h/x".to_string())),
+            ("team".to_string(), oci("oci://r:5000/team")),
+            ("idle".to_string(), oci("oci://r:5000/idle")),
+        ];
+        let pins = BTreeMap::from([
+            ("Alpha".to_string(), "team".to_string()),
+            ("beta".to_string(), "net".to_string()),
+            ("gamma".to_string(), "team".to_string()),
+        ]);
+        let (remotes, registries) = split_sources(sources, &pins);
+        assert_eq!(folders(&remotes), ["http://h/x"]);
+        let split: Vec<(&str, String, &[String])> = registries
+            .iter()
+            .map(|feed| {
+                (
+                    feed.name.as_str(),
+                    feed.url.to_string(),
+                    feed.pinned.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            split,
+            [
+                (
+                    "team",
+                    "oci://r:5000/team".to_string(),
+                    ["Alpha".to_string(), "gamma".to_string()].as_slice()
+                ),
+                ("idle", "oci://r:5000/idle".to_string(), [].as_slice()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_source_pin_owns_its_name_over_the_cache_a_local_folder_and_earlier_feeds() {
+        let listed = |name: &str, version: &str, source: &str| Entry {
+            source: source.to_string(),
+            ..local_entry(
+                LocalEntry {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    display_name: None,
+                    requires: Vec::new(),
+                    lv_min: None,
+                },
+                String::new(),
+                None,
+            )
+        };
+        let owners = HashMap::from([("alpha".to_string(), Some("second".to_string()))]);
+        let kept = |entries: Vec<Entry>| -> Vec<(String, String)> {
+            first_source_wins(entries, &owners)
+                .iter()
+                .map(|e| (e.name.clone(), e.source.clone()))
+                .collect()
+        };
+        let pair = |name: &str, source: &str| (name.to_string(), source.to_string());
+
+        // The pinned name comes from "second" alone; "gamma" stays first-wins.
+        let entries = vec![
+            listed("alpha", "9.0", CACHE_SOURCE),
+            listed("alpha", "8.0", "/local/folder"),
+            listed("Alpha", "2.0", "first"),
+            listed("gamma", "1.0", "first"),
+            listed("Alpha", "1.0", "second"),
+            listed("gamma", "5.0", "second"),
+        ];
+        assert_eq!(
+            kept(entries),
+            [pair("gamma", "first"), pair("Alpha", "second"),]
+        );
+
+        // The pinned source does not list the name: nothing is left, and no
+        // other source takes its place.
+        let entries = vec![
+            listed("alpha", "2.0", "first"),
+            listed("gamma", "1.0", "second"),
+        ];
+        assert_eq!(kept(entries), [pair("gamma", "second")]);
+    }
+
+    #[test]
+    fn a_source_pin_naming_an_unknown_source_matches_no_entry_and_does_not_fall_back() {
+        let owners = owners(
+            &[(
+                "second".to_string(),
+                Feed::Hosted("http://h/two".to_string()),
+            )],
+            &BTreeMap::from([("alpha".to_string(), "nope".to_string())]),
+        );
+        let listed = |name: &str, source: &str| Entry {
+            source: source.to_string(),
+            ..local_entry(
+                LocalEntry {
+                    name: name.to_string(),
+                    version: "1.0".to_string(),
+                    display_name: None,
+                    requires: Vec::new(),
+                    lv_min: None,
+                },
+                String::new(),
+                None,
+            )
+        };
+        let kept = first_source_wins(
+            vec![
+                listed("alpha", "http://h/two/index.vipr"),
+                listed("beta", "http://h/two/index.vipr"),
+            ],
+            &owners,
+        );
+        let names: Vec<&str> = kept.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["beta"]);
+    }
+
+    #[test]
+    fn an_imported_archive_wins_over_a_local_folder() {
+        let (root, _cache) = test_cache("import-over-folder");
+        let imports = root.join("imports");
+        let folder = root.join("folder");
+        std::fs::create_dir_all(&imports).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        write_import_fixture(&imports.join("imported_library-1.0.0.vip"), "1.0.0");
+        write_import_fixture(&folder.join("imported_library-2.0.0.vip"), "2.0.0");
+        cache_add(&root, &imports, false).unwrap();
+
+        let folders = [folder];
+        let sources = SourceSet {
+            extra: &[],
+            local: &folders,
+            defaults: false,
+            ..SourceSet::default()
+        };
+        let resolved = load_each(
+            &root,
+            false,
+            &sources,
+            &HashMap::new(),
+            &Oci::default(),
+            &NullSink,
+            &CancelToken::new(),
+            |_, error| Err(error),
+        )
+        .unwrap()
+        .index;
+        // sync's archive lookup keeps every source, so a locked copy is found.
+        let lookup = load(&root, false, &[], &folders, false, &NullSink).unwrap();
+
+        assert_eq!(resolved.entries.len(), 1);
+        assert_eq!(resolved.entries[0].version.to_string(), "1.0.0");
+        assert_eq!(resolved.entries[0].source, CACHE_SOURCE);
+        assert_eq!(lookup.entries.len(), 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn what_a_registry_answered_is_told_apart_as_a_listing_fault() {
+        let status = |status| oci::Error::Status {
+            registry: "r:1".into(),
+            status,
+            request: "GET".into(),
+        };
+        assert_eq!(fault_of(&status(404)), ListingFault::NotListed);
+        assert_eq!(fault_of(&status(401)), ListingFault::Refused);
+        assert_eq!(fault_of(&status(403)), ListingFault::Refused);
+        assert!(
+            matches!(fault_of(&status(500)), ListingFault::Unreachable(c) if c.contains("500"))
+        );
+        let login = oci::Error::LoginRefused {
+            registry: "r:1".into(),
+            origin: "auths".into(),
+        };
+        assert!(login.is_host_level());
+        assert_eq!(fault_of(&login), ListingFault::Host(login.to_string()));
+    }
+}

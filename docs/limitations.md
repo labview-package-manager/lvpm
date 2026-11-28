@@ -1,32 +1,40 @@
 # Known limitations
 
-- `Replace Mode = If Newer` leaves a file that is already on disk alone
-  instead of replacing it.
+- `Replace Mode = If Newer` only writes when the file is absent; doing it
+  properly means comparing archive timestamps against disk.
 - Installing a package that is already at that version does nothing, so a
   package VI edited or resaved by mistake cannot be repaired that way;
   `lvpm uninstall` and then `lvpm install` does it.
-- No dependency conflict resolution: each package gets the newest version
-  meeting the highest floor anything asks for, and a manifest pin always
-  wins (with a warning when a dependent asks for more).
+- Dependency conflicts are solved only when a project is locked. A named
+  install outside a project resolves greedily, with no backtracking: each name
+  takes the newest version satisfying the highest floor asked of it, so a
+  conflict the solver would settle can still fail.
+- No mass compile; LabVIEW recompiles installed VIs on first load.
+- Install hooks are off by default and the allowlist is by package name, not
+  by VI: allowing a package allows every hook VI it ships, and a hook runs
+  with your rights. The rules are in [Hooks](labview-integration.md#hooks).
 - A hook VI's own `error out` is not read back. A hook that fails internally
   but runs to completion reports as ok.
-- An install that fails part-way through writing a package's files leaves
-  them unrecorded (and, on an upgrade, the old version already removed) until
-  the install is run again.
-- Windows is the tested platform. Linux is verified against LabVIEW 2026 Q3
-  in NI's container image only, and does not yet honour a package's
-  `Exclusive_OS` ([linux.md](linux.md)).
-- In a venv, `PreInstall` hooks cannot run (the venv's LabVIEW only starts
-  once the files are down), and file groups aimed at machine locations
-  (`<OS ...>`, `<temp>`) are skipped — both are recorded in the manifest and
-  shown by `lvpm list`. A hook that drops palette files into the overlay is
-  picked up at the next `lvpm launch`, not by a refresh. Uninstall hooks never
-  run in a venv, whose LabVIEW has to be closed before its files can be
-  removed.
+- A failure part-way through unpacking leaves files behind with no record,
+  and one failed download aborts the rest of the plan.
+- In a venv, no install or uninstall hook runs during an install or uninstall,
+  and nothing allows one (`lvpm run-hooks` runs a kept PostInstall by hand): they
+  act on the LabVIEW installation, not on an overlay. File groups aimed at
+  machine locations (`<OS ...>`, `<temp>`) are skipped. Both are recorded and
+  shown by `lvpm list`.
 - Some packages don't work in a venv yet (Panther Dashboard for DQMH), and
-  some need their PostInstall hook run by hand (AsciiDoc for LabVIEW).
-  [package-notes.md](package-notes.md) lists them.
+  some need a hook run by hand (AsciiDoc for LabVIEW).
+  [Package notes](package-notes.md) lists them.
 - `lvpm launch` checks install records, not file contents: a package VI
   edited or resaved since install is not detected.
+- In NI's LabVIEW Linux images CI runs only the smoke flow
+  ([Continuous integration](https://github.com/ThatsTheEnd/lvpm/blob/main/CONTRIBUTING.md#continuous-integration));
+  the `@labview` acceptance scenarios run in the Windows image only. Linux
+  does not yet honour a package's `Exclusive_OS` ([Linux](https://github.com/ThatsTheEnd/lvpm/blob/main/docs/linux.md)).
+- `lvpm build` packages one library's members as a `.lvpkg`, lvpm's own
+  format: no build hooks, no probes or templates from outside the library.
+  VIPM cannot read it, so don't hand it to VIPM users
+  ([ADR 6](adr/0006-lvpkg-only-vip-read-only.md)).
 
-[roadmap.md](roadmap.md) has what is planned.
+The [roadmap](https://github.com/ThatsTheEnd/lvpm/blob/main/docs/roadmap.md)
+has what is planned.

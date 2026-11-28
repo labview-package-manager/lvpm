@@ -1,0 +1,378 @@
+//! `--json`: JSON Lines on stdout. Each event is one line, `{"event": name,
+//! "data": {...}}` (no `data` for an event with no fields), and the last line
+//! is `{"result": ...}` or `{"error": message}`, so a reader tells them apart
+//! by their top-level key.
+
+use lvpm_core::events::{Event, EventSink};
+use std::io::Write;
+
+/// Writes each event as one line on stdout.
+pub struct JsonSink;
+
+impl EventSink for JsonSink {
+    fn emit(&self, event: Event) {
+        print(&to_line(serde_json::json!(event)));
+    }
+}
+
+/// The line a command that succeeded ends with.
+pub fn result(result: &serde_json::Value) -> String {
+    to_line(serde_json::json!({ "result": result }))
+}
+
+/// The line a command that failed ends with: the error and its causes.
+pub fn error(error: &anyhow::Error) -> String {
+    let text = super::lock::listing_error(error).unwrap_or_else(|| format!("{error:#}"));
+    to_line(serde_json::json!({ "error": text }))
+}
+
+/// One line on stdout, written under one lock so no other write splits it. A
+/// write error, such as a closed pipe, loses the line and is ignored; the exit
+/// code is kept. A reader that stopped listening is not worth a panic.
+pub fn print(text: &str) {
+    let _ = writeln!(std::io::stdout().lock(), "{text}");
+}
+
+/// serde escapes only the ASCII controls; feed text can also hold C1
+/// controls (U+009B starts a terminal sequence) and the line separators, so
+/// those are escaped too. They can only stand inside a string, where `\uXXXX`
+/// is the same value.
+fn to_line(value: serde_json::Value) -> String {
+    value
+        .to_string()
+        .chars()
+        .map(
+            |c| match c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                true => format!("\\u{:04x}", c as u32),
+                false => c.to_string(),
+            },
+        )
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lvpm_core::errors::{ListingFailure, ListingFailures, ListingFault};
+    use lvpm_core::events::{AddedDependency, Phase, Retarget, SourceKind};
+    use lvpm_core::git::GitOutcome;
+    use lvpm_core::oci::FeedUrl;
+    use lvpm_core::ops::venv_cmd::VenvStatus;
+    use lvpm_core::target::LvTarget;
+    use lvpm_core::venv::Venv;
+
+    #[test]
+    fn an_event_keeps_its_fields_under_data() {
+        let line = serde_json::json!(Event::PhaseStarted {
+            phase: Phase::Download
+        });
+        assert_eq!(
+            line,
+            serde_json::json!({"event": "phase_started", "data": {"phase": "download"}})
+        );
+    }
+
+    #[test]
+    fn an_event_with_no_fields_has_no_data() {
+        let line = serde_json::json!(Event::IndexesLoading);
+        assert_eq!(line, serde_json::json!({"event": "indexes_loading"}));
+    }
+
+    #[test]
+    fn a_result_line_has_only_a_result() {
+        let done = result(&serde_json::json!({"command": "install"}));
+        assert_eq!(done, r#"{"result":{"command":"install"}}"#);
+    }
+
+    #[test]
+    fn an_error_line_has_only_the_error_and_its_causes() {
+        let failed = error(&anyhow::anyhow!("no alpha").context("installing"));
+        assert_eq!(failed, r#"{"error":"installing: no alpha"}"#);
+    }
+
+    #[test]
+    fn an_error_line_words_listing_failures_as_lock_does() {
+        let failure = ListingFailure {
+            package: "alpha".into(),
+            source: "team".into(),
+            feed: FeedUrl::parse("oci://r:1/org").unwrap(),
+            fault: ListingFault::NotListed,
+        };
+        let failed = error(&ListingFailures::new(vec![failure]).into());
+        assert_eq!(
+            failed,
+            r#"{"error":"alpha: source \"team\" (oci://r:1/org) does not list it; check the name, or publish it with lvpm publish --to oci://r:1/org"}"#
+        );
+    }
+
+    #[test]
+    fn feed_text_cannot_reach_the_terminal_as_a_control() {
+        let done = result(&serde_json::json!("Evil\u{9b}31m\u{2028}"));
+        assert_eq!(done, r#"{"result":"Evil\u009b31m\u2028"}"#);
+        let back: serde_json::Value = serde_json::from_str(&done).unwrap();
+        assert_eq!(back["result"], "Evil\u{9b}31m\u{2028}");
+    }
+
+    /// No recording pins these: `venv status` is recorded only with no venv,
+    /// so its `target` holds the `LvTarget` fields pinned here.
+    #[test]
+    fn venv_status_keeps_its_field_names() {
+        let target = LvTarget {
+            version: 26.3,
+            bitness: 64,
+            path: "lv".into(),
+        };
+        let status = VenvStatus {
+            venv: Venv {
+                manifest: None,
+                repo: "repo".into(),
+                dir: "repo/dir".into(),
+                target,
+                port: 3364,
+            },
+            installed: 2,
+            not_relinked: 1,
+            running: false,
+            starting: false,
+            shadowed: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::json!(status),
+            serde_json::json!({
+                "venv": {
+                    "repo": "repo",
+                    "dir": "repo/dir",
+                    "target": {"version": 26.3, "bitness": 64, "path": "lv"},
+                    "port": 3364
+                },
+                "installed": 2,
+                "not_relinked": 1,
+                "running": false,
+                "starting": false,
+                "shadowed": []
+            })
+        );
+    }
+
+    #[test]
+    fn the_manifest_init_wrote_keeps_its_field_names_and_a_missing_labview_is_null() {
+        let written = |labview, retarget| {
+            serde_json::json!(Event::InitManifestWritten {
+                path: "proj/lvpm.toml".into(),
+                labview,
+                installed: vec!["2023 (64-bit)".into(), "2022 (64-bit)".into()],
+                retarget,
+                source_labview: Some(2013),
+                source_kind: Some(SourceKind::Vipc),
+            })
+        };
+        assert_eq!(
+            written(Some(2023), Some(Retarget::Year(2022))),
+            serde_json::json!({"event": "init_manifest_written", "data":
+                {"path": "proj/lvpm.toml", "labview": 2023,
+                 "installed": ["2023 (64-bit)", "2022 (64-bit)"],
+                 "retarget": {"by": "year", "value": 2022},
+                 "source_labview": 2013, "source_kind": "vipc"}})
+        );
+        assert_eq!(
+            written(None, Some(Retarget::Path("lv32".into())))["data"]["retarget"],
+            serde_json::json!({"by": "path", "value": "lv32"})
+        );
+        let none = written(None, None);
+        assert_eq!(none["data"]["labview"], serde_json::Value::Null);
+        assert_eq!(none["data"]["retarget"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_dependencies_init_added_keep_their_field_names() {
+        assert_eq!(
+            serde_json::json!(Event::InitDependenciesAdded {
+                from: "p.vipc".into(),
+                added: vec![AddedDependency {
+                    name: "demo_lib".into(),
+                    constraint: ">=1.0.0.1".into()
+                }],
+                skipped: 2,
+            }),
+            serde_json::json!({"event": "init_dependencies_added", "data":
+                {"from": "p.vipc", "skipped": 2,
+                 "added": [{"name": "demo_lib", "constraint": ">=1.0.0.1"}]}})
+        );
+    }
+
+    #[test]
+    fn the_package_events_init_sends_keep_their_field_names() {
+        let (name, version, from) = ("demo_lib".to_string(), "1.0.0".to_string(), "p.vipc");
+        assert_eq!(
+            serde_json::json!(Event::InitPackageImported {
+                name: name.clone(),
+                version: version.clone(),
+                from: from.into(),
+            }),
+            serde_json::json!({"event": "init_package_imported", "data":
+                {"name": "demo_lib", "version": "1.0.0", "from": "p.vipc"}})
+        );
+        assert_eq!(
+            serde_json::json!(Event::InitPackageNotEmbedded {
+                name: name.clone(),
+                version: version.clone(),
+                from: from.into(),
+            }),
+            serde_json::json!({"event": "init_package_not_embedded", "data":
+                {"name": "demo_lib", "version": "1.0.0", "from": "p.vipc"}})
+        );
+        assert_eq!(
+            serde_json::json!(Event::InitPackageImportFailed {
+                name,
+                version,
+                why: "disk full".into(),
+            }),
+            serde_json::json!({"event": "init_package_import_failed", "data":
+                {"name": "demo_lib", "version": "1.0.0", "why": "disk full"}})
+        );
+    }
+
+    #[test]
+    fn a_held_back_version_has_its_release_and_eligible_instants_as_rfc_3339() {
+        let released = lvpm_core::released::parse("Wed, 28 Oct 2026 11:46:49 GMT").unwrap();
+        assert_eq!(
+            serde_json::json!(Event::HeldBack {
+                name: "alpha".into(),
+                version: "1.1".into(),
+                chosen: "1.0".into(),
+                released,
+                eligible: lvpm_core::released::eligible_at(released, 14),
+                min_age_days: 14,
+            }),
+            serde_json::json!({"event": "held_back", "data":
+                {"name": "alpha", "version": "1.1", "chosen": "1.0",
+                 "released": "2026-10-28T11:46:49Z", "eligible": "2026-11-11T11:46:49Z",
+                 "min_age_days": 14}})
+        );
+    }
+
+    #[test]
+    fn no_labview_is_an_event_with_no_data() {
+        assert_eq!(
+            serde_json::json!(Event::InitNoLabview),
+            serde_json::json!({"event": "init_no_labview"})
+        );
+    }
+
+    #[test]
+    fn the_git_outcome_is_tagged_by_kind_and_carries_only_its_own_data() {
+        let git = |outcome| serde_json::json!(Event::InitGit { outcome });
+        assert_eq!(
+            git(GitOutcome::Initialized),
+            serde_json::json!({"event": "init_git", "data": {"outcome": {"kind": "initialized"}}})
+        );
+        assert_eq!(
+            git(GitOutcome::InsideWorkTree { top: "repo".into() })["data"]["outcome"],
+            serde_json::json!({"kind": "inside_work_tree", "top": "repo"})
+        );
+        assert_eq!(
+            git(GitOutcome::GitMissing)["data"]["outcome"],
+            serde_json::json!({"kind": "git_missing"})
+        );
+        assert_eq!(
+            git(GitOutcome::Failed {
+                why: "denied".into()
+            })["data"]["outcome"],
+            serde_json::json!({"kind": "failed", "why": "denied"})
+        );
+    }
+
+    #[test]
+    fn a_skipped_hook_carries_its_package_hooks_reason_and_the_allow_line_by_kind() {
+        use lvpm_core::events::{AllowLine, HookKind, SkipReason};
+        let skipped = |reason, allow| {
+            serde_json::json!(Event::HooksSkipped {
+                package: "pilot_a".into(),
+                hooks: vec![HookKind::PreInstall, HookKind::PostInstall],
+                reason,
+                run_now: true,
+                dry_run: false,
+                allow,
+            })
+        };
+        assert_eq!(
+            skipped(
+                SkipReason::NotAllowed,
+                Some(AllowLine::ConfigSet {
+                    names: vec!["other".into(), "pilot_a".into()],
+                    skipped: 1,
+                })
+            ),
+            serde_json::json!({"event": "hooks_skipped", "data":
+                {"package": "pilot_a", "hooks": ["pre_install", "post_install"],
+                 "reason": "not_allowed", "run_now": true, "dry_run": false,
+                 "allow": {"kind": "config_set", "names": ["other", "pilot_a"], "skipped": 1}}})
+        );
+        assert_eq!(
+            skipped(
+                SkipReason::NotAllowed,
+                Some(AllowLine::AddKey {
+                    name: "pilot_a".into(),
+                    table: "dependencies".into(),
+                })
+            )["data"]["allow"],
+            serde_json::json!({"kind": "add_key", "name": "pilot_a", "table": "dependencies"})
+        );
+        assert_eq!(
+            skipped(
+                SkipReason::NotAllowed,
+                Some(AllowLine::AddLine {
+                    name: "pilot_a".into()
+                })
+            )["data"]["allow"],
+            serde_json::json!({"kind": "add_line", "name": "pilot_a"})
+        );
+        assert_eq!(
+            skipped(
+                SkipReason::NotAllowed,
+                Some(AllowLine::SkipDoesNothing {
+                    name: "pilot_a".into(),
+                    table: "dependencies".into(),
+                })
+            )["data"]["allow"],
+            serde_json::json!({"kind": "skip_does_nothing", "name": "pilot_a", "table": "dependencies"})
+        );
+        let headless = skipped(SkipReason::Headless, Some(AllowLine::PassHooks));
+        assert_eq!(headless["data"]["reason"], "headless");
+        assert_eq!(
+            headless["data"]["allow"],
+            serde_json::json!({"kind": "pass_hooks"})
+        );
+        let installed = skipped(SkipReason::AlreadyInstalled, None);
+        assert_eq!(installed["data"]["reason"], "already_installed");
+        assert_eq!(installed["data"]["allow"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_install_summary_carries_the_failed_resaves_only_when_there_are_any() {
+        let done = |resave_failed: Vec<String>| {
+            serde_json::json!(Event::InstallDone {
+                files: 2,
+                dry_run: false,
+                resave_failed,
+            })
+        };
+        assert_eq!(
+            done(vec!["alpha".into()]),
+            serde_json::json!({"event": "install_done", "data":
+                {"files": 2, "dry_run": false, "resave_failed": ["alpha"]}})
+        );
+        assert_eq!(
+            done(Vec::new()),
+            serde_json::json!({"event": "install_done", "data": {"files": 2, "dry_run": false}})
+        );
+        let failed = serde_json::json!(Event::ResaveFailed {
+            package: "alpha".into(),
+            error: "error 1003".into(),
+            folder: "venv/alpha".into(),
+        });
+        assert_eq!(failed["event"], "resave_failed");
+        assert_eq!(failed["data"]["package"], "alpha");
+        assert_eq!(failed["data"]["error"], "error 1003");
+    }
+}

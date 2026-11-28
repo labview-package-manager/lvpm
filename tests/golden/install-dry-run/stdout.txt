@@ -1,0 +1,13 @@
+
+resolved 2 packages:
+  alpha 2.0
+  beta 1.0
+
+? alpha 2.0 ... 1 files would be written
+      dest/LabVIEW/vi.lib/lvpm_fixture/alpha.txt
+? beta 1.0 ... 1 files would be written
+      dest/LabVIEW/vi.lib/lvpm_fixture/beta.txt
+
+dry run: 2 files would be written, nothing changed
+
+linkfix: would prepare newly written LabVIEW-tree files (repair links and separate compiled code; no LabVIEW needed)

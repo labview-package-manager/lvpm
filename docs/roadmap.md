@@ -39,21 +39,17 @@ wins over the overlay; `LVAddons.AdditionalLocations` needs LabVIEW 2024 Q1.
 
 ### Iteration 2 - WIP
 
-- ~~**Install hooks in a venv.**~~ Done. `PostInstall` now runs in the venv's
+- ~~**Install hooks in a venv.**~~ Done upstream; this fork still runs no
+  hook in a venv ([usage](usage.md#install-hooks)). Upstream, `PostInstall` now runs in the venv's
   own instance, sharing the one LabVIEW the install already starts, and
   `lvpm run-hooks` is venv-aware too. Confirmed on
   `ni_lib_advanced_http_client_api`: it ships both `lvwebclient_32.dll` and
   `lvwebclient_64.dll` but records the 32-bit one in all 19 VIs, so without
   the hook `Open Session.vi` fails with error 1003; after it, all 19 point at
-  `_64` and the VI runs. `--no-hooks` opts out. Since then: linkfix's
-  `clfn-wildcard` method makes that hook's edit itself (the cause is VIPM's
-  known issue [VI Package Builder removes cross platform wildcards from Call
-  Library Function nodes](https://support.vipm.io/hc/en-us/articles/360053941572-VI-Package-Builder-removes-cross-platform-wildcards-from-Call-Library-Function-nodes-during-the-build-process)), and a venv runs no
-  hooks unless the manifest says `hooks = "run"` for the package (22 hooks
-  measured on NovaXC: six change the LabVIEW installation from a venv, none
-  of the rest is needed). Still open: `PreInstall` in a venv (the instance
-  only starts once the files are down), and snapshotting the real
-  installation to catch a hook that writes outside the overlay.
+  `_64` and the VI runs. `--no-hooks` opts out. Still open: `PreInstall` in a
+  venv (the instance only starts once the files are down), snapshotting the
+  real installation to catch a hook that writes outside the overlay, and
+  per-dependency `hooks = "run" | "skip"` in the manifest.
 - ~~**LabVIEW relink by default.**~~ Inverted: the LabVIEW load/save pass is opt-in behind
   `--relink`, as an alternative to linkfix rather than a subsequent pass.
   Measured across 10 packages saved between LabVIEW 8.6 and 2020,
@@ -61,7 +57,7 @@ wins over the overlay; `LVAddons.AdditionalLocations` needs LabVIEW 2024 Q1.
   files only the 3 that were saved by hand ever changed. `tools/linkfix/audit.py`
   reports the two properties that decide it (embedded compiled code, and
   linker paths that are not `<vilib>`-relative).
-- ~~**Rewrite linker paths in Rust.**~~ Done: `lvpm linkfix` (`src/linkfix.rs`).
+- ~~**Rewrite linker paths in Rust.**~~ Done: `lvpm linkfix` (`crates/lvpm-core/src/linkfix.rs`).
   The real residue turned out to be bigger than the 579 absolutes: 5127 of
   7649 VIs carried a relative or empty owner path, relative subVI paths, or
   links into other libraries without the qualifier — everything a project
@@ -105,7 +101,7 @@ wins over the overlay; `LVAddons.AdditionalLocations` needs LabVIEW 2024 Q1.
     packages (dev-dependencies) than copied from one developer's machine.
 - **The venv keeps its own ini — done.** A venv LabVIEW writes its options
   back to `.lv-venv/labview.ini` when it closes (measured on 2026), so that file
-  — copied from the target's ini by `venv create` — is now the base of every
+  — copied from the target's ini at the venv's first LabVIEW start — is now the base of every
   launch; only lvpm's keys are reapplied. Deleting it inherits the target's
   settings afresh at the next launch.
 - **Relink what a partial run left behind.** A rerun after a failed install
@@ -115,20 +111,9 @@ wins over the overlay; `LVAddons.AdditionalLocations` needs LabVIEW 2024 Q1.
 - **Survive one bad download.** A single failed download aborts the plan;
   retry transient errors, continue past a package, fail at the end with the
   list — as `uninstall --all` already does.
-- ~~**Shadowing warning.**~~ Done (`src/shadow.rs`): after an install into a
-  venv, at launch and in `venv status`, lvpm names each venv package whose
-  LabVIEW files the installation has too, and the fix (`lvpm uninstall
-  --global` when lvpm put it there, else the tool that did). Found by file,
-  so VIPM installs count. Open: the version of a copy lvpm did not install.
-- **Detect changed package files at launch.** `lvpm launch` checks the
-  install records against the manifest (installed, version, files present,
-  relink and PostInstall state), but a record holds no hashes, so a package
-  VI edited, resaved by LabVIEW or replaced since install passes. Record a
-  hash (and size/mtime as a cheap pre-filter) per file at install, refresh it
-  after linkfix and the relink pass, and compare at launch or in a
-  `lvpm venv check`. Also open: `[dependencies.<name>]` groups are not
-  checked, because the venv does not record which groups it was installed
-  with; transitive dependencies are not checked either.
+- **Shadowing warning.** A package installed both globally and in the venv is
+  loaded from the global copy whatever its version. Warn at install and at
+  launch, with both versions and the uninstall command that fixes it.
 - **Duplicate logical paths across addons.** Two venv packages shipping the
   same `vi.lib` file: LabVIEW's (undocumented) scan order picks one. Warn,
   naming the file and both packages.
@@ -138,46 +123,65 @@ wins over the overlay; `LVAddons.AdditionalLocations` needs LabVIEW 2024 Q1.
   (`examples`, `project`, `help`, `templates`, `Targets`): a GUI check.
 - Ask NI: is there a way to make a running LabVIEW re-read an addon location?
 
-## The manifest and the lockfile - WIP
+## The manifest and the lockfile
 
 `lvpm.toml` (done: exact pins, `>=` floors, `*`, hosted `[sources]` and
 `defaults = false`, `labview` minimum, `[nipm.dependencies]`). Local package
 directories are user-level `sources.local` settings, not manifest sources.
-Reference: [manifest.md](manifest.md); VIPM's files: [compatibility.md](compatibility.md).
+Reference and `vipm.toml` comparison: [manifest.md](manifest.md).
 
-- **`lvpm.lock`** — the resolved closure (name, version, source URL, MD5) so
-  `lvpm install` restores the identical venv on another machine and only
-  `lvpm update` re-resolves. The thing a venv without a lock only pretends to
-  be.
-- **`lvpm sync`** — after `lvpm.lock`: make the venv match the lock
-  exactly, installing what is missing and uninstalling what the lock does not
-  list. `install` stays additive. `--dry-run` shows both lists. Waits for the
-  lock because today's resolver does not follow already-installed
-  dependencies, so it cannot say what is still needed; notes in
-  [manifest.md](manifest.md#to-do).
-- **Editing the manifest from the CLI** — done the npm way: on a venv,
-  `lvpm install <pkg>` saves the package to `lvpm.toml` (`--group <g>`),
-  `lvpm uninstall <pkg>` removes it, `--no-save` opts out; comments and
-  formatting are kept (`toml_edit`). No separate `add` / `remove`.
-- **Constraint grammar (Cargo)** — bare and `^` caret, `~` tilde, `=`
-  exact, `>=` floor, `*` newest, in every dependency table; `name@x` stays
-  CLI-only. Breaking: a bare version is exact today. `lvpm import` then
-  writes VIPM's bare versions as `=x`.
-- **`[dependencies.<name>]`** — done: named group tables shaped like
-  `[dependencies]` with a reserved `include-groups = [...]` key, selected
-  with `--with`, `--without`, `--only`; only `main` installs by default.
-  Open: whether `dev` should install by default. Reference in
-  [manifest.md](manifest.md#named-dependency-groups).
-- Per-dependency tables: `hooks` is done (`{ version = "...", hooks = "run" }`);
-  `source = "local"` is still open.
+Done:
+
+- **`lvpm.lock`** — the resolved closure (name, exact version, SHA-256, source),
+  written by `lvpm lock`; `lvpm sync` makes a venv hold exactly that, and
+  `lvpm lock --upgrade[-package]` is the only thing that moves it. A real
+  solver replaces the greedy resolver when a project is locked.
+- **`lvpm install <pkg>[@constraint]` / `lvpm uninstall <pkg>`** in a project (also `add` and `remove`) — edit the manifest,
+  lock and sync in one step.
+- **`[dev-dependencies]`** — test and CI tooling, synced by default and
+  skipped with `--no-dev`.
+- **Named dependency groups** (`[dependency-groups.<name>]`, with
+  `[dev-dependencies]` as the group `dev`) — `lvpm sync --group <name>` and
+  `lvpm install/uninstall --group <name>`; the lock records each package's groups.
+  Slice S11 in [vision/build-slices.md](vision/build-slices.md).
+- Headless machines act as `--locked`: a missing or stale lock fails the job.
+- **`vipm.toml` conversion** — for `lvpm venv create --manifest vipm.toml`
+  (installing its packages is still to do: lock and sync read only `lvpm.toml`): `labview-version`, exact `[dependencies]`,
+  `[dev-dependencies]` as lvpm's `[dev-dependencies]`, `[nipm.dependencies]`,
+  and an event naming what was not used. Not discovered. Mapping in
+  [manifest.md](manifest.md#reading-a-vipmtoml-with-lvpm).
+
+Still to do:
+
+- **Constraint grammar (Cargo)** — bare and `^` caret, `~` tilde, `=` exact,
+  `>=` floor, `*` newest. Breaking: a bare version is exact today.
+- Per-dependency tables: `{ version = "...", hooks = "run", source = "local" }`.
 - `[venv]` overrides: `dir`, `vi-server-port`, `bitness`.
-- **VIPM's files** — done as `lvpm import`, which writes a `vipm.toml` or a
-  `.vipc` into the project's `lvpm.toml` once (`src/vipm_interop.rs`:
-  `labview-version`, exact `[dependencies]`, `[dev-dependencies]` as group
-  `dev`, `[nipm.dependencies]`, a note naming what was not used; for a
-  `.vipc`, its top-level packages, and the packages it carries into the
-  cache). lvpm never reads a `vipm.toml` as a manifest. Mapping in
-  [compatibility.md](compatibility.md).
+- SBOM export from the lock.
+
+## The core split, cancellation and the TUI
+
+Specified in [docs/specs/lvpm-tui.md](specs/lvpm-tui.md).
+
+Done:
+
+- **`lvpm-core`** — a library crate that holds the package-management logic
+  and does no terminal I/O. `lvpm` (`src/`) is a front end: it parses flags,
+  builds an `OpEnv` and renders what core reports (`src/render/`).
+- **Events** — core reports progress as typed data to an `EventSink` instead
+  of printing.
+- **Cancellation** — a `CancelToken` stops lock, upgrade, sync, add and remove
+  until their first write, and uninstall until its first deletion.
+
+Planned:
+
+- **`lvpm-tui`** — a full-screen terminal UI over the same operations, in
+  progress (`plans/lvpm-tui.md`): browse, details, reload and install in
+  global mode and into a venv work and ship as `lvpm tui`; project mode is next.
+- **`--json`** output for the new commands, package details and an uncapped
+  catalog listing, which both front ends share.
+- Plans as data (not only as events) and a dry run for `lock --upgrade`, which
+  a TUI preview needs.
 
 ## Configuration
 
@@ -196,39 +200,19 @@ records) and make it first-class:
   non-zero otherwise. The post-relink correctness gate.
 - `lvpm tree [DIR|VI]` — the dependency graph as text, `--cycles`, `--dot` /
   `--mermaid`.
-- Known gaps in `deptree.py` to close in the port: it misses the `PTH0`
+- Known gaps in that prototype to close in the implementation: it misses the `PTH0`
   flavour old OpenG packages use (reports "no linker tables" on every VI in
   `oglib_*`); `resolvable()` accepts a path if _any_ ancestor directory exists,
   so shadowing cases pass; `.llb` archive members are skipped entirely.
 
 ## Packaging and distribution (from idea.txt)
 
-- **Authenticode signing through SignPath Foundation** (free code signing for
-  open-source projects) of `lvpm.exe` and the MSI, the lasting answer to
-  Defender and SmartScreen. Open points:
-  - Apply: SignPath Foundation signs only what CI builds from this public
-    repository, under a code signing policy the project publishes (who may
-    approve a release, what gets signed).
-  - Where it fits in `release.yml`: dist builds the zip and the MSI in one
-    job and hashes them there, so signing afterwards invalidates its
-    checksums, and `lvpm.exe` inside the MSI must be signed too. Either a
-    custom dist job that submits the built artifacts to SignPath (its
-    artifact configuration can sign the exe inside the zip and the MSI as
-    well as the MSI itself) and recomputes the checksums, or signing
-    `lvpm.exe` before dist packages it. Check what dist's custom-job hooks
-    allow before choosing.
-  - Each release then waits for an approval in SignPath.
-- **winget, after signing.** A `winget-pkgs` manifest for the MSI gives
-  `winget install lvpm` with hash checks and upgrades. Then the MSI is the
-  main route and `scripts/install.ps1` shrinks to the portable install and
-  `-BuildLocal`: until then it is what spares users SmartScreen's warning on
-  an unsigned MSI and checks the download's SHA-256.
-- **One-command install of a released `lvpm.exe`.** Done from v0.3.1: dist
-  (`dist-workspace.toml`) publishes a GitHub Release per version tag with the
-  archives, a per-user MSI and checksums, each carrying `relink-package.vi`
-  beside the executable, and lvpm refuses a VI from another build. The
-  original idea: a GitHub Release per tag
-  carrying `lvpm.exe` (built by CI), and an `install.ps1` at a stable URL for
+- **One-command install of a released `lvpm.exe`** — done: merging the
+  release PR (release-please) publishes a release with the Windows zip, a Linux tar.gz and
+  `SHA256SUMS` (see "What is automated" below), and `install.ps1` installs it.
+  The original idea, kept for the reasoning: a GitHub Release per tag
+  carrying `lvpm.exe` (built by CI, so the relink VI embedded in it is the one
+  from that commit), and an `install.ps1` at a stable URL for
   `irm https://…/install.ps1 | iex`: downloads the latest release (or
   `-Version x.y.z`), verifies its checksum, drops it in `%LOCALAPPDATA%\lvpm\bin`,
   adds that to the user `PATH`, prints `lvpm --version`. Motivation: a stale
@@ -259,7 +243,7 @@ Run a project's LabVIEW build specifications (EXE, packed library, LLB,
 source distribution, zip, installer) the way `install` runs a relink: through
 VI Server, headless where wanted, against the project's own dependencies.
 
-- **A standard or custom `Build.vi`.** The standard one is embedded in the
+- **A standard or custom `Build.vi`.** The standard one ships beside the
   binary, like the relink VI: it opens the `.lvproj`, runs the named build
   specs and reports each step. A project can name its own `Build.vi`
   instead. No LabVIEWCLI: lvpm drives LabVIEW over its own VI Server client.
@@ -304,6 +288,19 @@ way as one built against a global install.
 
 ## CI for lvpm itself: the container as the end-to-end test
 
+**What is automated** ([spec](specs/lvpm-ci-pipeline.md)):
+
+- PR checks: a conventional-commit title, `cargo test` on Windows and Linux,
+  the release build of both binaries, packaging, an installer check, and the
+  `ci/` lints. `ci-ok` and `conventional title` are the required checks (an
+  admin sets them).
+- The release: release-please keeps one release PR that raises the version;
+  merging it publishes `v<version>` with the Windows zip, the Linux tar.gz and
+  `SHA256SUMS`.
+
+**What is still manual:** relink, MassCompile and Caraya (steps 2, 4 and 5
+below).
+
 lvpm's unit tests cover parsing and planning; what they cannot cover is the
 part that matters — a real LabVIEW loading, relinking and compiling what
 lvpm installed. NI's container image is a clean LabVIEW that is thrown away
@@ -325,7 +322,7 @@ workflow is the work.
   relinked, `lvpm list` shows every package `relinked`. This is the test of
   the VI Server client against a headless LabVIEW: the handshake retry
   (error 63 for the first ~8 s after the port opens), `Relink Package.vi`
-  materialising from the binary, load/save over the wire — and, with an
+  copied from beside the binary, load/save over the wire — and, with an
   explicit `lvpm refresh --labview-version 2026` afterwards, the palette
   and menu rebuild that headless mode otherwise skips. About ten minutes; the slow
   step is Caraya's 358 s folder, so a smaller package set would do for a
@@ -400,7 +397,7 @@ test scripts as today.
 
 ## macOS
 
-Not supported, and a macOS build stops with a `compile_error!` in `main.rs`.
+Not supported, and a macOS build stops with a `compile_error!` in `crates/lvpm-core/src/lib.rs`.
 What is a fact about LabVIEW on Linux is `cfg(target_os = "linux")`; what is
 true of any POSIX system is `cfg(not(windows))` or `cfg(unix)` and needs no
 new branch.
@@ -549,11 +546,6 @@ cache is already safe (SQLite in WAL mode, downloads renamed into place).
   the same file lock, so the two never collide.
 
 ## Housekeeping
-
-- Window-title tagging (`venv.title`) covers LabVIEW started by `lvpm launch`
-  only. A venv LabVIEW started another way can be found by its
-  `-pref …\.lv-venv\labview.ini` command line; a `title-watch --attach` could
-  tag it. The LabVIEW an install starts for relink and hooks is not tagged.
 
 - `Replace Mode = If Newer` compares timestamps instead of "write when absent".
 - Read hook VIs' `error out` back.

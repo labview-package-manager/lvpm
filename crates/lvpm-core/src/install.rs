@@ -1,0 +1,978 @@
+//! Unpacking a `.vip` into a target, and taking it back out again.
+//!
+//! Install is a file copy: expand the `Target Dir` token against the target's
+//! roots, join the file's relative path, write it. No LabVIEW process is
+//! involved. An install manifest records absolute paths so uninstall can
+//! remove exactly what was added and nothing else.
+
+use crate::ops::staging::Staging;
+use crate::spec::Spec;
+use crate::target::{LvTarget, Roots, TokenClass};
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Manifest {
+    pub name: String,
+    pub version: String,
+    pub display_name: Option<String>,
+    pub installed_at: u64,
+    /// Where it went: a scratch prefix or a LabVIEW install dir.
+    pub target: String,
+    /// Absolute paths, forward-slashed.
+    pub files: Vec<String>,
+    /// In a venv, the package's `menus/` files, by path within that tree,
+    /// once [`crate::palette::reconcile`] moved them out of the addon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub palette_files: Vec<PaletteFile>,
+    /// The packages this version requires directly, as its spec names them;
+    /// uninstall follows them. Missing in records written before lvpm kept
+    /// it, and then removing dependencies refuses: see
+    /// [`records_without_dependencies`].
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    /// Hooks the package declares that were not run: every one in a venv
+    /// (hooks act on a LabVIEW installation, and a venv is not one), every
+    /// one of a package the install skipped (nothing allowed its hooks, or
+    /// LabVIEW ran headless), and otherwise only a PostInstall that failed.
+    /// Uninstall hooks of a package that ran its install hooks are not
+    /// skipped, they are pending — `lvpm uninstall` runs them from the
+    /// extracted copies below. Manifests older than that extraction list them
+    /// here, which is how uninstall knows it has nothing to run.
+    pub skipped_hooks: Vec<String>,
+    /// Whether the relink pass has run over these files since they were
+    /// copied. Defaults to false so manifests written before relinking existed
+    /// read as "not relinked", which is what they are.
+    #[serde(default)]
+    pub relinked: bool,
+    /// The package's own folders, as the spec asked for them — what the relink
+    /// pass walks. Recorded here because the file list alone cannot say where
+    /// the package boundary was.
+    #[serde(default)]
+    pub relink_folders: Vec<String>,
+    /// Where the package's `PostInstall.vi` was extracted to, when it ships
+    /// one. The archive carries hook VIs at its root under the hook's own
+    /// name — the path in `[Script VIs]` is only where the VI lived on the
+    /// build machine. Recorded so the run can happen after the relink pass,
+    /// and be retried.
+    #[serde(default)]
+    pub post_install_vi: Option<String>,
+    /// Where `PreInstall.vi` was extracted to, when the package ships one. It
+    /// has already run by the time this manifest exists — kept for the record
+    /// and so uninstall can clean it up.
+    #[serde(default)]
+    pub pre_install_vi: Option<String>,
+    /// Where `PreUninstall.vi` / `PostUninstall.vi` were extracted to, when
+    /// the package ships them. Extracted at install time — the archive is
+    /// long gone by the time uninstall needs them.
+    #[serde(default)]
+    pub pre_uninstall_vi: Option<String>,
+    #[serde(default)]
+    pub post_uninstall_vi: Option<String>,
+    /// File groups a venv install left out because they aim at the machine
+    /// rather than the LabVIEW tree, as `Target Dir (N files)`.
+    #[serde(default)]
+    pub skipped_groups: Vec<String>,
+    /// The SHA-256 of the archive these files came from, as lowercase hex.
+    /// Manifests written before it was recorded have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_sha256: Option<String>,
+}
+
+impl Manifest {
+    /// Whether the record lists `hook` among the hooks that did not run.
+    pub fn hook_skipped(&self, hook: crate::events::HookKind) -> bool {
+        self.skipped_entry(hook).is_some()
+    }
+
+    /// The `Name=path` entry that lists `hook` as not run, if any.
+    pub fn skipped_entry(&self, hook: crate::events::HookKind) -> Option<&String> {
+        let prefix = format!("{}=", hook.name());
+        self.skipped_hooks.iter().find(|h| h.starts_with(&prefix))
+    }
+
+    /// Whether the record lists any hook as not run: the package's install
+    /// hooks did not all run, so its uninstall hooks stay off too.
+    pub fn any_hook_skipped(&self) -> bool {
+        !self.skipped_hooks.is_empty()
+    }
+
+    /// Forget every skipped hook, install ones and uninstall ones alike: the
+    /// user ran the package's install hook by hand, so none is held back.
+    pub fn clear_skipped_hooks(&mut self) {
+        self.skipped_hooks.clear();
+    }
+}
+
+/// Which tree of the merged palette addon a palette file belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PaletteTree {
+    /// `<menus>`: the Functions and Controls palette trees.
+    #[default]
+    #[serde(rename = "menus")]
+    Menus,
+    /// `.mnu` files under `<vi.lib>/addons`, the Addons palette. Several
+    /// packages share a category folder there (`addons\HSE`), and LabVIEW
+    /// shows only one addon's copy of a folder.
+    #[serde(rename = "vi.lib/addons")]
+    Addons,
+}
+
+impl PaletteTree {
+    /// The tree's folder, relative to an addon root.
+    pub fn dir(self) -> &'static str {
+        match self {
+            PaletteTree::Menus => "menus",
+            PaletteTree::Addons => "vi.lib/addons",
+        }
+    }
+
+    fn is_menus(&self) -> bool {
+        *self == PaletteTree::Menus
+    }
+}
+
+/// One of a venv package's menu files, kept outside the mounted addons.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaletteFile {
+    /// Relative to the tree's folder.
+    pub relative: String,
+    /// Absent in records from before `vi.lib/addons` palettes were merged.
+    #[serde(default, skip_serializing_if = "PaletteTree::is_menus")]
+    pub tree: PaletteTree,
+}
+
+/// What an install *would* do. Produced first so `--dry-run` and the real run
+/// share one code path.
+#[derive(Debug)]
+pub struct Plan {
+    pub writes: Vec<PlannedWrite>,
+    /// Files the package ships that were already on disk and left alone
+    /// (`Replace Mode = If Newer`). Still part of its footprint: they go in
+    /// the manifest so uninstall takes them with everything else.
+    pub kept: Vec<PathBuf>,
+    pub missing_from_archive: Vec<String>,
+    /// Groups not written because a venv holds LabVIEW-tree content only:
+    /// the `Target Dir` and how many files it named.
+    pub skipped_groups: Vec<(String, usize)>,
+}
+
+#[derive(Debug)]
+pub struct PlannedWrite {
+    pub zip_index: usize,
+    pub dest: PathBuf,
+    pub overwrites: bool,
+}
+
+/// Reject absolute paths and `..` traversal before we join anything.
+fn safe_relative(rel: &str) -> Result<PathBuf> {
+    let rel = rel.replace('\\', "/");
+    if rel.starts_with('/') || rel.contains(':') {
+        bail!("refusing absolute path in package: {rel:?}");
+    }
+    let mut out = PathBuf::new();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => bail!("refusing path traversal in package: {rel:?}"),
+            p => out.push(p),
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn manifest_path(roots: &Roots, name: &str) -> PathBuf {
+    roots.store_dir().join(format!("{name}.json"))
+}
+
+pub fn is_installed(roots: &Roots, name: &str) -> bool {
+    manifest_path(roots, name).exists()
+}
+
+/// The install record of `name`, or `None` when it is not installed. Only a
+/// missing file is `None`: a record that cannot be read or parsed is an error.
+pub fn read_manifest_if_present(roots: &Roots, name: &str) -> Result<Option<Manifest>> {
+    let p = manifest_path(roots, name);
+    match std::fs::read_to_string(&p) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .with_context(|| format!("{} is not a valid install record", p.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
+    }
+}
+
+pub fn read_manifest(roots: &Roots, name: &str) -> Result<Manifest> {
+    let p = manifest_path(roots, name);
+    let text = std::fs::read_to_string(&p)
+        .with_context(|| format!("{name} is not installed in this target ({})", p.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("{} is not a valid install record", p.display()))
+}
+
+/// Records written before lvpm kept a dependency list. Uninstall cannot say
+/// which dependencies such a package still needs, so it refuses to plan.
+pub fn records_without_dependencies(roots: &Roots) -> Result<Vec<PathBuf>> {
+    let dir = roots.store_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&dir)? {
+        let p = e?.path();
+        if p.extension().is_some_and(|x| x == "json")
+            && let Ok(text) = std::fs::read_to_string(&p)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            && v.get("dependencies").is_none()
+        {
+            out.push(p);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+pub fn list_installed(roots: &Roots) -> Result<Vec<Manifest>> {
+    let dir = roots.store_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&dir)? {
+        let p = e?.path();
+        if p.extension().is_some_and(|x| x == "json")
+            && let Ok(text) = std::fs::read_to_string(&p)
+            && let Ok(m) = serde_json::from_str::<Manifest>(&text)
+        {
+            out.push(m);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+type Archive = zip::ZipArchive<std::io::Cursor<Vec<u8>>>;
+
+pub fn open_archive(vip_bytes: Vec<u8>) -> Result<Archive> {
+    Ok(zip::ZipArchive::new(std::io::Cursor::new(vip_bytes))?)
+}
+
+/// The most of a `spec` member that is read: real ones are a few KiB, and a
+/// feed's or a local folder's archive must not inflate one until memory runs
+/// out.
+const MAX_SPEC_BYTES: u64 = 1024 * 1024;
+
+/// The archive's spec, read and checked: by content, a root `package.toml`
+/// makes it a `.lvpkg` (its `RECORD` is checked), a root `spec` a `.vip` or
+/// `.ogp`. The file's extension plays no part.
+pub fn read_spec(zip: &mut Archive) -> Result<Spec> {
+    // Almost always literally "spec" at the archive root.
+    let idx = (0..zip.len()).find(|i| {
+        zip.by_index(*i)
+            .map(|f| f.name().is_ok_and(|n| n.eq_ignore_ascii_case("spec")))
+            .unwrap_or(false)
+    });
+    let is_lvpkg = zip
+        .file_names()
+        .any(|n| n.is_ok_and(|n| n == crate::lvpkg::PACKAGE_TOML));
+    let idx = match (is_lvpkg, idx) {
+        (true, None) => return crate::lvpkg::read(zip),
+        (true, Some(_)) => bail!(
+            "the archive holds both package.toml and spec; a .lvpkg has the first and a .vip the \
+             second, so it is refused as ambiguous"
+        ),
+        (false, Some(idx)) => idx,
+        (false, None) => bail!("the archive has neither package.toml (a .lvpkg) nor spec (a .vip)"),
+    };
+    let mut buf = Vec::new();
+    zip.by_index(idx)?
+        .take(MAX_SPEC_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_SPEC_BYTES {
+        bail!("the `spec` member is larger than {MAX_SPEC_BYTES} bytes");
+    }
+    // spec files are latin-1-ish; lossy is fine for the fields we read.
+    let spec = crate::spec::parse(&String::from_utf8_lossy(&buf))?;
+    // The name becomes a file name (record, hook VIs), so no path may hide in it.
+    ensure!(
+        !spec.name.is_empty() && !spec.name.contains(['/', '\\', ':']) && !spec.name.contains(".."),
+        "the archive's spec names the package {:?}, which is not a file name",
+        spec.name
+    );
+    Ok(spec)
+}
+
+/// A package entry's content, at most `cap` bytes. The size in the
+/// entry's header is the archive's claim, so nothing is allocated from it.
+fn read_entry(src: zip::read::ZipFile<'_, std::io::Cursor<Vec<u8>>>, cap: u64) -> Result<Vec<u8>> {
+    let name = src
+        .name()
+        .context("archive entry has no usable name")?
+        .to_string();
+    let mut buf = Vec::new();
+    src.take(cap + 1)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("reading entry {name:?}"))?;
+    if buf.len() as u64 > cap {
+        bail!("entry {name:?} is larger than {cap} bytes");
+    }
+    Ok(buf)
+}
+
+/// Work out every file this package would write, without touching disk.
+pub fn plan(roots: &Roots, spec: &Spec, zip: &mut Archive) -> Result<Plan> {
+    // Zip entry names are case-sensitive; index once, tolerate case drift
+    // between `spec` and the archive.
+    let mut by_lower = std::collections::HashMap::new();
+    for i in 0..zip.len() {
+        let name = zip
+            .by_index(i)?
+            .name()
+            .with_context(|| format!("archive entry {i} has no usable name"))?
+            .to_string();
+        by_lower.insert(name.to_lowercase().replace('\\', "/"), i);
+    }
+
+    let mut writes = Vec::new();
+    let mut kept = Vec::new();
+    let mut missing = Vec::new();
+    let mut skipped = Vec::new();
+
+    for group in &spec.file_groups {
+        if group.files.is_empty() {
+            continue;
+        }
+        // A venv is an addon: LabVIEW-tree content only. What a package also
+        // puts on the machine — a driver DLL into System32, say — is no part
+        // of that, and a project's install must not scatter files across the
+        // machine. Left out, and said so.
+        if roots.venv().is_some() && Roots::classify(&group.target_dir)? != TokenClass::LabView {
+            skipped.push((group.target_dir.clone(), group.files.len()));
+            continue;
+        }
+        let dest_root = roots.expand(&group.target_dir)?;
+        let if_newer = group.replace_mode.eq_ignore_ascii_case("If Newer");
+
+        for rel in &group.files {
+            let rel_path = safe_relative(rel)?;
+            let entry_name = group.entry(rel);
+
+            let Some(&zip_index) = by_lower.get(&entry_name.to_lowercase()) else {
+                missing.push(entry_name);
+                continue;
+            };
+
+            let dest = dest_root.join(&rel_path);
+            roots.check_contained(&dest)?;
+
+            let exists = dest.exists();
+            if exists && if_newer {
+                // PoC simplification: `If Newer` only writes when absent.
+                // Doing it properly means comparing the archive timestamp
+                // against the file on disk.
+                kept.push(dest);
+                continue;
+            }
+            writes.push(PlannedWrite {
+                zip_index,
+                dest,
+                overwrites: exists,
+            });
+        }
+    }
+
+    Ok(Plan {
+        writes,
+        kept,
+        missing_from_archive: missing,
+        skipped_groups: skipped,
+    })
+}
+
+/// The `lvaddoninfo.json` LabVIEW reads to mount an addon (fields as NI's own
+/// addons write them). The floor is the bound target itself, not what the
+/// package claimed: the relink pass saves the payload in that version's
+/// format, so nothing older could load it anyway.
+pub(crate) fn addon_info(name: &str, target: &LvTarget) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "AddonName": name,
+        "ApiVersion": "v1",
+        "MinimumSupportedLVVersion": format!("{}.0", target.version.trunc() as u32),
+        "SupportedBitness": target.bitness.to_string(),
+    }))
+    .expect("a fixed shape of strings serialises")
+}
+
+/// Execute a plan and record the manifest, with the SHA-256 of the archive
+/// the files were read from. `hooks_skipped` lists every declared hook as not
+/// run in that same write: a record patched afterwards would, if the patch
+/// failed, let uninstall run hooks nobody allowed.
+pub fn apply(
+    roots: &Roots,
+    spec: &Spec,
+    zip: &mut Archive,
+    plan: &Plan,
+    pre_install_vi: Option<&Path>,
+    archive_sha256: &str,
+    hooks_skipped: bool,
+) -> Result<Manifest> {
+    let mut manifest = unpack_to(roots, spec, zip, plan, pre_install_vi, archive_sha256, None)?;
+    if hooks_skipped {
+        manifest.skipped_hooks = declared_hooks(spec);
+    }
+    write_manifest(roots, &manifest)?;
+    Ok(manifest)
+}
+
+/// Write a plan's files and build its manifest, without recording it. With a
+/// `stage`, each file is written to its staged path; the manifest still names
+/// the final ones, where landing the stage moves them.
+pub(crate) fn unpack_to(
+    roots: &Roots,
+    spec: &Spec,
+    zip: &mut Archive,
+    plan: &Plan,
+    pre_install_vi: Option<&Path>,
+    archive_sha256: &str,
+    stage: Option<&Staging>,
+) -> Result<Manifest> {
+    let place = |p: &Path| match stage {
+        Some(s) => s.to_stage(p),
+        None => Ok(p.to_path_buf()),
+    };
+    let mut written = Vec::new();
+
+    // A declared PostInstall hook ships as `PostInstall.vi` at the archive
+    // root. Extract it next to the manifests so it survives until the relink
+    // pass has made it runnable.
+    let mut hook = |name: &str, member: &str| -> Result<Option<PathBuf>> {
+        match spec
+            .script_vis
+            .iter()
+            .any(|(h, v)| h == name && !v.is_empty())
+        {
+            true => extract_hook(roots, &spec.name, zip, member),
+            false => Ok(None),
+        }
+    };
+    let post_install_vi = hook("PostInstall", "PostInstall.vi")?;
+    let pre_uninstall_vi = hook("PreUninstall", "PreUninstall.vi")?;
+    let post_uninstall_vi = hook("PostUninstall", "PostUninstall.vi")?;
+
+    for w in &plan.writes {
+        let dest = place(&w.dest)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let buf = read_entry(zip.by_index(w.zip_index)?, crate::lvpkg::MAX_ENTRY_BYTES)?;
+        std::fs::write(&dest, &buf).with_context(|| format!("writing {}", dest.display()))?;
+        written.push(w.dest.to_string_lossy().replace('\\', "/"));
+    }
+    // The footprint is what the package ships, not what this run happened to
+    // copy — a file left alone today is still gone when the package goes.
+    for k in &plan.kept {
+        // A staged package replaces its whole folder, so a kept file is
+        // carried over into the stage.
+        if stage.is_some() {
+            let dest = place(k)?;
+            std::fs::create_dir_all(dest.parent().expect("a staged file has a folder"))?;
+            std::fs::copy(k, &dest).with_context(|| format!("copying {}", k.display()))?;
+        }
+        written.push(k.to_string_lossy().replace('\\', "/"));
+    }
+
+    // An addon is what LVAddons mounts: `lvaddoninfo.json` beside the mirrored
+    // tree names it and says which LabVIEW may load it. Only when something
+    // landed — an addon holding nothing but its info file is noise, and a
+    // package whose every group aimed at the machine leaves no addon at all.
+    if roots.venv().is_some()
+        && let Some(t) = &roots.target
+        && !written.is_empty()
+    {
+        let info = roots.application.join("lvaddoninfo.json");
+        let dest = place(&info)?;
+        std::fs::create_dir_all(dest.parent().expect("the info file has a folder"))?;
+        std::fs::write(&dest, addon_info(&spec.name, t))
+            .with_context(|| format!("writing {}", dest.display()))?;
+        written.push(info.to_string_lossy().replace('\\', "/"));
+    }
+
+    let manifest = Manifest {
+        name: spec.name.clone(),
+        version: spec.version.clone(),
+        display_name: spec.display_name.clone(),
+        installed_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        target: match &roots.target {
+            Some(t) => t.label(),
+            None => format!("scratch {}", roots.application.display()),
+        },
+        files: written,
+        palette_files: Vec::new(),
+        dependencies: crate::dependency::package_dependency_names(&[], spec.requires.as_deref()),
+        skipped_hooks: match roots.venv() {
+            Some(_) => declared_hooks(spec),
+            // PreInstall has run by now. PostInstall is owed from this copy
+            // until it has run after the relink pass, so an install that stops
+            // in between leaves it listed for `lvpm run-hooks`. The uninstall
+            // hooks wait for `lvpm uninstall` in the copies extracted above.
+            // An install that skips a package's hooks has `apply` record them.
+            None if roots.target.is_some() && post_install_vi.is_some() => declared_hooks(spec)
+                .into_iter()
+                .filter(|h| h.starts_with("PostInstall="))
+                .collect(),
+            None => Vec::new(),
+        },
+        relinked: false,
+        post_install_vi: post_install_vi.map(|p| p.to_string_lossy().replace('\\', "/")),
+        pre_install_vi: pre_install_vi.map(|p| p.to_string_lossy().replace('\\', "/")),
+        pre_uninstall_vi: pre_uninstall_vi.map(|p| p.to_string_lossy().replace('\\', "/")),
+        post_uninstall_vi: post_uninstall_vi.map(|p| p.to_string_lossy().replace('\\', "/")),
+        relink_folders: crate::relink::folders_for_spec(roots, spec)?
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect(),
+        skipped_groups: plan
+            .skipped_groups
+            .iter()
+            .map(|(dir, n)| format!("{dir} ({n} files)"))
+            .collect(),
+        archive_sha256: Some(archive_sha256.to_string()),
+    };
+    Ok(manifest)
+}
+
+/// Pull one hook VI out of the archive root into the target's `hooks` store.
+/// A declared hook missing from the archive is a warning-level oddity, not an
+/// error — the files themselves installed fine.
+pub fn extract_hook(
+    roots: &Roots,
+    package: &str,
+    zip: &mut Archive,
+    member: &str,
+) -> Result<Option<PathBuf>> {
+    let Ok(src) = zip.by_name(member) else {
+        return Ok(None);
+    };
+    let dir = roots.hooks_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let dest = dir.join(format!("{package}-{member}"));
+    let buf = read_entry(src, crate::lvpkg::MAX_ENTRY_BYTES)?;
+    std::fs::write(&dest, &buf).with_context(|| format!("writing {}", dest.display()))?;
+    Ok(Some(dest))
+}
+
+/// Every hook the package declares, in the `Name=path` form the record uses.
+fn declared_hooks(spec: &Spec) -> Vec<String> {
+    spec.script_vis
+        .iter()
+        .map(|(h, v)| format!("{h}={v}"))
+        .collect()
+}
+
+/// Written beside the record, synced and renamed over it, so a kill or power
+/// loss mid-write leaves the old record, not a truncated one that `lvpm list`
+/// silently drops. The tmp name is per process, so two writers never share it.
+pub(crate) fn write_manifest(roots: &Roots, m: &Manifest) -> Result<()> {
+    use std::io::Write;
+    let mp = manifest_path(roots, &m.name);
+    std::fs::create_dir_all(mp.parent().unwrap())?;
+    let tmp = mp.with_extension(format!("json.{}.tmp", std::process::id()));
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(serde_json::to_string_pretty(m)?.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, &mp)?;
+    Ok(())
+}
+
+/// Record that the relink pass has run over this package.
+///
+/// Separate from `apply` because the two happen in different phases: every
+/// package is copied before any is relinked, so the manifest is written once
+/// with `relinked: false` and amended if and when the relink succeeds.
+pub fn mark_relinked(roots: &Roots, name: &str) -> Result<()> {
+    let mut m = read_manifest(roots, name)?;
+    if m.relinked {
+        return Ok(());
+    }
+    m.relinked = true;
+    write_manifest(roots, &m)
+}
+
+/// Record a hook this install declared and did not run, so `lvpm list` says
+/// so. `hook` is the `Name=path` form the manifest already uses.
+pub fn mark_hook_skipped(roots: &Roots, name: &str, hook: &str) -> Result<()> {
+    let mut m = read_manifest(roots, name)?;
+    if m.skipped_hooks.iter().any(|h| h == hook) {
+        return Ok(());
+    }
+    m.skipped_hooks.push(hook.to_string());
+    write_manifest(roots, &m)
+}
+
+/// Record that `hook` has run: the record stops listing it as not run.
+pub fn mark_hook_ran(roots: &Roots, name: &str, hook: crate::events::HookKind) -> Result<()> {
+    let mut m = read_manifest(roots, name)?;
+    let prefix = format!("{}=", hook.name());
+    m.skipped_hooks.retain(|h| !h.starts_with(&prefix));
+    write_manifest(roots, &m)
+}
+
+/// Record that the user ran the package's install hook by hand: no hook is
+/// listed as skipped any more. `ran_for` is the record the hook ran from; one
+/// written since, by a reinstall or upgrade while the hook ran, is left as it is.
+// shortcut: no lock spans the read and the write, so a reinstall landing between
+// them (or within the same second) is not caught; add a store lock if lvpm ever
+// supports two commands on one installation at once.
+pub fn clear_skipped_hooks(roots: &Roots, ran_for: &Manifest) -> Result<()> {
+    let mut m = read_manifest(roots, &ran_for.name)?;
+    if (m.installed_at, &m.version) != (ran_for.installed_at, &ran_for.version) {
+        bail!("{} was reinstalled while its hook ran", m.name);
+    }
+    m.clear_skipped_hooks();
+    write_manifest(roots, &m)
+}
+
+/// The install record is a file on disk, and uninstall deletes and runs what
+/// it names: refuse a record that names a file outside the places this
+/// destination installs to, or a hook VI outside its hooks directory.
+pub fn check_record(roots: &Roots, manifest: &Manifest) -> Result<()> {
+    let hooks = roots.hooks_dir();
+    let hook_vis = [
+        &manifest.post_install_vi,
+        &manifest.pre_install_vi,
+        &manifest.pre_uninstall_vi,
+        &manifest.post_uninstall_vi,
+    ]
+    .into_iter()
+    .flatten();
+    let outside: Vec<&String> = manifest
+        .files
+        .iter()
+        .filter(|f| !roots.is_inside(Path::new(f)))
+        .chain(hook_vis.filter(|h| !crate::target::within(&hooks, Path::new(h))))
+        .collect();
+    if let Some(first) = outside.first() {
+        bail!(
+            "refusing {}: its install record names {} path(s) outside this \
+             destination, the first {first:?}; nothing was removed or run",
+            manifest.name,
+            outside.len()
+        );
+    }
+    Ok(())
+}
+
+/// Remove every file the manifest recorded, then prune directories this
+/// leaves empty. Directories that still hold anything are left alone.
+pub fn uninstall(roots: &Roots, name: &str) -> Result<(usize, Manifest)> {
+    let manifest = read_manifest(roots, name)?;
+    check_record(roots, &manifest)?;
+    let mut removed = 0;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    let stop_at = roots.application.clone();
+
+    for f in &manifest.files {
+        let p = PathBuf::from(f);
+        if p.exists() {
+            std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+            removed += 1;
+        }
+        let mut d = p.parent().map(Path::to_path_buf);
+        while let Some(dir) = d {
+            // Never prune the LabVIEW install dir itself or anything above it,
+            // nor the venv: palette contributions live outside the package's
+            // addon, so `stop_at` is not among their ancestors.
+            if dir == stop_at || Some(dir.as_path()) == roots.venv() || dir.parent().is_none() {
+                break;
+            }
+            dirs.push(dir.clone());
+            d = dir.parent().map(Path::to_path_buf);
+        }
+    }
+
+    // Deepest first, so parents get a chance once children are gone.
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    dirs.dedup();
+    for d in dirs {
+        if d.exists() && std::fs::read_dir(&d)?.next().is_none() {
+            let _ = std::fs::remove_dir(&d);
+        }
+    }
+
+    // The extracted hook VIs go with the package they belonged to.
+    for hook in [
+        &manifest.post_install_vi,
+        &manifest.pre_install_vi,
+        &manifest.pre_uninstall_vi,
+        &manifest.post_uninstall_vi,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = std::fs::remove_file(hook);
+    }
+    std::fs::remove_file(manifest_path(roots, name))?;
+    Ok((removed, manifest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_traversal_and_absolute_paths() {
+        assert!(safe_relative("../../etc/passwd").is_err());
+        assert!(safe_relative("/etc/passwd").is_err());
+        assert!(safe_relative(r"C:\windows\system32\evil.dll").is_err());
+        assert!(safe_relative("vi.lib/addons/ok.llb").is_ok());
+    }
+
+    #[test]
+    fn a_hook_that_ran_is_no_longer_listed_and_the_others_stay() {
+        use crate::events::HookKind;
+        let dir = std::env::temp_dir().join(format!("lvpm-hook-ran-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let roots = Roots::scratch(&dir);
+        std::fs::create_dir_all(manifest_path(&roots, "p").parent().unwrap()).unwrap();
+        let record = r#"{"name":"p","version":"1","display_name":null,"installed_at":0,"target":"t",
+            "files":[],"skipped_hooks":["PostInstall=a.vi","PreUninstall=b.vi"]}"#;
+        let m: Manifest = serde_json::from_str(record).unwrap();
+        write_manifest(&roots, &m).unwrap();
+
+        mark_hook_ran(&roots, "p", HookKind::PostInstall).unwrap();
+
+        let m = read_manifest(&roots, "p").unwrap();
+        assert_eq!(m.skipped_hooks, ["PreUninstall=b.vi"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An archive whose only member is `spec`, holding `text`, deflated.
+    fn archive_with_spec(text: &[u8]) -> Archive {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let deflated = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("spec", deflated).unwrap();
+        writer.write_all(text).unwrap();
+        open_archive(writer.finish().unwrap().into_inner()).unwrap()
+    }
+
+    const SPEC: &[u8] = b"[Package]\nName=alpha\nVersion=1.0\n";
+
+    /// [`SPEC`] padded with spaces to `len` bytes: a few KiB deflated.
+    fn padded_spec(len: u64) -> Vec<u8> {
+        let mut text = SPEC.to_vec();
+        text.resize(len as usize, b' ');
+        text
+    }
+
+    #[test]
+    fn a_spec_member_is_read_and_parsed() {
+        let read = read_spec(&mut archive_with_spec(SPEC)).unwrap();
+        assert_eq!(read.name, "alpha");
+    }
+
+    #[test]
+    fn a_spec_whose_name_is_a_path_is_refused() {
+        for name in ["../../x", "a/b", "a\\b", ".."] {
+            let text = format!("[Package]\nName={name}\nVersion=1.0\n");
+            let why = read_spec(&mut archive_with_spec(text.as_bytes())).unwrap_err();
+            assert!(
+                format!("{why:#}").contains("names the package"),
+                "{name}: {why:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spec_member_of_exactly_the_cap_is_read() {
+        let mut zip = archive_with_spec(&padded_spec(MAX_SPEC_BYTES));
+        assert_eq!(read_spec(&mut zip).unwrap().name, "alpha");
+    }
+
+    #[test]
+    fn a_spec_member_over_the_cap_is_refused() {
+        let mut zip = archive_with_spec(&padded_spec(MAX_SPEC_BYTES + 1));
+        let why = read_spec(&mut zip).unwrap_err().to_string();
+        assert!(why.contains("larger than"), "{why}");
+    }
+
+    #[test]
+    fn an_entry_is_read_up_to_its_cap_and_no_further() {
+        let mut zip = archive_with_spec(&[b'x'; 10]);
+        assert_eq!(
+            read_entry(zip.by_name("spec").unwrap(), 10).unwrap().len(),
+            10
+        );
+        let why = read_entry(zip.by_name("spec").unwrap(), 9)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(why, "entry \"spec\" is larger than 9 bytes");
+    }
+
+    #[test]
+    fn an_archive_with_neither_package_toml_nor_spec_is_refused_naming_both() {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("a.vi", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let mut zip = open_archive(writer.finish().unwrap().into_inner()).unwrap();
+        let why = read_spec(&mut zip).unwrap_err().to_string();
+        assert_eq!(
+            why,
+            "the archive has neither package.toml (a .lvpkg) nor spec (a .vip)"
+        );
+    }
+
+    /// A record for `files`, with the hook VIs it is given, installed nowhere.
+    fn record(files: &[&str], pre_uninstall_vi: Option<&str>) -> Manifest {
+        Manifest {
+            name: "a".into(),
+            version: "1".into(),
+            display_name: None,
+            installed_at: 0,
+            target: "t".into(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+            palette_files: Vec::new(),
+            dependencies: Vec::new(),
+            skipped_hooks: Vec::new(),
+            relinked: false,
+            relink_folders: Vec::new(),
+            post_install_vi: None,
+            pre_install_vi: None,
+            pre_uninstall_vi: pre_uninstall_vi.map(String::from),
+            post_uninstall_vi: None,
+            skipped_groups: Vec::new(),
+            archive_sha256: None,
+        }
+    }
+
+    #[test]
+    fn uninstall_prunes_package_but_preserves_packages_directory_and_state() {
+        let dir =
+            std::env::temp_dir().join(format!("lvpm-uninstall-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = LvTarget {
+            version: 26.3,
+            bitness: 64,
+            path: dir.join("LabVIEW"),
+        };
+        let package = Roots::project(&dir, &target, "example");
+        let store = Roots::project_store(&dir, &target);
+        let payload = package.application.join("vi.lib").join("test.vi");
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"test").unwrap();
+        let mut manifest = record(&[&payload.to_string_lossy()], None);
+        manifest.name = "example".into();
+        write_manifest(&package, &manifest).unwrap();
+        assert_eq!(uninstall(&store, "example").unwrap().0, 1);
+        assert!(!dir.join("packages").join("example").exists());
+        assert!(dir.join("packages").is_dir());
+        assert!(dir.join("installed").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_palette_record_from_before_addons_merging_reads_as_menus() {
+        let file: PaletteFile = serde_json::from_str(r#"{"relative":"Categories/a.mnu"}"#).unwrap();
+        assert_eq!(file.tree, PaletteTree::Menus);
+        assert_eq!(
+            serde_json::to_string(&file).unwrap(),
+            r#"{"relative":"Categories/a.mnu"}"#
+        );
+        let addons = PaletteFile {
+            relative: "HSE/a.mnu".into(),
+            tree: PaletteTree::Addons,
+        };
+        assert_eq!(
+            serde_json::to_string(&addons).unwrap(),
+            r#"{"relative":"HSE/a.mnu","tree":"vi.lib/addons"}"#
+        );
+    }
+
+    #[test]
+    fn a_record_says_which_hook_it_lists_as_skipped_by_the_hooks_name_alone() {
+        use crate::events::HookKind::{PostInstall, PreInstall};
+        let mut m = record(&[], None);
+        assert!(!m.hook_skipped(PostInstall));
+        m.skipped_hooks = vec![r"PostInstall=<OS Boot Volume Root>\ci\PostInstall.vi".into()];
+        assert!(m.hook_skipped(PostInstall));
+        assert!(!m.hook_skipped(PreInstall), "another hook is not listed");
+        m.skipped_hooks = vec!["PostInstallX=a.vi".into(), "PostInstall".into()];
+        assert!(!m.hook_skipped(PostInstall), "a longer name is not it");
+    }
+
+    #[test]
+    fn clearing_the_skipped_hooks_lists_none_of_them() {
+        let mut m = record(&[], None);
+        m.skipped_hooks = vec![
+            "PreInstall=a".into(),
+            "PostInstall=b".into(),
+            "PreUninstall=c".into(),
+            "PostUninstall=d".into(),
+        ];
+        assert!(m.any_hook_skipped());
+        m.clear_skipped_hooks();
+        assert!(!m.any_hook_skipped(), "{m:?}");
+    }
+
+    #[test]
+    fn a_record_is_refused_for_a_file_outside_the_destination_or_a_hook_outside_its_directory() {
+        let roots = Roots::scratch(Path::new("/box"));
+        let hooks = roots.hooks_dir().to_string_lossy().replace('\\', "/");
+        let ok = record(
+            &["/box/LabVIEW/a.txt"],
+            Some(&format!("{hooks}/a-PreUninstall.vi")),
+        );
+        check_record(&roots, &ok).unwrap();
+
+        for files in [
+            &["/etc/passwd"][..],
+            &["/box/../etc/passwd"],
+            &["/box/LabVIEW/../../etc/passwd"],
+            &["a/relative.txt"],
+            &["/box/LabVIEW/a.txt", "/boxed/b.txt"],
+        ] {
+            let why = check_record(&roots, &record(files, None)).unwrap_err();
+            assert!(
+                why.to_string().contains("outside this destination"),
+                "{files:?}: {why}"
+            );
+        }
+        let hook_elsewhere = record(&["/box/LabVIEW/a.txt"], Some("/box/LabVIEW/evil.vi"));
+        assert!(check_record(&roots, &hook_elsewhere).is_err());
+    }
+
+    #[test]
+    fn a_manifest_from_before_the_archive_hash_reads_without_one_and_is_written_back_as_it_was() {
+        let legacy = r#"{"name":"a","version":"1","display_name":null,"installed_at":0,
+            "target":"t","files":[],"skipped_hooks":[]}"#;
+        let manifest: Manifest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(manifest.archive_sha256, None);
+        let written = serde_json::to_string(&manifest).unwrap();
+        assert!(!written.contains("archive_sha256"), "{written}");
+    }
+
+    #[test]
+    fn addon_info_has_the_fields_ni_writes_and_floors_at_the_bound_target() {
+        let t = LvTarget {
+            version: 26.3,
+            bitness: 64,
+            path: PathBuf::from(r"C:\LV"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&addon_info("oglib_error", &t)).unwrap();
+        assert_eq!(v["AddonName"], "oglib_error");
+        assert_eq!(v["ApiVersion"], "v1");
+        assert_eq!(v["MinimumSupportedLVVersion"], "26.0");
+        assert_eq!(v["SupportedBitness"], "64");
+    }
+}

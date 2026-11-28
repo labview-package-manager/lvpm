@@ -1,6 +1,7 @@
-//! What each suite's work folder holds besides the two executables. The
-//! repo's own VIs are built into this executable, so it needs no checkout
-//! where it runs.
+//! What each suite's work folder holds besides the two executables and the
+//! VIs lvpm ships beside its executable (SHIPPED_VIS in main.rs). The repo's
+//! fixtures are built into this executable, so it needs no checkout where it
+//! runs.
 
 use std::io::Write;
 use std::path::Path;
@@ -97,7 +98,10 @@ File 0="Relink Packages.vi"
                  [File Group 0]\nTarget Dir=\"<vi.lib>/{name}\"\n\
                  Num Files=1\nFile 0=\"fixture.txt\"\n"
             ),
-            &[("File Group 0/fixture.txt", b"dependency uninstall fixture\n")],
+            &[(
+                "File Group 0/fixture.txt",
+                b"dependency uninstall fixture\n",
+            )],
         )?;
     }
 
@@ -105,28 +109,19 @@ File 0="Relink Packages.vi"
         work,
         "local",
         "[sources]\ndefaults = false\n\n",
-        "lvpm_linux_test = \"*\"\n",
+        &["lvpm_linux_test"],
     )
 }
 
 /// The `public` suite: a project for the global install and one for the
-/// venv, asking for `packages` from the public indexes. Both say for every
-/// package whether its hooks run: `skip_hooks` not, every other one yes.
-pub fn public(work: &Path, packages: &[String], skip_hooks: &[&str]) -> Result<()> {
-    let dependencies: String = packages
-        .iter()
-        .map(|p| {
-            let hooks = match skip_hooks.iter().any(|s| s.eq_ignore_ascii_case(p)) {
-                true => "skip",
-                false => "run",
-            };
-            format!("{p} = {{ version = \"*\", hooks = \"{hooks}\" }}\n")
-        })
-        .collect();
-    projects(work, "public", "", &dependencies)
+/// venv, asking for `packages` from the public indexes.
+pub fn public(work: &Path, packages: &[String]) -> Result<()> {
+    let packages: Vec<&str> = packages.iter().map(String::as_str).collect();
+    projects(work, "public", "", &packages)
 }
 
-fn projects(work: &Path, suite: &str, sources: &str, dependencies: &str) -> Result<()> {
+fn projects(work: &Path, suite: &str, sources: &str, packages: &[&str]) -> Result<()> {
+    let dependencies: String = packages.iter().map(|p| format!("{p} = \"*\"\n")).collect();
     for dir in ["global", "venv"] {
         std::fs::create_dir_all(work.join(dir))?;
         std::fs::write(
@@ -195,7 +190,11 @@ mod tests {
         ] {
             let mut archive = open(&format!("{name}-1.0.0.1.vip"));
             let mut spec = String::new();
-            archive.by_name("spec").unwrap().read_to_string(&mut spec).unwrap();
+            archive
+                .by_name("spec")
+                .unwrap()
+                .read_to_string(&mut spec)
+                .unwrap();
             assert!(spec.contains(&format!("Requires=\"{dependency}\"")));
             assert!(archive.by_name("File Group 0/fixture.txt").is_ok());
         }
@@ -208,15 +207,10 @@ mod tests {
     #[test]
     fn public_asks_for_the_packages_from_the_default_sources() {
         let work = scratch("public");
-        public(&work, &["a_pkg".into(), "b_pkg".into()], &["B_PKG"]).unwrap();
-        for dir in ["global", "venv"] {
-            let toml = std::fs::read_to_string(work.join(dir).join("lvpm.toml")).unwrap();
-            assert!(!toml.contains("[sources]"));
-            assert!(toml.ends_with(
-                "[dependencies]\na_pkg = { version = \"*\", hooks = \"run\" }\n\
-                 b_pkg = { version = \"*\", hooks = \"skip\" }\n"
-            ));
-        }
+        public(&work, &["a_pkg".into(), "b_pkg".into()]).unwrap();
+        let toml = std::fs::read_to_string(work.join("global").join("lvpm.toml")).unwrap();
+        assert!(!toml.contains("[sources]"));
+        assert!(toml.ends_with("[dependencies]\na_pkg = \"*\"\nb_pkg = \"*\"\n"));
         assert!(!work.join("pkgs").exists());
         std::fs::remove_dir_all(&work).unwrap();
     }

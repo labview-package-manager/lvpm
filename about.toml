@@ -23,10 +23,14 @@ accepted = [
     "CC0-1.0",
     "bzip2-1.0.6",
     "CDLA-Permissive-2.0",
+    # The resolver: pubgrub, version-ranges, priority-queue (as in uv). MPL-2.0
+    # is per-file copyleft: shipping them unmodified only asks for the notice
+    # and a pointer to their source, which this file gives.
+    "MPL-2.0",
 ]
 
 # The release targets (dist-workspace.toml).
-targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-musl"]
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
 
 # Only what is built into the shipped executable.
 ignore-build-dependencies = true

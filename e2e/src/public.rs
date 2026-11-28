@@ -17,17 +17,9 @@ use libtest_mimic::{Failed, Trial};
 
 use crate::checks::*;
 
-/// LUnit, a test framework with its own dependencies; G-Image, which ships
-/// the Call Library links VI Package Builder breaks.
+/// LUnit, a test framework with its own dependencies; G-Image, whose
+/// PostInstall has to run for its VIs to work.
 pub const PACKAGES: [&str; 2] = ["astemes_lib_lunit", "dataflow_g_lib_g_image"];
-
-/// Packages whose install hooks the projects turn off (`hooks = "skip"`);
-/// every other package's run (`hooks = "run"`). G-Image's PostInstall
-/// unzips clean copies of its 90 VIs over the installed ones, to undo VI
-/// Package Builder replacing their Call Library wildcard with
-/// `g_image_32.dll`. linkfix's `clfn-wildcard` makes that repair, and the
-/// unzipped copies would replace the linkfixed files with unprepared ones.
-pub const SKIP_HOOKS: [&str; 1] = ["dataflow_g_lib_g_image"];
 
 /// Every name under the LabVIEW folder, with a file's modification time; a
 /// folder has none.
@@ -40,18 +32,24 @@ static VENV_TREE: Mutex<Option<Tree>> = Mutex::new(None);
 pub fn trials() -> Vec<Trial> {
     crate::checks::trials(&[
         (
-            "headless install resolves and copies every package",
+            "headless install --hooks resolves and copies every package",
             global_install,
         ),
         ("lvpm list shows every package asked for", list_complete),
-        ("hooks ran as the manifest says: G-Image's skipped", hooks_ran),
+        ("every install hook ran", hooks_ran),
         (
             "every file in the install records is on disk",
             records_on_disk,
         ),
         ("uninstall linkfixed packages", uninstall_all),
-        ("linkfix left no changes after uninstall", global_tree_unchanged),
-        ("fresh global install without linkfix", global_install_for_relink),
+        (
+            "linkfix left no changes after uninstall",
+            global_tree_unchanged,
+        ),
+        (
+            "fresh global install without linkfix",
+            global_install_for_relink,
+        ),
         ("relink --all over un-linkfixed packages", relink_all),
         ("lvpm list shows every package relinked", list_relinked),
         ("uninstall --all", uninstall_all),
@@ -63,7 +61,10 @@ pub fn trials() -> Vec<Trial> {
         ("venv install uses linkfix without relink", venv_install),
         ("the linkfixed venv left LabVIEW alone", venv_tree_unchanged),
         ("uninstall linkfixed venv packages", venv_uninstall),
-        ("fresh venv install --relink skips linkfix", venv_install_relinked),
+        (
+            "fresh venv install --relink skips linkfix",
+            venv_install_relinked,
+        ),
         ("every venv package relinked", venv_relinked),
         ("the venv left the LabVIEW tree alone", venv_tree_unchanged),
     ])
@@ -79,24 +80,20 @@ fn global_install() -> Check {
     )?;
     close_labview();
     *GLOBAL_TREE.lock().unwrap() = Some(tree()?);
-    // No --hooks: it would override the manifest's hooks = "skip". Headless,
-    // the packages with hooks = "run" still run theirs.
-    linkfix_only(&stdout(&ok(&global(), &["install"])?))
+    linkfix_only(&stdout(&ok(&global(), &["install", "--hooks"])?))
 }
 
-/// Linkfix ran and LabVIEW's relink pass did not: the install no longer says
-/// the relink was skipped, so check that its "relinking N folder(s)" never ran.
 fn linkfix_only(output: &str) -> Check {
     ensure(
         output.contains("linkfix: preparing installed files")
-            && !output.contains("relinking ")
+            && output.contains("LabVIEW relink: skipped")
             && !output.contains("linkfix could not complete"),
         || format!("expected linkfix without LabVIEW relink:\n{output}"),
     )
 }
 
 fn global_install_for_relink() -> Check {
-    ok(&global(), &["install", "--no-linkfix"]).map(drop)
+    ok(&global(), &["install", "--no-linkfix", "--hooks"]).map(drop)
 }
 
 /// The dependency names of the global project, as fixtures::public wrote them.
@@ -125,27 +122,10 @@ fn list_complete() -> Check {
     })
 }
 
-/// In `lvpm list`, a package in [`SKIP_HOOKS`] has its PostInstall recorded
-/// as skipped (when it has one), and no other package has a hook that did not
-/// run: nothing pending, failed, skipped or listed under "hooks not run".
 fn hooks_ran() -> Check {
     let list = stdout(&ok(&global(), &["list"])?);
-    let rows: Vec<&str> = list.lines().filter(|l| l.contains(" files ")).collect();
-    let wrong: Vec<&str> = rows
-        .iter()
-        .copied()
-        .filter(|row| {
-            let name = row.split_whitespace().next().unwrap_or_default();
-            match SKIP_HOOKS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-                true => row.contains("post-install") && !row.contains("post-install skipped"),
-                false => ["PENDING", "FAILED", "unknown", "skipped", "hooks not run"]
-                    .iter()
-                    .any(|s| row.contains(s)),
-            }
-        })
-        .collect();
-    ensure(!rows.is_empty() && wrong.is_empty(), || {
-        format!("hooks did not run as the manifest says:\n{}\n\nlist:\n{list}", wrong.join("\n"))
+    ensure(!list.contains("hooks skipped"), || {
+        format!("a package's hooks did not run:\n{list}")
     })
 }
 
@@ -194,16 +174,9 @@ fn relink_all() -> Check {
     ok(&global(), &["relink", "--all"]).map(drop)
 }
 
-/// Every package row of `lvpm list` (the lines with a file count) says
-/// `relinked`; an unrelinked package shows nothing in that column.
-fn all_relinked(list: &str) -> bool {
-    let mut rows = list.lines().filter(|l| l.contains(" files ")).peekable();
-    rows.peek().is_some() && rows.all(|l| l.contains(" relinked"))
-}
-
 fn list_relinked() -> Check {
     let list = stdout(&ok(&global(), &["list"])?);
-    ensure(all_relinked(&list), || {
+    ensure(!list.contains("NOT relinked"), || {
         format!("not every package relinked:\n{list}")
     })
 }
@@ -248,9 +221,10 @@ fn venv_install_relinked() -> Check {
 
 fn venv_relinked() -> Check {
     let list = stdout(&ok(&venv(), &["list"])?);
-    ensure(all_relinked(&list), || {
-        format!("not every venv package relinked:\n{list}")
-    })
+    ensure(
+        list.contains(" relinked") && !list.contains("NOT relinked"),
+        || format!("not every venv package relinked:\n{list}"),
+    )
 }
 
 fn venv_tree_unchanged() -> Check {

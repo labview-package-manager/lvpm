@@ -1,0 +1,5 @@
+sync: 1 to replace, 1 to remove
+  remove extra 1.0 (not in lvpm.lock)
+  replace alpha 1.0 -> 2.0
+sync cancelled: nothing was changed
+next: add it to lvpm.toml with lvpm add extra, or run lvpm sync --prefix dest --yes

@@ -1,10 +1,6 @@
 # Steps dist puts into release.yml before each build (dist-workspace.toml,
-# github-build-setup). rusqlite's bundled SQLite is C, and the musl build
-# compiles it with musl-gcc, as build.yml does.
-- name: Use musl-gcc for the musl build
-  if: runner.os == 'Linux'
-  shell: bash
-  run: echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+# github-build-setup).
+#
 # THIRD-PARTY-LICENSES.txt is not in git: each release generates it from the
 # Cargo.lock it builds, so it always lists exactly the crates in the binary.
 # dist packs it into the archives and the MSI (dist-workspace.toml `include`,

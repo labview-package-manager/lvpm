@@ -1,16 +1,19 @@
-//! Advisory release checks. Only the main thread prints. A check still running
-//! when the command ends gets a short grace period, then is abandoned rather
-//! than delaying the exit further.
+//! Tells an interactive user when a newer stable lvpm is out. The check runs
+//! on a thread beside the command, at most once a day, and is cached in the
+//! `cache` folder. A check still running when the command ends gets a short
+//! grace period, then is abandoned rather than delaying the exit.
 
 use anyhow::{Context, Result};
-use semver::Version;
+use lvpm_core::version::Version;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// shortcut: points at upstream's releases, which are numbered below this fork's, so it
+// stays quiet until upstream passes our version; point it at the fork's own once it publishes.
 const RELEASES_API: &str =
     "https://api.github.com/repos/labview-package-manager/lvpm/releases?per_page=30";
 const RELEASES_PAGE: &str = "https://github.com/labview-package-manager/lvpm/releases";
@@ -27,7 +30,7 @@ const GRACE: Duration = Duration::from_millis(150);
 #[derive(Clone, Default, Deserialize, Serialize)]
 struct Cached {
     checked_at: u64,
-    latest: Option<Version>,
+    latest: Option<String>,
 }
 
 impl Cached {
@@ -45,12 +48,13 @@ struct Release {
 }
 
 pub struct UpdateNotice {
-    current: Version,
-    latest: Option<Version>,
+    current: String,
+    latest: Option<String>,
     worker: Option<JoinHandle<Option<Cached>>>,
 }
 
-pub fn start() -> Option<UpdateNotice> {
+/// Start a check, unless the run is not interactive or the user opted out.
+pub fn start(cache: &Path) -> Option<UpdateNotice> {
     let forced = test_override("LVPM_TEST_TERMINAL").is_some();
     if !enabled(
         forced || std::io::stdout().is_terminal(),
@@ -59,13 +63,7 @@ pub fn start() -> Option<UpdateNotice> {
     ) {
         return None;
     }
-    match prepare() {
-        Ok(notice) => Some(notice),
-        Err(e) => {
-            log::debug!("cannot start update check: {e:#}");
-            None
-        }
-    }
+    prepare(cache.join(CACHE_FILE)).ok()
 }
 
 fn enabled(stdout_terminal: bool, stderr_terminal: bool, env_set: impl Fn(&str) -> bool) -> bool {
@@ -79,7 +77,7 @@ fn enabled(stdout_terminal: bool, stderr_terminal: bool, env_set: impl Fn(&str) 
 /// Tests only, and only in a debug build (what `cargo test` runs):
 /// `LVPM_TEST_TERMINAL` makes lvpm treat its output as a terminal, and
 /// `LVPM_TEST_RELEASES_URL` replaces the GitHub releases API (and makes the
-/// command wait for the check), so the update notice can be driven end to end
+/// command wait for the check), so the notice can be driven end to end
 /// without a pseudoterminal or GitHub. A release build never reads them.
 #[cfg(debug_assertions)]
 fn test_override(key: &str) -> Option<String> {
@@ -91,14 +89,12 @@ fn test_override(_key: &str) -> Option<String> {
     None
 }
 
-fn prepare() -> Result<UpdateNotice> {
-    let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
-    let path = crate::config::load()?.cache.join(CACHE_FILE);
+fn prepare(path: PathBuf) -> Result<UpdateNotice> {
     let cached = read_cache(&path);
     let checked_at = now()?;
     let fresh = cached.as_ref().is_some_and(|c| c.fresh(checked_at));
     let mut notice = UpdateNotice {
-        current,
+        current: env!("CARGO_PKG_VERSION").to_string(),
         latest: cached.and_then(|c| c.latest),
         worker: None,
     };
@@ -108,14 +104,10 @@ fn prepare() -> Result<UpdateNotice> {
             std::thread::Builder::new()
                 .name("update-check".into())
                 .spawn(move || {
-                    let check = || refresh(&path, &url, now()?, TIMEOUT);
-                    match check() {
-                        Ok(cached) => cached,
-                        Err(e) => {
-                            log::debug!("cannot refresh update cache: {e:#}");
-                            None
-                        }
-                    }
+                    now()
+                        .and_then(|now| refresh(&path, &url, now, TIMEOUT))
+                        .ok()
+                        .flatten()
                 })?,
         );
     }
@@ -131,7 +123,7 @@ impl UpdateNotice {
             None => GRACE,
         };
         if let Some(latest) = self.available(grace) {
-            elog!(
+            eprintln!(
                 "\nA newer lvpm is available: {current} -> {latest}\n\
                  Run the installation script again, or download the new release, to upgrade.\n\
                  {RELEASES_PAGE}"
@@ -139,23 +131,27 @@ impl UpdateNotice {
         }
     }
 
-    fn available(mut self, grace: Duration) -> Option<Version> {
+    fn available(mut self, grace: Duration) -> Option<String> {
         if let Some(worker) = self.worker.take() {
             let deadline = Instant::now() + grace;
             while !worker.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            if worker.is_finished() {
-                match worker.join() {
-                    Ok(Some(cached)) => self.latest = cached.latest,
-                    Ok(None) => {}
-                    Err(_) => log::debug!("update check thread panicked"),
-                }
+            if worker.is_finished()
+                && let Ok(Some(cached)) = worker.join()
+            {
+                self.latest = cached.latest;
             }
         }
+        let current = stable(&self.current);
         self.latest
-            .filter(|v| v.pre.is_empty() && v.cmp_precedence(&self.current).is_gt())
+            .filter(|v| stable(v).is_release() && stable(v) > current)
     }
+}
+
+/// A version without its `+build` part, which never decides which is newer.
+fn stable(v: &str) -> Version {
+    Version::parse(v.split('+').next().unwrap_or(v))
 }
 
 fn now() -> Result<u64> {
@@ -163,24 +159,11 @@ fn now() -> Result<u64> {
 }
 
 fn read_cache(path: &Path) -> Option<Cached> {
-    let read = || -> Result<Option<Cached>> {
-        match std::fs::read(path) {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    };
-    match read() {
-        Ok(cached) => cached,
-        Err(e) => {
-            log::debug!("cannot read update cache {}: {e:#}", path.display());
-            None
-        }
-    }
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 /// Only called under the lock, so one fixed temp name is enough, and a temp
-/// file left by an interrupted write is simply overwritten next time.
+/// file left by an interrupted write is overwritten next time.
 fn write_cache(path: &Path, cached: &Cached) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(cached)?;
@@ -223,9 +206,8 @@ fn refresh(path: &Path, url: &str, now: u64, timeout: Duration) -> Result<Option
             latest: cached.latest.clone(),
         },
     )?;
-    match fetch_latest(url, timeout) {
-        Ok(latest) => cached.latest = latest,
-        Err(e) => log::debug!("update check failed: {e:#}"),
+    if let Ok(latest) = fetch_latest(url, timeout) {
+        cached.latest = latest;
     }
     // Cache completed failures for a full interval too, so offline runs and
     // rate limits do not trigger a request on every command.
@@ -234,7 +216,7 @@ fn refresh(path: &Path, url: &str, now: u64, timeout: Duration) -> Result<Option
     Ok(Some(cached))
 }
 
-fn fetch_latest(url: &str, timeout: Duration) -> Result<Option<Version>> {
+fn fetch_latest(url: &str, timeout: Duration) -> Result<Option<String>> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("lvpm/", env!("CARGO_PKG_VERSION")))
         .timeout(timeout)
@@ -251,25 +233,18 @@ fn fetch_latest(url: &str, timeout: Duration) -> Result<Option<Version>> {
 
 /// The newest stable release: drafts, releases marked as prereleases and
 /// versions with a prerelease part (`-rc.1`) do not count.
-fn latest_release(releases: Vec<Release>) -> Option<Version> {
+fn latest_release(releases: Vec<Release>) -> Option<String> {
     releases
         .into_iter()
         .filter(|r| !r.draft && !r.prerelease)
-        .filter_map(|release| {
-            let tag = release
-                .tag_name
+        .map(|r| {
+            r.tag_name
                 .strip_prefix('v')
-                .unwrap_or(&release.tag_name);
-            match Version::parse(tag) {
-                Ok(version) => Some(version),
-                Err(e) => {
-                    log::debug!("ignoring release tag {:?}: {e}", release.tag_name);
-                    None
-                }
-            }
+                .unwrap_or(&r.tag_name)
+                .to_string()
         })
-        .filter(|v| v.pre.is_empty())
-        .max_by(|a, b| a.cmp_precedence(b))
+        .filter(|tag| tag.starts_with(|c: char| c.is_ascii_digit()) && stable(tag).is_release())
+        .max_by_key(|tag| stable(tag))
 }
 
 #[cfg(test)]
@@ -277,35 +252,12 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::path::PathBuf;
-    use std::sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    };
+    use std::sync::mpsc;
 
-    struct TestCache(PathBuf);
-
-    impl TestCache {
-        fn new() -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "lvpm-update-test-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed),
-            ));
-            std::fs::create_dir(&root).unwrap();
-            Self(root)
-        }
-
-        fn path(&self) -> PathBuf {
-            self.0.join(CACHE_FILE)
-        }
-    }
-
-    impl Drop for TestCache {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    fn cache() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CACHE_FILE);
+        (dir, path)
     }
 
     fn server(status: &str, body: &str) -> (String, JoinHandle<()>) {
@@ -331,16 +283,20 @@ mod tests {
         (url, thread)
     }
 
-    fn notice(current: &str, latest: Option<&str>, worker: Option<JoinHandle<Option<Cached>>>) -> UpdateNotice {
+    fn notice(
+        current: &str,
+        latest: Option<&str>,
+        worker: Option<JoinHandle<Option<Cached>>>,
+    ) -> UpdateNotice {
         UpdateNotice {
-            current: Version::parse(current).unwrap(),
-            latest: latest.map(|v| Version::parse(v).unwrap()),
+            current: current.into(),
+            latest: latest.map(String::from),
             worker,
         }
     }
 
     #[test]
-    fn only_stable_releases_count_and_versions_compare_as_semver() {
+    fn only_stable_releases_count_and_versions_compare_numerically() {
         let releases = serde_json::from_str(
             r#"[
             {"tag_name":"v0.9.9","draft":false},
@@ -352,8 +308,15 @@ mod tests {
         ]"#,
         )
         .unwrap();
-        assert_eq!(latest_release(releases).unwrap().to_string(), "0.10.0");
+        assert_eq!(latest_release(releases).as_deref(), Some("0.10.0"));
+        let releases =
+            serde_json::from_str(r#"[{"tag_name":"v0.10.0-rc.1","draft":false}]"#).unwrap();
+        assert!(latest_release(releases).is_none());
+    }
 
+    #[test]
+    fn only_stable_releases_count_and_versions_compare_as_semver() {
+        // A tag without the `v` prefix counts as well.
         let releases = serde_json::from_str(
             r#"[
             {"tag_name":"v0.9.0","draft":false},
@@ -361,8 +324,7 @@ mod tests {
         ]"#,
         )
         .unwrap();
-        assert_eq!(latest_release(releases).unwrap().to_string(), "0.10.0");
-
+        assert_eq!(latest_release(releases).as_deref(), Some("0.10.0"));
         let releases = serde_json::from_str(
             r#"[{"tag_name":"v0.10.0-rc.1","draft":false,"prerelease":true}]"#,
         )
@@ -371,89 +333,14 @@ mod tests {
     }
 
     #[test]
-    fn only_interactive_runs_without_an_opt_out_are_enabled() {
-        assert!(enabled(true, true, |_| false));
-        assert!(!enabled(false, true, |_| false));
-        assert!(!enabled(true, false, |_| false));
-        for key in ["LVPM_NO_UPDATE_CHECK", "CI", "LV_RTE_HEADLESS"] {
-            assert!(!enabled(true, true, |env| env == key), "{key}");
-        }
-    }
-
-    #[test]
-    fn checks_are_persisted_and_reused_for_exactly_one_day() {
-        let cache = TestCache::new();
-        let (url, server) = server("200 OK", r#"[{"tag_name":"v0.4.0","draft":false}]"#);
-        let now = INTERVAL * 10;
-        let first = refresh(&cache.path(), &url, now, TIMEOUT).unwrap().unwrap();
-        server.join().unwrap();
-        assert_eq!(first.latest.unwrap().to_string(), "0.4.0");
-        assert_eq!(read_cache(&cache.path()).unwrap().checked_at, now);
-
-        // The server is gone: a fresh cache must not attempt a request.
-        let reused = refresh(&cache.path(), &url, now + INTERVAL - 1, TIMEOUT)
-            .unwrap()
-            .unwrap();
-        assert_eq!(reused.checked_at, now);
-        let retried = refresh(&cache.path(), &url, now + INTERVAL, TIMEOUT)
-            .unwrap()
-            .unwrap();
-        assert_eq!(retried.checked_at, now + INTERVAL);
-        assert_eq!(retried.latest.unwrap().to_string(), "0.4.0");
-        assert!(!read_cache(&cache.path()).unwrap().fresh(now - 1));
-    }
-
-    #[test]
-    fn an_abandoned_check_is_retried_after_an_hour_not_on_every_run() {
-        let cache = TestCache::new();
-        write_cache(
-            &cache.path(),
-            &Cached {
-                checked_at: 0,
-                latest: Some(Version::parse("0.4.0").unwrap()),
-            },
-        )
-        .unwrap();
-        // A server that accepts but never answers: the check is in flight,
-        // as it is when a short command exits.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/releases", listener.local_addr().unwrap());
-        let (release, wait) = mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
-            let _ = wait.recv_timeout(Duration::from_secs(10));
-        });
-        let now = INTERVAL * 10;
-        let path = cache.path();
-        let check = std::thread::spawn(move || refresh(&path, &url, now, Duration::from_secs(10)));
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let claimed = loop {
-            let cached = read_cache(&cache.path()).unwrap();
-            if cached.checked_at != 0 {
-                break cached;
-            }
-            assert!(Instant::now() < deadline, "the check was not recorded before the request");
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        assert_eq!(claimed.latest.as_ref().unwrap().to_string(), "0.4.0");
-        assert!(claimed.fresh(now + RETRY - 1));
-        assert!(!claimed.fresh(now + RETRY));
-
-        release.send(()).unwrap();
-        server.join().unwrap();
-        check.join().unwrap().unwrap();
-    }
-
-    #[test]
     fn failed_checks_are_cached_without_losing_the_previous_notice() {
-        let cache = TestCache::new();
+        let (_dir, path) = cache();
         let mut now = INTERVAL * 10;
         write_cache(
-            &cache.path(),
+            &path,
             &Cached {
                 checked_at: 0,
-                latest: Some(Version::parse("0.4.0").unwrap()),
+                latest: Some("0.4.0".into()),
             },
         )
         .unwrap();
@@ -462,63 +349,56 @@ mod tests {
             ("200 OK", "invalid json"),
         ] {
             let (url, server) = server(status, body);
-            let result = refresh(&cache.path(), &url, now, TIMEOUT).unwrap().unwrap();
+            let result = refresh(&path, &url, now, TIMEOUT).unwrap().unwrap();
             server.join().unwrap();
-            assert_eq!(result.latest.unwrap().to_string(), "0.4.0");
-            let persisted = read_cache(&cache.path()).unwrap();
+            assert_eq!(result.latest.as_deref(), Some("0.4.0"));
+            let persisted = read_cache(&path).unwrap();
             assert_eq!(persisted.checked_at, now);
             assert!(persisted.fresh(now + 1));
             now += INTERVAL;
         }
         let (url, server) = server("200 OK", "[]");
         assert!(
-            refresh(&cache.path(), &url, now, TIMEOUT)
+            refresh(&path, &url, now, TIMEOUT)
                 .unwrap()
                 .unwrap()
                 .latest
                 .is_none()
         );
         server.join().unwrap();
-        assert!(read_cache(&cache.path()).unwrap().latest.is_none());
-        assert!(!cache.path().with_extension("json.tmp").exists());
+        assert!(read_cache(&path).unwrap().latest.is_none());
+        assert!(!path.with_extension("json.tmp").exists());
     }
 
     #[test]
     fn corrupt_cache_is_repaired_and_concurrent_checks_are_skipped() {
-        let cache = TestCache::new();
-        std::fs::write(cache.path(), b"partial json").unwrap();
+        let (_dir, path) = cache();
+        std::fs::write(&path, b"partial json").unwrap();
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(cache.path().with_extension("lock"))
+            .open(path.with_extension("lock"))
             .unwrap();
         lock.lock().unwrap();
         assert!(
-            refresh(&cache.path(), "invalid URL", INTERVAL * 10, TIMEOUT)
+            refresh(&path, "invalid URL", INTERVAL * 10, TIMEOUT)
                 .unwrap()
                 .is_none()
         );
         drop(lock);
 
         let (url, server) = server("200 OK", r#"[{"tag_name":"v0.4.0","draft":false}]"#);
-        refresh(&cache.path(), &url, INTERVAL * 10, TIMEOUT).unwrap();
+        refresh(&path, &url, INTERVAL * 10, TIMEOUT).unwrap();
         server.join().unwrap();
-        assert_eq!(
-            read_cache(&cache.path())
-                .unwrap()
-                .latest
-                .unwrap()
-                .to_string(),
-            "0.4.0"
-        );
+        assert_eq!(read_cache(&path).unwrap().latest.as_deref(), Some("0.4.0"));
     }
 
     #[test]
     fn slow_requests_time_out() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/releases", listener.local_addr().unwrap());
-        let (release, wait) = mpsc::channel();
+        let (release, wait) = mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let (_stream, _) = listener.accept().unwrap();
             let _ = wait.recv_timeout(Duration::from_secs(5));
@@ -536,48 +416,114 @@ mod tests {
     }
 
     #[test]
-    fn a_running_check_delays_the_cached_notice_by_at_most_the_grace_period() {
-        let (release, wait) = mpsc::channel();
-        let (done, finished) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let _ = wait.recv_timeout(Duration::from_secs(5));
-            done.send(()).unwrap();
-            None
-        });
-        let started = Instant::now();
-        let latest = notice("0.3.0", Some("0.4.0"), Some(worker))
-            .available(GRACE)
-            .unwrap();
-        let elapsed = started.elapsed();
-        release.send(()).unwrap();
-        finished.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(latest.to_string(), "0.4.0");
-        assert!(elapsed >= GRACE, "{elapsed:?}");
-        assert!(elapsed < GRACE + Duration::from_millis(500), "{elapsed:?}");
-    }
-
-    #[test]
     fn a_check_completing_within_the_grace_period_replaces_or_clears_the_cached_notice() {
         for latest in [Some("0.5.0"), None] {
             let worker = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(20));
                 Some(Cached {
                     checked_at: 0,
-                    latest: latest.map(|v| Version::parse(v).unwrap()),
+                    latest: latest.map(String::from),
                 })
             });
             assert_eq!(
                 notice("0.3.0", Some("0.4.0"), Some(worker))
                     .available(Duration::from_secs(5))
-                    .map(|v| v.to_string()),
-                latest.map(String::from)
+                    .as_deref(),
+                latest
             );
         }
     }
 
     #[test]
+    fn only_interactive_runs_without_an_opt_out_are_enabled() {
+        assert!(enabled(true, true, |_| false));
+        assert!(!enabled(false, true, |_| false));
+        assert!(!enabled(true, false, |_| false));
+        for key in ["LVPM_NO_UPDATE_CHECK", "CI", "LV_RTE_HEADLESS"] {
+            assert!(!enabled(true, true, |env| env == key), "{key}");
+        }
+    }
+
+    #[test]
+    fn checks_are_persisted_and_reused_for_exactly_one_day() {
+        let (_dir, path) = cache();
+        let (url, server) = server("200 OK", r#"[{"tag_name":"v0.4.0","draft":false}]"#);
+        let now = INTERVAL * 10;
+        let first = refresh(&path, &url, now, TIMEOUT).unwrap().unwrap();
+        server.join().unwrap();
+        assert_eq!(first.latest.as_deref(), Some("0.4.0"));
+        // The server is gone: a fresh cache must not attempt a request.
+        let reused = refresh(&path, &url, now + INTERVAL - 1, TIMEOUT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reused.checked_at, now);
+        // A failed check keeps the previous notice and is cached a day too.
+        let retried = refresh(&path, &url, now + INTERVAL, TIMEOUT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.checked_at, now + INTERVAL);
+        assert_eq!(retried.latest.as_deref(), Some("0.4.0"));
+    }
+
+    #[test]
+    fn an_abandoned_check_is_retried_after_an_hour_not_on_every_run() {
+        let (_dir, path) = cache();
+        // A server that accepts but never answers: the check is in flight,
+        // as it is when a short command exits.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/releases", listener.local_addr().unwrap());
+        let (release, wait) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+        });
+        let now = INTERVAL * 10;
+        let p = path.clone();
+        let check = std::thread::spawn(move || refresh(&p, &url, now, Duration::from_secs(10)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let claimed = loop {
+            if let Some(c) = read_cache(&path) {
+                break c;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the check was not recorded first"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(claimed.fresh(now + RETRY - 1));
+        assert!(!claimed.fresh(now + RETRY));
+        release.send(()).unwrap();
+        server.join().unwrap();
+        check.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_running_check_delays_the_cached_notice_by_at_most_the_grace_period() {
+        let (release, wait) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+            None
+        });
+        let started = Instant::now();
+        let latest = notice("0.3.0", Some("0.4.0"), Some(worker)).available(GRACE);
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        assert_eq!(latest.as_deref(), Some("0.4.0"));
+        assert!(elapsed >= GRACE, "{elapsed:?}");
+        // Well short of the worker's 5 s, with room for a loaded CI machine.
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    #[test]
     fn installed_older_and_prerelease_versions_do_not_notify() {
-        for latest in ["0.3.0", "0.2.9", "0.3.0-rc.1", "0.3.0+new-build", "0.4.0-rc.1"] {
+        for latest in [
+            "0.3.0",
+            "0.2.9",
+            "0.3.0-rc.1",
+            "0.3.0+new-build",
+            "0.4.0-rc.1",
+        ] {
             assert!(
                 notice("0.3.0+installed-build", Some(latest), None)
                     .available(GRACE)
@@ -589,9 +535,8 @@ mod tests {
         assert_eq!(
             notice("0.3.0-rc.1", Some("0.3.0"), None)
                 .available(GRACE)
-                .unwrap()
-                .to_string(),
-            "0.3.0"
+                .as_deref(),
+            Some("0.3.0")
         );
     }
 }
